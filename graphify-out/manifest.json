@@ -1,0 +1,86 @@
+{
+  "AI_Slat_Rib_Conveyor_V4_4_Robust_Profile.py": {
+    "mtime": 1789214473.297021,
+    "seen": 1789269016.6646824,
+    "ast_hash": "a3fc43b53be2a726afb1492e311bf99b",
+    "semantic_hash": "a3fc43b53be2a726afb1492e311bf99b"
+  },
+  "Program AI/AI_Slat_Rib_Conveyor_V4_2_Robust.py": {
+    "mtime": 1789027554.70359,
+    "seen": 1789269016.664691,
+    "ast_hash": "45f4c9ba337018405842006a77289f2f",
+    "semantic_hash": "45f4c9ba337018405842006a77289f2f"
+  },
+  "Program AI/AI_Slat_Rib_Conveyor_V4_3_Robust_Profile.py": {
+    "mtime": 1789108275.7644255,
+    "seen": 1789269016.6646936,
+    "ast_hash": "b4f85f341fd25fd64b998dcaddb0ec0b",
+    "semantic_hash": "b4f85f341fd25fd64b998dcaddb0ec0b"
+  },
+  "Program AI/AI_Slat_Rib_Conveyor_V4_4_Robust_Profile.py": {
+    "mtime": 1789112609.0689905,
+    "seen": 1789269016.6646957,
+    "ast_hash": "1cea379e9ba8b5f1417ddb9efb597317",
+    "semantic_hash": "1cea379e9ba8b5f1417ddb9efb597317"
+  },
+  "Program AI/Benchmark_Filter_Slat_Rib.py": {
+    "mtime": 1789049485.456031,
+    "seen": 1789269016.6646981,
+    "ast_hash": "faeedccc2a96bd511548f40c9e2c2579",
+    "semantic_hash": "faeedccc2a96bd511548f40c9e2c2579"
+  },
+  "Program AI/Tes_Garis_Acuan_PureCV_V1.py": {
+    "mtime": 1788961853.9218793,
+    "seen": 1789269016.6647005,
+    "ast_hash": "0fd7391ef0e592d39c326200850ca8a3",
+    "semantic_hash": "0fd7391ef0e592d39c326200850ca8a3"
+  },
+  "Program AI/Tes_Garis_Acuan_PureCV_V2.py": {
+    "mtime": 1788961848.9004128,
+    "seen": 1789269016.664703,
+    "ast_hash": "6a3f92b31ad468f2bc13ee4a73035076",
+    "semantic_hash": "6a3f92b31ad468f2bc13ee4a73035076"
+  },
+  "Program AI/Tes_Garis_Acuan_PureCV_V3_w_Rib&Slat.py": {
+    "mtime": 1789021443.5573754,
+    "seen": 1789269016.6647046,
+    "ast_hash": "26ccc8f3261d802ff8db90df0861c196",
+    "semantic_hash": "26ccc8f3261d802ff8db90df0861c196"
+  },
+  "Program AI/Tes_Garis_Acuan_PureCV_V4_w_Rib&Slat.py": {
+    "mtime": 1789046081.3263881,
+    "seen": 1789269016.6647062,
+    "ast_hash": "b1b76c84d15fe5537e8d4843b306e63c",
+    "semantic_hash": "b1b76c84d15fe5537e8d4843b306e63c"
+  },
+  "Program AI/Tes_Garis_Acuan_PureCV_V5_w_Rib&Slat_Filter_Benchmark.py": {
+    "mtime": 1789091299.131725,
+    "seen": 1789269016.664708,
+    "ast_hash": "e0fccbea69b9e5dba86aa7c170d395f1",
+    "semantic_hash": "e0fccbea69b9e5dba86aa7c170d395f1"
+  },
+  "Program AI/Tes_Garis_Acuan_PureCV_V6_w_Rib&Slat_Filter_Benchmark.py": {
+    "mtime": 1789097407.5875309,
+    "seen": 1789269016.6647103,
+    "ast_hash": "e3a742e0210b1876ad8e205c41d8e81a",
+    "semantic_hash": "e3a742e0210b1876ad8e205c41d8e81a"
+  },
+  "Program AI/Tes_Garis_Acuan_PureCV_V7_w_Rib&Slat_Filter_Benchmark.py": {
+    "mtime": 1789099545.1461709,
+    "seen": 1789269016.6647122,
+    "ast_hash": "30609fe85059d0ae85dd05cb350c49ff",
+    "semantic_hash": "30609fe85059d0ae85dd05cb350c49ff"
+  },
+  "Program AI/Tes_YOLO_Image.py": {
+    "mtime": 1788961850.9808092,
+    "seen": 1789269016.6647148,
+    "ast_hash": "947611ca3e6a4353bcddeaf94687c5e9",
+    "semantic_hash": "947611ca3e6a4353bcddeaf94687c5e9"
+  },
+  "Program AI/Tes_YOLO_Simple.py": {
+    "mtime": 1788942717.4465544,
+    "seen": 1789269016.6647182,
+    "ast_hash": "a73f0db2a38cf608d295b502d0a9dc6a",
+    "semantic_hash": "a73f0db2a38cf608d295b502d0a9dc6a"
+  }
+}
