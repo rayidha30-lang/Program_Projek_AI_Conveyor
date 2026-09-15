@@ -27,6 +27,12 @@ import cv2
 import numpy as np
 import os
 import sys
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 from db import save_inspection_to_db
 
 try:
@@ -919,12 +925,6 @@ def interactive_multi_roi_session(initial_image_path, config=FILTER_CONFIG):
                         last_sirip = l_sir
                         last_slat  = l_sla
 
-                        # ──────────────────────────────────────────────────────────────
-                        # ✅ TAMBAHKAN LINE INI: KIRIM KE SQL SERVER
-                        # ──────────────────────────────────────────────────────────────
-                        save_inspection_to_db(image_path, l_sir, l_sla)
-                        # ──────────────────────────────────────────────────────────────
-
                         result_frame = frame.copy()
                         draw_sirip_visuals(result_frame, last_sirip)
                         draw_slat_visuals(result_frame, last_slat)
@@ -961,6 +961,12 @@ def interactive_multi_roi_session(initial_image_path, config=FILTER_CONFIG):
                         save_path  = f"{base}_hasil_v4_4{ext}"
                         cv2.imwrite(save_path, result_frame)
                         print(f"  💾 Disimpan: {os.path.basename(save_path)}")
+
+                        # ──────────────────────────────────────────────────────────────
+                        # ✅ SIMPAN KE SQL SERVER (Lengkap dengan Path Hasil Anotasi)
+                        # ──────────────────────────────────────────────────────────────
+                        save_inspection_to_db(image_path, l_sir, l_sla, annotated_path=save_path)
+                        # ──────────────────────────────────────────────────────────────
                     else:
                         print("  ⚠️ Klik minimal 3 titik untuk PLAT DASAR!")
 

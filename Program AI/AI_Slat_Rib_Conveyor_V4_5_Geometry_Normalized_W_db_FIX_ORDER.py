@@ -1,24 +1,43 @@
 """
-AI_Slat_Rib_Conveyor_V4_3_Robust_Profile.py
+AI_Slat_Rib_Conveyor_V4_4_Robust_Profile.py
 AI / Computer Vision - Inspeksi Deformasi Slat & Rib Conveyor
-V4.3 - Robust Physical Profile Extraction
+V4.5 - Geometry Normalized + Upper-Edge Locking & Full-Span Profile Extraction
 
-Perubahan utama:
-  SLAT : TIDAK lagi menggunakan first-white-pixel dari Morph Close.
-          Pipeline baru: gradient -> local maxima candidates -> scoring
-          (edge strength + position continuity) -> search band tracking
-          -> conservative outlier rejection.
-  SIRIP: Topmost-edge algorithm DIPERTAHANKAN (proven, tidak diubah).
-  Dual threshold (P-V + Max Abs Deviation) untuk kedua komponen.
-  8-panel debug visualization untuk SLAT.
-  Semua parameter terpusat di FILTER_CONFIG.
-  Semua UI, keyboard, file picker, navigasi foto DIPERTAHANKAN.
+Pembaruan Utama V4.5:
+  SLAT : 1. UPPER-EDGE LOCKING: Menggunakan polaritas gradien vertikal (Sobel Y > 0)
+            dan dominansi horizontal (|Sy| >= 0.45 * |Sx|). Kandidat tepi bawah
+            dan bayangan bawah dieliminasi 100%, mencegah garis acuan memotong diagonal.
+         2. ADAPTIVE THRESHOLDING: Mengganti ambang batas kaku 30 dengan threshold
+            dinamis per kolom (SLAT_MIN_STR_FLOOR=12.0, SLAT_ADAPTIVE_RATIO=0.28)
+            sehingga area berkarat di sisi kiri tetap terdeteksi sejak awal (x=0).
+         3. BIDIRECTIONAL ANCHOR TRACKING: Menemukan kolom jangkar (anchor) dengan tepi
+            terjelas, lalu melacak maju (ke kanan) dan mundur (ke kiri) dengan
+            proyeksi kemiringan (slope) saat dropout. Menghasilkan profil fisik
+            penuh 100% bentang plat.
+         4. STRICT JUMP CONSTRAINT: Kandidat dengan lompatan > SLAT_MAX_JUMP
+            didiskualifikasi mutlak, mencegah profil melompat ke tepi lain.
+         5. REFERENCE LINE SEJAJAR: Garis acuan ditarik dari titik kiri tepi atas ke
+            titik kanan tepi atas yang sama -> sejajar alami dengan perspektif plat.
+  5. GEOMETRY NORMALIZATION: ROI SLAT menggunakan 4 titik sudut dan
+            perspective transform ke canonical plane (1000x220 px). Deteksi profile
+            dilakukan pada koordinat yang telah dinormalisasi sehingga perubahan
+            rotasi/perspektif kamera lebih terkontrol.
+  SIRIP: Topmost-edge algorithm DIPERTAHANKAN 100% (proven, stabil).
+  UI   : Manual 2-stage ROI, tombol keyboard, navigasi foto, HUD, dan file picker
+         dipertahankan sepenuhnya.
 """
 
 import cv2
 import numpy as np
 import os
 import sys
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+from db import save_inspection_to_db
 
 try:
     import tkinter as tk
@@ -44,7 +63,7 @@ FILTER_CONFIG = {
     "BILATERAL_SIGMA_COLOR":  50,
     "BILATERAL_SIGMA_SPACE":  50,
     "SOBEL_KSIZE":            3,
-    "SOBEL_THRESH":           35,    # Hanya untuk panel Morph Close (debug)
+    "SOBEL_THRESH":           35,    # Untuk panel Morph Close debug SIRIP
     "MORPH_KERNEL_SIZE":      (13, 5),
 
     # ── SIRIP (RIB): smoothing & threshold ───────────────────────────────────
@@ -54,16 +73,26 @@ FILTER_CONFIG = {
     "THRESH_SIRIP_PV":   15.0,   # batas P-V flatness SIRIP (px)
     "THRESH_SIRIP_MAX":  12.0,   # batas max absolute deviation SIRIP (px)
 
-    # ── SLAT: Robust Profile Extraction ──────────────────────────────────────
-    "SLAT_EDGE_MIN_STRENGTH":  30,    # gradient minimum agar jadi kandidat
-    "SLAT_SEARCH_RADIUS":      25,    # half-width search band dari prev pos (px)
-    "SLAT_MAX_JUMP":           12,    # max step antar kolom sebelum penalti berat (px)
+    # ── SLAT: Upper-Edge Locked Robust Profile Extraction V4.4 ───────────────
+    "SLAT_MIN_STR_FLOOR":      12.0,  # ambang batas minimum gradien (area karat sisi kiri)
+    "SLAT_ADAPTIVE_RATIO":     0.28,  # persentase dari max gradien lokal di kolom tsb
+    "SLAT_HORIZ_DOMINANCE":    0.45,  # rasio min |Sy| / (|Sx| + 1e-5) untuk tolak noise vertikal
+    "SLAT_SEARCH_RADIUS":      22,    # radius search band tracking (px)
+    "SLAT_MAX_JUMP":           10,    # batas max lompatan per step sebelum hard-reject (px)
     "SLAT_PROFILE_STEP":       2,     # step sampling kolom (px)
-    "SLAT_CANDIDATE_TOPN":     5,     # max kandidat per kolom yang diskor
-    "SLAT_INIT_BAND_PCT":      0.40,  # posisi awal = N% dari atas ROI
-    "SLAT_MEDIAN_K":           5,     # kernel median outlier (KECIL = jaga deformasi)
-    "SLAT_SMOOTH_W":           3,     # window moving avg (KECIL = jaga deformasi)
-    "SLAT_CORNER_TRIM_PCT":    0.05,  # potong 5% ujung profil
+    "SLAT_CANDIDATE_TOPN":     5,     # max kandidat per kolom
+    "SLAT_MEDIAN_K":           5,     # kernel median outlier (jaga kelengkungan fisik)
+    "SLAT_SMOOTH_W":           3,     # window moving avg
+    "SLAT_CORNER_TRIM_PCT":    0.04,  # potong 4% ujung ekstrem profil
+    "SLAT_MAX_DROPOUT_STEPS":  8,     # max consecutive missing steps sebelum interpolasi stop
+
+    # ── SLAT: Geometry Normalization V4.5 ─────────────────────────────────────
+    # ROI SLAT menggunakan 4 titik sudut untuk perspective rectification.
+    # Profil dianalisis pada bidang canonical agar perubahan angle/perspektif
+    # kamera tidak langsung mengubah koordinat pixel analisis.
+    "SLAT_NORM_WIDTH":         1000,
+    "SLAT_NORM_HEIGHT":        220,
+    "SLAT_NORM_INTERPOLATION": cv2.INTER_CUBIC,
 
     # ── SLAT: threshold OK/NG ────────────────────────────────────────────────
     "THRESH_SLAT_PV":   18.0,
@@ -72,7 +101,7 @@ FILTER_CONFIG = {
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# UTILITAS
+# UTILITAS FILE & DIALOG
 # ═════════════════════════════════════════════════════════════════════════════
 
 def clean_path_string(p):
@@ -127,7 +156,7 @@ def get_sibling_images(current_path):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# MOUSE CALLBACK
+# MOUSE CALLBACK (ROI SELECTION)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def mouse_callback(event, x, y, flags, param):
@@ -158,7 +187,10 @@ def mouse_callback(event, x, y, flags, param):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _preprocess_roi(frame, polygon_pts, config):
-    """CLAHE -> Bilateral -> Sobel gradient. Dipakai SIRIP dan SLAT."""
+    """
+    CLAHE -> Bilateral -> Sobel (X, Y, Magnitude).
+    Mengembalikan gradien terarah (sx, sy) untuk Upper-Edge Locking.
+    """
     pts  = np.array(polygon_pts, dtype=np.int32)
     h, w = frame.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
@@ -175,10 +207,11 @@ def _preprocess_roi(frame, polygon_pts, config):
                                    d=config["BILATERAL_D"],
                                    sigmaColor=config["BILATERAL_SIGMA_COLOR"],
                                    sigmaSpace=config["BILATERAL_SIGMA_SPACE"])
-    sx   = cv2.Sobel(denoised, cv2.CV_64F, 1, 0, ksize=config["SOBEL_KSIZE"])
-    sy   = cv2.Sobel(denoised, cv2.CV_64F, 0, 1, ksize=config["SOBEL_KSIZE"])
-    grad = cv2.magnitude(sx, sy)
-    grad = np.clip(grad, 0, 255).astype(np.uint8)
+
+    sx_f   = cv2.Sobel(denoised, cv2.CV_64F, 1, 0, ksize=config["SOBEL_KSIZE"])
+    sy_f   = cv2.Sobel(denoised, cv2.CV_64F, 0, 1, ksize=config["SOBEL_KSIZE"])
+    grad_f = cv2.magnitude(sx_f, sy_f)
+    grad   = np.clip(grad_f, 0, 255).astype(np.uint8)
 
     _, thr   = cv2.threshold(grad, config["SOBEL_THRESH"], 255, cv2.THRESH_BINARY)
     ker      = cv2.getStructuringElement(cv2.MORPH_RECT, config["MORPH_KERNEL_SIZE"])
@@ -186,7 +219,8 @@ def _preprocess_roi(frame, polygon_pts, config):
     morph_m  = cv2.bitwise_and(morph, morph, mask=crop_mask)
     grad_m   = cv2.bitwise_and(grad, grad, mask=crop_mask)
 
-    return pts, h, w, rx, ry, rw, rh, crop, crop_mask, gray, enhanced, denoised, grad, morph_m, grad_m
+    return (pts, h, w, rx, ry, rw, rh, crop, crop_mask,
+            gray, enhanced, denoised, grad, morph_m, grad_m, sx_f, sy_f)
 
 
 def _ctx_bounds(frame, ry, rh, rx, rw, is_h):
@@ -201,7 +235,7 @@ def _ctx_bounds(frame, ry, rh, rx, rw, is_h):
 
 
 def _make_panel(frame, pts, crop_mask, ry, rh, rx, rw,
-                cy1, cy2, cx1, cx2, stage, title, pw=500, is_bgr=False):
+                cy1, cy2, cx1, cx2, stage, title, pw=400, is_bgr=False):
     cw = max(1, cx2 - cx1)
     ch = max(1, cy2 - cy1)
     sb = cv2.cvtColor(stage, cv2.COLOR_GRAY2BGR) if not is_bgr else stage.copy()
@@ -209,23 +243,23 @@ def _make_panel(frame, pts, crop_mask, ry, rh, rx, rw,
     cc = cv[ry:ry+rh, rx:rx+rw]
     cc[crop_mask > 0] = sb[crop_mask > 0]
     cv[ry:ry+rh, rx:rx+rw] = cc
-    cv2.polylines(cv, [pts], True, (0, 255, 255), 3)
+    cv2.polylines(cv, [pts], True, (0, 255, 255), 2)
     sub = cv[cy1:cy2, cx1:cx2].copy()
-    gh  = max(200, min(340, int(pw * ch / cw)))
+    gh  = max(180, min(320, int(pw * ch / cw)))
     r   = cv2.resize(sub, (pw, gh))
-    cv2.rectangle(r, (0, 0), (pw, 30), (15, 15, 15), -1)
-    cv2.putText(r, title, (10, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 2)
+    cv2.rectangle(r, (0, 0), (pw, 26), (15, 15, 15), -1)
+    cv2.putText(r, title, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1, cv2.LINE_AA)
     return r
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SIRIP (RIB) — Topmost Edge Algorithm (TIDAK DIUBAH)
+# SIRIP (RIB) — Topmost Edge Algorithm (TIDAK DIUBAH, PROVEN)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def extract_clean_contour(frame, polygon_pts, name="KOMPONEN", config=FILTER_CONFIG):
     """Profil SIRIP: topmost white pixel dari Morph Close. Algoritma asli dipertahankan."""
-    pts, h, w, rx, ry, rw, rh, crop, crop_mask, gray, enhanced, denoised, grad, morph_m, _ = \
-        _preprocess_roi(frame, polygon_pts, config)
+    res = _preprocess_roi(frame, polygon_pts, config)
+    pts, h, w, rx, ry, rw, rh, crop, crop_mask, gray, enhanced, denoised, grad, morph_m, _ = res[:15]
 
     if rw < 20 or rh < 10:
         return None, None, None, rx, ry, rw, rh, pts, None, True
@@ -329,53 +363,337 @@ def draw_sirip_visuals(canvas, d, color=(0, 140, 255)):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SLAT (PLAT DASAR) — Robust Physical Profile Extraction V4.3
+# SLAT (PLAT DASAR) — GEOMETRY NORMALIZATION V4.5
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _find_col_candidates(col_grad, y_min, y_max, min_str, top_n):
+def _order_quad_points(points):
     """
-    Temukan local maxima gradient di range [y_min, y_max].
-    Return list (y, strength) sorted by strength desc, max top_n.
+    Mengurutkan 4 titik sudut ROI menjadi:
+        TL, TR, BR, BL
+
+    V4.5:
+    - Tidak menggunakan metode sum/delta karena dapat gagal pada
+      perspektif kuat dan menghasilkan titik duplikat.
+    - Dua titik dengan y terkecil dianggap sebagai sisi atas.
+    - Dua titik dengan y terbesar dianggap sebagai sisi bawah.
+    - Masing-masing pasangan diurutkan berdasarkan x.
     """
-    lo = max(0, y_min)
-    hi = min(len(col_grad)-1, y_max)
-    if hi - lo < 2:
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+
+    if len(pts) != 4:
+        raise ValueError(
+            f"Perspective normalization membutuhkan tepat 4 titik, "
+            f"tetapi menerima {len(pts)} titik."
+        )
+
+    # Pastikan keempat titik unik.
+    if len(np.unique(pts, axis=0)) != 4:
+        raise ValueError("Empat titik ROI harus berbeda.")
+
+    # Urutkan berdasarkan koordinat Y.
+    by_y = pts[np.argsort(pts[:, 1])]
+
+    top = by_y[:2]
+    bottom = by_y[2:]
+
+    # Pasangan atas: kiri -> kanan.
+    top = top[np.argsort(top[:, 0])]
+    tl, tr = top[0], top[1]
+
+    # Pasangan bawah: kiri -> kanan.
+    bottom = bottom[np.argsort(bottom[:, 0])]
+    bl, br = bottom[0], bottom[1]
+
+    quad = np.array([tl, tr, br, bl], dtype=np.float32)
+
+    # Validasi geometri: quadrilateral tidak boleh degeneratif.
+    area = abs(cv2.contourArea(quad.reshape(-1, 1, 2)))
+    if area < 100.0:
+        raise ValueError(
+            f"Quadrilateral ROI degeneratif (area={area:.1f}px²)."
+        )
+
+    return quad
+
+
+def _normalize_slat_roi(frame, polygon_pts, config):
+    """
+    Mengubah ROI SLAT dari perspektif kamera menjadi canonical plane.
+
+    Input:
+        polygon_pts = 4 titik sudut ROI pada gambar asli.
+
+    Output:
+        normalized_frame : ROI SLAT yang sudah di-rectify
+        normalized_pts   : empat sudut canonical
+        M                 : matrix original -> normalized
+        M_inv             : matrix normalized -> original
+        quad              : empat sudut ROI pada gambar asli
+    """
+    if len(polygon_pts) != 4:
+        raise ValueError(
+            f"ROI SLAT V4.5 membutuhkan 4 titik sudut. "
+            f"Saat ini ada {len(polygon_pts)} titik."
+        )
+
+    quad = _order_quad_points(polygon_pts)
+
+    nw = int(config["SLAT_NORM_WIDTH"])
+    nh = int(config["SLAT_NORM_HEIGHT"])
+
+    if nw < 100 or nh < 40:
+        raise ValueError("Ukuran canonical SLAT terlalu kecil.")
+
+    dst = np.array([
+        [0, 0],
+        [nw - 1, 0],
+        [nw - 1, nh - 1],
+        [0, nh - 1]
+    ], dtype=np.float32)
+
+    M = cv2.getPerspectiveTransform(quad, dst)
+
+    # Validasi matrix sebelum inverse.
+    if not np.all(np.isfinite(M)):
+        raise ValueError("Matrix perspective transform mengandung nilai tidak valid.")
+
+    det = float(np.linalg.det(M))
+    if abs(det) < 1e-10:
+        raise ValueError(
+            f"Perspective transform singular (det={det:.3e})."
+        )
+
+    try:
+        M_inv = np.linalg.inv(M)
+    except np.linalg.LinAlgError:
+        raise ValueError("Perspective transform tidak valid.")
+
+    normalized = cv2.warpPerspective(
+        frame,
+        M,
+        (nw, nh),
+        flags=config["SLAT_NORM_INTERPOLATION"],
+        borderMode=cv2.BORDER_REPLICATE
+    )
+
+    return normalized, dst, M, M_inv, quad
+
+
+def _map_points_from_normalized(points_xy, M_inv):
+    """
+    Memetakan titik dari canonical plane kembali ke koordinat gambar asli.
+    """
+    pts = np.asarray(points_xy, dtype=np.float32).reshape(-1, 1, 2)
+    mapped = cv2.perspectiveTransform(pts, M_inv)
+    return mapped.reshape(-1, 2)
+
+
+def _map_point_from_normalized(x, y, M_inv):
+    mapped = _map_points_from_normalized([(x, y)], M_inv)
+    return float(mapped[0, 0]), float(mapped[0, 1])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SLAT (PLAT DASAR) — Upper-Edge Locked Robust Profile Extraction V4.5
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _find_col_upper_candidates(col_grad, col_sy, col_sx, col_mask, y_lo, y_hi, config):
+    """
+    Mendeteksi kandidat TEPI ATAS pada satu kolom:
+    1. Berada di dalam crop_mask.
+    2. Local maxima gradien vertikal.
+    3. Sy > 3.0 (polaritas positif: transisi dari celah atas gelap -> plat logam).
+       Tepi bawah memiliki Sy < 0 sehingga otomatis TERELIMINASI 100%.
+    4. |Sy| >= SLAT_HORIZ_DOMINANCE * |Sx| (menolak goresan vertikal / noise karat).
+    5. Kekuatan gradien >= threshold adaptif kolom.
+    """
+    lo = max(1, y_lo)
+    hi = min(len(col_grad)-2, y_hi)
+    if hi <= lo:
         return []
-    reg  = col_grad[lo:hi+1].astype(np.float32)
-    cands = []
-    for i in range(1, len(reg)-1):
-        v = reg[i]
-        if v >= min_str and v >= reg[i-1] and v >= reg[i+1]:
-            cands.append((lo+i, float(v)))
-    cands.sort(key=lambda c: c[1], reverse=True)
-    return cands[:top_n]
+
+    cands_raw = []
+    for y in range(lo, hi + 1):
+        if col_mask[y] == 0:
+            continue
+        g   = float(col_grad[y])
+        sy  = float(col_sy[y])
+        sx  = float(col_sx[y])
+
+        # Kunci tepi atas: Sobel Y harus positif (transisi masuk ke plat)
+        if sy <= 3.0:
+            continue
+
+        # Dominansi orientasi horizontal
+        if abs(sy) < config["SLAT_HORIZ_DOMINANCE"] * (abs(sx) + 1e-5):
+            continue
+
+        # Local maxima gradien (terhadap tetangga atas dan bawah)
+        if g >= float(col_grad[y-1]) and g >= float(col_grad[y+1]):
+            cands_raw.append((y, g, sy))
+
+    if not cands_raw:
+        return []
+
+    # Threshold adaptif kolom: mampu menangkap area berkarat di kiri
+    max_g = max(c[1] for c in cands_raw)
+    col_thr = max(config["SLAT_MIN_STR_FLOOR"], max_g * config["SLAT_ADAPTIVE_RATIO"])
+
+    valid = [c for c in cands_raw if c[1] >= col_thr]
+    valid.sort(key=lambda c: c[1], reverse=True)
+    return valid[:config["SLAT_CANDIDATE_TOPN"]]
 
 
-def _score_candidate(y, strength, max_str, prev_y, config):
+def _score_slat_candidate(y, strength, max_str, prev_y, expected_y, rh, config):
     """
-    Score = 55% edge_strength + 45% position_continuity.
-    Penalti berat jika loncatan > 2*max_jump.
-    Tanpa prev_y: hanya berdasarkan strength.
+    Scoring kandidat SLAT:
+    - 60% kontinuitas (jarak terhadap expected_y) + 40% kekuatan relatif.
+    - Loncatan > SLAT_MAX_JUMP -> DISKUALIFIKASI MUTLAK (-1e6).
     """
-    sr  = config["SLAT_SEARCH_RADIUS"]
-    mj  = config["SLAT_MAX_JUMP"]
-    ss  = strength / max_str if max_str > 0 else 0.0
-    if prev_y is None:
-        return ss
-    dist = abs(y - prev_y)
-    if dist > mj * 2:
-        return ss * 0.05   # penalti berat, bukan reject mutlak
+    sr = config["SLAT_SEARCH_RADIUS"]
+    mj = config["SLAT_MAX_JUMP"]
+    ss = strength / max_str if max_str > 0 else 0.0
+
+    dist = abs(y - expected_y)
+    if dist > mj:
+        return -1e6  # Hard reject: dilarang melompat ke tepi lain!
+
     cs = max(0.0, 1.0 - dist / sr)
-    return 0.55 * ss + 0.45 * cs
+    return 0.40 * ss + 0.60 * cs
+
+
+def _find_best_anchor(col_data, rw, rh, config):
+    """
+    Mencari kolom jangkar (anchor) dengan tepi atas paling meyakinkan.
+    Diutamakan di rentang 20% s/d 80% lebar plat di mana tepi atas biasanya solid.
+    """
+    best_score = -1.0
+    best_xc = rw // 2
+    best_cand = None
+
+    x_start = int(rw * 0.15)
+    x_end   = int(rw * 0.85)
+
+    for xc in range(x_start, x_end, config["SLAT_PROFILE_STEP"]):
+        if xc not in col_data or not col_data[xc]:
+            continue
+        cands = col_data[xc]
+        for (y, g, sy) in cands:
+            norm_str = min(1.0, g / 180.0)
+            ub = max(0.0, 1.0 - (y / max(1.0, float(rh))))
+            score = 0.65 * norm_str + 0.35 * ub
+            if score > best_score:
+                best_score = score
+                best_xc = xc
+                best_cand = (y, g, sy)
+
+    if best_cand is None:
+        # Fallback: cari dari semua kolom yang memiliki kandidat
+        for xc in sorted(col_data.keys()):
+            if col_data[xc]:
+                best_xc = xc
+                best_cand = col_data[xc][0]
+                break
+
+    return best_xc, best_cand
+
+
+def _track_slat_profile_bidirectional(col_data, rw, rh, config):
+    """
+    Pelacakan dua arah dari anchor:
+    - Pass maju: anchor -> kanan (rw)
+    - Pass mundur: anchor -> kiri (0)
+    Menggunakan proyeksi forward-slope saat dropout untuk mempertahankan kesinambungan.
+    Menghasilkan profil 100% bentang plat.
+    """
+    anchor_xc, anchor_cand = _find_best_anchor(col_data, rw, rh, config)
+    if anchor_cand is None:
+        return [], None, None
+
+    step = config["SLAT_PROFILE_STEP"]
+    max_drop = config["SLAT_MAX_DROPOUT_STEPS"]
+
+    # ── Pass 1: Dari anchor ke kanan ─────────────────────────────────────────
+    right_pts = [(anchor_xc, anchor_cand[0])]
+    prev_y = float(anchor_cand[0])
+    slope = 0.0
+    dropout_count = 0
+
+    for xc in range(anchor_xc + step, rw, step):
+        cands = col_data.get(xc, [])
+        best_cand = None
+        best_sc = -1e5
+        max_str = max([c[1] for c in cands]) if cands else 1.0
+        exp_y = prev_y + slope * step
+
+        for (cy, cg, csy) in cands:
+            sc = _score_slat_candidate(cy, cg, max_str, prev_y, exp_y, rh, config)
+            if sc > best_sc:
+                best_sc = sc
+                best_cand = (cy, cg)
+
+        if best_cand is not None and best_sc > 0:
+            act_y = float(best_cand[0])
+            new_slope = (act_y - prev_y) / float(step)
+            slope = 0.7 * slope + 0.3 * np.clip(new_slope, -1.2, 1.2)
+            prev_y = act_y
+            dropout_count = 0
+            right_pts.append((xc, int(round(prev_y))))
+        else:
+            # Dropout handling: teruskan estimasi lintasan
+            dropout_count += 1
+            if dropout_count <= max_drop:
+                prev_y = float(np.clip(prev_y + slope * step, 0, rh - 1))
+                right_pts.append((xc, int(round(prev_y))))
+            else:
+                break
+
+    # ── Pass 2: Dari anchor ke kiri ──────────────────────────────────────────
+    left_pts = []
+    prev_y = float(anchor_cand[0])
+    slope = 0.0
+    dropout_count = 0
+
+    for xc in range(anchor_xc - step, -1, -step):
+        cands = col_data.get(xc, [])
+        best_cand = None
+        best_sc = -1e5
+        max_str = max([c[1] for c in cands]) if cands else 1.0
+        exp_y = prev_y + slope * (-step)
+
+        for (cy, cg, csy) in cands:
+            sc = _score_slat_candidate(cy, cg, max_str, prev_y, exp_y, rh, config)
+            if sc > best_sc:
+                best_sc = sc
+                best_cand = (cy, cg)
+
+        if best_cand is not None and best_sc > 0:
+            act_y = float(best_cand[0])
+            new_slope = (act_y - prev_y) / float(-step)
+            slope = 0.7 * slope + 0.3 * np.clip(new_slope, -1.2, 1.2)
+            prev_y = act_y
+            dropout_count = 0
+            left_pts.append((xc, int(round(prev_y))))
+        else:
+            dropout_count += 1
+            if dropout_count <= max_drop:
+                prev_y = float(np.clip(prev_y + slope * (-step), 0, rh - 1))
+                left_pts.append((xc, int(round(prev_y))))
+            else:
+                break
+
+    # Gabungkan: sisi kiri (dibalik) + sisi kanan
+    full_path = list(reversed(left_pts)) + right_pts
+    return full_path, anchor_xc, anchor_cand
 
 
 def _reject_slat_outliers(x_arr, y_arr, config):
     """
     Outlier rejection KONSERVATIF:
     1. Isolated spike removal (jauh dari KEDUA tetangga, tetangga saling dekat).
-       Deformasi kontinu (arch, concave) TIDAK dihapus.
-    2. Gentle median filter (kernel KECIL).
-    3. Light moving average  (window KECIL).
+       Deformasi kontinu (arch / concave) TIDAK dihapus.
+    2. Gentle median filter (kernel KECIL = 5).
+    3. Light moving average (window KECIL = 3).
     """
     if len(y_arr) < 5:
         return x_arr, y_arr
@@ -411,158 +729,260 @@ def _reject_slat_outliers(x_arr, y_arr, config):
     return x_arr, y_out
 
 
-def extract_slat_profile_robust(frame, polygon_pts, config=FILTER_CONFIG):
+def extract_slat_profile_robust_v44(frame, polygon_pts, config=FILTER_CONFIG):
     """
-    Robust SLAT Physical Profile Extraction V4.3.
+    SLAT Physical Profile Extraction V4.5.
 
-    Pipeline:
-      ROI -> CLAHE -> Bilateral -> Sobel gradient
-      -> per-column local maxima detection   (BUKAN first white pixel)
-      -> candidate scoring: strength + continuity
-      -> search band tracking (+/- SLAT_SEARCH_RADIUS)
-      -> spike rejection (deformasi kontinu DIPERTAHANKAN)
-      -> gentle smoothing (kernel kecil)
-
-    Morph Close dibuat untuk panel debug #6 saja, TIDAK untuk profil.
-
-    Returns:
-      profile_x, profile_y  – array profil (koordinat frame)
-      dbg_cands             – list (xf, yf, strength) semua kandidat ditemukan
-      dbg_rej               – list (xf, yf) kolom tanpa kandidat valid
-      filter_grid           – gambar 8-panel debug
-      roi_info              – (rx, ry, rw, rh, pts)
+    Perubahan utama:
+    - ROI SLAT di-rectify lebih dahulu menggunakan perspective transform.
+    - Semua filter/tracking V4.4 bekerja pada canonical plane.
+    - Hasil profile tetap berada di canonical coordinates agar metrologi
+      tidak langsung terpengaruh oleh angle/perspektif kamera.
     """
-    pts, h, w, rx, ry, rw, rh, crop, crop_mask, gray, enhanced, denoised, grad, morph_m, grad_m = \
-        _preprocess_roi(frame, polygon_pts, config)
+    # ── Geometry normalization ──────────────────────────────────────────────
+    try:
+        normalized_frame, normalized_pts, M, M_inv, quad = \
+            _normalize_slat_roi(frame, polygon_pts, config)
+    except ValueError as e:
+        print(f"\n⚠️ [SLAT V4.5] Geometry normalization gagal: {e}")
+        d = np.zeros((200, 500, 3), np.uint8)
+        cv2.putText(
+            d, "SLAT ROI NEEDS 4 CORNERS",
+            (10, 100),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2
+        )
+        return None, None, [], d, {
+            "rx": 0, "ry": 0, "rw": 0, "rh": 0,
+            "pts": np.asarray(polygon_pts, dtype=np.int32),
+            "quad": np.asarray(polygon_pts, dtype=np.float32),
+            "M": None,
+            "M_inv": None,
+            "normalized": False
+        }
 
-    is_h = (rw >= rh)
-    cy1, cy2, cx1, cx2 = _ctx_bounds(frame, ry, rh, rx, rw, is_h)
-    PW = 400   # 4 panel per baris -> lebar total 1600px
+    # ── Preprocessing V4.4, tetapi pada canonical plane ─────────────────────
+    res = _preprocess_roi(
+        normalized_frame,
+        normalized_pts,
+        config
+    )
+
+    pts, h, w, rx, ry, rw, rh, crop, crop_mask, gray, enhanced, \
+        denoised, grad, morph_m, grad_m, sx_f, sy_f = res
+
+    # Canonical ROI seharusnya berupa rectangle penuh.
+    is_h = True
+    cy1, cy2, cx1, cx2 = _ctx_bounds(
+        normalized_frame, ry, rh, rx, rw, is_h
+    )
+    PW = 400
 
     def mkp(s, t, b=False):
-        return _make_panel(frame, pts, crop_mask, ry, rh, rx, rw, cy1, cy2, cx1, cx2, s, t, PW, b)
+        return _make_panel(
+            normalized_frame, pts, crop_mask,
+            ry, rh, rx, rw,
+            cy1, cy2, cx1, cx2,
+            s, t, PW, b
+        )
 
-    # Guard ROI terlalu kecil
     if rw < 20 or rh < 10:
-        d = np.zeros((220, PW, 3), np.uint8)
-        cv2.putText(d, "ROI INVALID", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-        grid = np.vstack([np.hstack([d]*4), np.hstack([d]*4)])
-        return None, None, [], [], grid, (rx, ry, rw, rh, pts)
+        d = np.zeros((200, PW, 3), np.uint8)
+        cv2.putText(
+            d, "ROI INVALID",
+            (10, 100),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2
+        )
+        grid = np.vstack([np.hstack([d] * 4), np.hstack([d] * 4)])
+        return None, None, [], grid, {
+            "rx": rx, "ry": ry, "rw": rw, "rh": rh,
+            "pts": pts, "quad": quad, "M": M, "M_inv": M_inv,
+            "normalized": True
+        }
 
-    # ── Deteksi kandidat per kolom ───────────────────────────────────────────
-    min_str  = config["SLAT_EDGE_MIN_STRENGTH"]
-    sr       = config["SLAT_SEARCH_RADIUS"]
-    step     = config["SLAT_PROFILE_STEP"]
-    top_n    = config["SLAT_CANDIDATE_TOPN"]
-    init_pct = config["SLAT_INIT_BAND_PCT"]
-
-    init_y  = int(rh * init_pct)   # posisi awal estimasi (crop coords)
-    prev_y  = None                  # tracking posisi edge sebelumnya
-
-    raw_x, raw_y = [], []
-    dbg_cands    = []   # (xf, yf, strength)
-    dbg_rej      = []   # (xf, yf)
+    # ── Deteksi kandidat Upper-Edge ─────────────────────────────────────────
+    step = config["SLAT_PROFILE_STEP"]
+    col_data = {}
+    dbg_all_cands = []
 
     for xc in range(0, rw, step):
-        col = grad_m[:, xc].astype(np.float32)
+        col_g = grad_m[:, xc]
+        col_sy = sy_f[:, xc]
+        col_sx = sx_f[:, xc]
+        col_m = crop_mask[:, xc]
 
-        # Search band
-        if prev_y is None:
-            ylo = max(0, init_y - sr*2);  yhi = min(rh-1, init_y + sr*2)
-        else:
-            ylo = max(0, prev_y - sr);    yhi = min(rh-1, prev_y + sr)
+        cands = _find_col_upper_candidates(
+            col_g, col_sy, col_sx, col_m,
+            0, rh - 1,
+            config
+        )
 
-        cands = _find_col_candidates(col, ylo, yhi, min_str, top_n)
+        col_data[xc] = cands
 
-        if not cands:
-            ref = prev_y if prev_y is not None else init_y
-            dbg_rej.append((rx+xc, ry+ref))
-            continue
+        for cy, cg, csy in cands:
+            dbg_all_cands.append((xc, cy, cg))
 
-        msb = max(c[1] for c in cands)
-        best_y, best_sc = None, -1.0
+    # ── Bidirectional tracking ──────────────────────────────────────────────
+    raw_path, anchor_xc, anchor_cand = \
+        _track_slat_profile_bidirectional(
+            col_data, rw, rh, config
+        )
 
-        for (cy_loc, cstr) in cands:
-            dbg_cands.append((rx+xc, ry+cy_loc, cstr))
-            sc = _score_candidate(cy_loc, cstr, msb, prev_y, config)
-            if sc > best_sc:
-                best_sc = sc;  best_y = cy_loc
+    # ── Visualisasi debug ───────────────────────────────────────────────────
+    sy_pos = np.clip(sy_f, 0, 255).astype(np.uint8)
+    sy_pos_m = cv2.bitwise_and(
+        sy_pos, sy_pos, mask=crop_mask
+    )
 
-        if best_y is None:
-            ref = prev_y if prev_y is not None else init_y
-            dbg_rej.append((rx+xc, ry+ref))
-            continue
+    dir_mask = np.zeros((rh, rw), np.uint8)
+    cond = (
+        (sy_f > 3.0) &
+        (
+            np.abs(sy_f)
+            >= config["SLAT_HORIZ_DOMINANCE"]
+            * (np.abs(sx_f) + 1e-5)
+        )
+    )
+    dir_mask[cond & (crop_mask > 0)] = 255
 
-        raw_x.append(rx+xc);  raw_y.append(ry+best_y)
-        prev_y = best_y
-
-    # ── Panel debug 7 & 8 ────────────────────────────────────────────────────
     cvis = np.zeros((rh, rw, 3), np.uint8)
-    for (xf, yf, cstr) in dbg_cands:
-        inten = int(np.clip(cstr/255*255, 60, 255))
-        yc, xcc = yf-ry, xf-rx
-        if 0 <= yc < rh and 0 <= xcc < rw:
-            cv2.circle(cvis, (xcc, yc), 2, (0, inten, inten), -1)
-    for (xf, yf) in dbg_rej:
-        yc, xcc = yf-ry, xf-rx
-        if 0 <= yc < rh and 0 <= xcc < rw:
-            cv2.circle(cvis, (xcc, yc), 1, (50, 0, 0), -1)
-    cvis = cv2.bitwise_and(cvis, cvis, mask=crop_mask)
+
+    for xf, yf, cg in dbg_all_cands:
+        if 0 <= yf < rh and 0 <= xf < rw:
+            cv2.circle(
+                cvis,
+                (int(xf), int(yf)),
+                2,
+                (255, 255, 0),
+                -1
+            )
+
+    if anchor_cand is not None:
+        cv2.circle(
+            cvis,
+            (int(anchor_xc), int(anchor_cand[0])),
+            5,
+            (0, 0, 255),
+            -1
+        )
+
+    cvis = cv2.bitwise_and(
+        cvis, cvis, mask=crop_mask
+    )
 
     svis = np.zeros((rh, rw, 3), np.uint8)
-    if len(raw_x) >= 2:
-        psel = np.array([[xi-rx, yi-ry] for xi, yi in zip(raw_x, raw_y)], np.int32)
-        cv2.polylines(svis, [psel], False, (0, 255, 255), 2)
-    svis = cv2.bitwise_and(svis, svis, mask=crop_mask)
 
-    p1 = mkp(crop,    "1. Foto Asli+ROI (SLAT)", True)
-    p2 = mkp(gray,    "2. Grayscale")
-    p3 = mkp(enhanced,"3. CLAHE")
-    p4 = mkp(denoised,"4. Bilateral")
-    p5 = mkp(grad,    "5. Gradient (Sobel)")
-    p6 = mkp(morph_m, "6. Morph Close [DEBUG - tdk dipakai]")
-    p7 = mkp(cvis,    "7. Candidate Edges (cyan=kuat)", True)
-    p8 = mkp(svis,    "8. Selected Profile (cyan=final)", True)
+    if len(raw_path) >= 2:
+        psel = np.array(
+            [[pt[0], pt[1]] for pt in raw_path],
+            np.int32
+        )
 
-    filter_grid = np.vstack([np.hstack([p1, p2, p3, p4]),
-                              np.hstack([p5, p6, p7, p8])])
+        cv2.polylines(
+            svis,
+            [psel],
+            False,
+            (0, 255, 255),
+            2
+        )
 
-    if len(raw_x) < 20:
-        return None, None, dbg_cands, dbg_rej, filter_grid, (rx, ry, rw, rh, pts)
+        cv2.line(
+            svis,
+            tuple(raw_path[0]),
+            tuple(raw_path[-1]),
+            (0, 140, 255),
+            2
+        )
 
-    rx_a = np.array(raw_x, np.float32)
-    ry_a = np.array(raw_y, np.float32)
+    svis = cv2.bitwise_and(
+        svis, svis, mask=crop_mask
+    )
 
-    # Corner trim
-    tr = max(2, int(config["SLAT_CORNER_TRIM_PCT"] * len(rx_a)))
-    rx_a, ry_a = rx_a[tr:-tr], ry_a[tr:-tr]
+    p1 = mkp(
+        normalized_frame,
+        "1. Normalized ROI",
+        True
+    )
+    p2 = mkp(gray, "2. Grayscale")
+    p3 = mkp(enhanced, "3. CLAHE")
+    p4 = mkp(denoised, "4. Bilateral")
+    p5 = mkp(sy_pos_m, "5. Sobel Y (Canonical)")
+    p6 = mkp(dir_mask, "6. Mask Upper Dominance")
+    p7 = mkp(cvis, "7. Upper Candidates & Anchor", True)
+    p8 = mkp(svis, "8. Profile & Reference Line", True)
 
-    # Outlier rejection konservatif
-    px, py = _reject_slat_outliers(rx_a, ry_a, config)
+    filter_grid = np.vstack([
+        np.hstack([p1, p2, p3, p4]),
+        np.hstack([p5, p6, p7, p8])
+    ])
 
-    return px, py, dbg_cands, dbg_rej, filter_grid, (rx, ry, rw, rh, pts)
+    if len(raw_path) < 20:
+        return None, None, dbg_all_cands, filter_grid, {
+            "rx": rx, "ry": ry, "rw": rw, "rh": rh,
+            "pts": pts, "quad": quad,
+            "M": M, "M_inv": M_inv,
+            "normalized": True
+        }
+
+    raw_x = np.array(
+        [rx + pt[0] for pt in raw_path],
+        np.float32
+    )
+    raw_y = np.array(
+        [ry + pt[1] for pt in raw_path],
+        np.float32
+    )
+
+    tr = max(
+        2,
+        int(config["SLAT_CORNER_TRIM_PCT"] * len(raw_x))
+    )
+
+    raw_x = raw_x[tr:-tr]
+    raw_y = raw_y[tr:-tr]
+
+    px, py = _reject_slat_outliers(
+        raw_x, raw_y, config
+    )
+
+    return px, py, dbg_all_cands, filter_grid, {
+        "rx": rx,
+        "ry": ry,
+        "rw": rw,
+        "rh": rh,
+        "pts": pts,
+        "quad": quad,
+        "M": M,
+        "M_inv": M_inv,
+        "normalized": True,
+        "original_frame_shape": frame.shape[:2]
+    }
 
 
-def analyze_slat_profile(px, py, dbg_cands, dbg_rej, filter_grid, roi_info, config):
+def analyze_slat_profile(px, py, dbg_cands, filter_grid, roi_info, config):
     """
-    Metrologi SLAT V4.3: P-V + Max Abs Deviation.
-    Reference line = endpoint-to-endpoint profil fisik.
+    Metrologi SLAT V4.5: P-V + Max Abs Deviation.
+    Reference line = menghubungkan ujung kiri tepi atas ke ujung kanan tepi atas.
     OK/NG = (P-V > thresh_pv) OR (max_abs > thresh_max).
     """
-    rx, ry, rw, rh, pts = roi_info
+    rx = roi_info["rx"]
+    ry = roi_info["ry"]
+    rw = roi_info["rw"]
+    rh = roi_info["rh"]
+    pts = roi_info["pts"]
+    M_inv = roi_info.get("M_inv")
+    quad = roi_info.get("quad")
     tpv, tmx = config["THRESH_SLAT_PV"], config["THRESH_SLAT_MAX"]
-    nc, nr    = len(dbg_cands), len(dbg_rej)
+    nc = len(dbg_cands)
 
     if px is None or len(px) < 15:
         nv = len(px) if px is not None else 0
-        print(f"\n{'='*55}\n  SLAT PROFILE DEBUG\n{'─'*55}")
+        print(f"\n{'='*55}\n  SLAT PROFILE DEBUG (V4.4)\n{'─'*55}")
         print(f"  Valid points       : {nv}  <- TERLALU SEDIKIT")
         print(f"  Total candidates   : {nc}")
-        print(f"  Rejected cols      : {nr}")
         print(f"  STATUS             : GAGAL\n{'='*55}")
         return {'success': False, 'name': 'PLAT DASAR',
                 'msg': f'Profil tidak cukup ({nv} titik, butuh >=15)',
-                'n_valid': nv, 'n_candidates': nc, 'n_rejected': nr,
+                'n_valid': nv, 'n_candidates': nc,
                 'grid': filter_grid, 'pts': pts}
 
     nv = len(px)
@@ -572,9 +992,9 @@ def analyze_slat_profile(px, py, dbg_cands, dbg_rej, filter_grid, roi_info, conf
 
     if sp < 1e-3:
         return {'success': False, 'name': 'PLAT DASAR', 'msg': 'Bentang terlalu pendek',
-                'grid': filter_grid, 'pts': pts,
-                'n_valid': nv, 'n_candidates': nc, 'n_rejected': nr}
+                'grid': filter_grid, 'pts': pts, 'n_valid': nv, 'n_candidates': nc}
 
+    # Perpendicular distance ke reference line
     perp = ((y2-y1)*px - (x2-x1)*py + x2*y1 - y2*x1) / sp
     pv   = float(np.max(perp) - np.min(perp))
     ma   = float(np.max(np.abs(perp)))
@@ -594,13 +1014,13 @@ def analyze_slat_profile(px, py, dbg_cands, dbg_rej, filter_grid, roi_info, conf
     dx_, dy_ = x2-x1, y2-y1
     t   = ((pkx-x1)*dx_ + (pky-y1)*dy_) / (sp**2)
 
-    print(f"\n{'='*55}\n  SLAT PROFILE DEBUG\n{'─'*55}")
-    print(f"  Valid points       : {nv}")
-    print(f"  Total candidates   : {nc}")
-    print(f"  Rejected cols      : {nr}")
-    print(f"  P-V Flatness       : {pv:.2f} px  (threshold: {tpv} px)")
-    print(f"  Max Abs Deviation  : {ma:.2f} px  (threshold: {tmx} px)")
-    print(f"  STATUS             : {ss}")
+    print(f"\n{'='*55}\n  SLAT PROFILE DEBUG (V4.5 GEOMETRY NORMALIZED + UPPER-EDGE LOCKED)\n{'─'*55}")
+    print(f"  Valid profile points : {nv}")
+    print(f"  Total candidates     : {nc}")
+    print(f"  Profile Span (X)     : {x1:.1f} -> {x2:.1f} (Lebar: {x2-x1:.1f}px)")
+    print(f"  P-V Flatness         : {pv:.2f} px  (threshold: {tpv} px)")
+    print(f"  Max Abs Deviation    : {ma:.2f} px  (threshold: {tmx} px)")
+    print(f"  STATUS               : {ss}")
     print(f"{'='*55}")
 
     return {'success': True, 'name': 'PLAT DASAR', 'pts': pts,
@@ -610,35 +1030,129 @@ def analyze_slat_profile(px, py, dbg_cands, dbg_rej, filter_grid, roi_info, conf
             'proj_x': x1+t*dx_, 'proj_y': y1+t*dy_,
             'pv_flatness': pv, 'max_abs': ma,
             'is_ng': ng, 'status_str': ss, 'grid': filter_grid,
-            'n_valid': nv, 'n_candidates': nc, 'n_rejected': nr}
+            'n_valid': nv, 'n_candidates': nc,
+            'M_inv': M_inv, 'quad': quad,
+            'normalized': bool(roi_info.get("normalized", False))}
 
 
 def draw_slat_visuals(canvas, d):
     """
-    Visualisasi SLAT V4.3:
-      ROI outline    – cyan tipis
-      Reference line – ORANGE
-      Profile fisik  – KUNING TERANG
-      Deviasi max    – MAGENTA (vektor + circle)
+    Visualisasi SLAT V4.5 pada koordinat gambar asli.
+
+    Metrologi dilakukan pada canonical plane.
+    Visualisasi dikembalikan ke gambar asli menggunakan inverse homography.
     """
     if not d.get('success'):
         return
-    cv2.polylines(canvas, [d['pts']], True, (0, 200, 200), 1)
-    # Reference line (ORANGE)
-    cv2.line(canvas, (int(d['x_left']), int(d['y_left'])),
-             (int(d['x_right']), int(d['y_right'])), (0, 165, 255), 3)
-    # Profile fisik (KUNING)
-    cv2.polylines(canvas,
-                  [np.column_stack((d['edge_x'], d['edge_y'])).astype(np.int32)],
-                  False, (255, 255, 0), 2)
-    # Max deviation (MAGENTA)
-    cv2.line(canvas, (int(d['proj_x']), int(d['proj_y'])),
-             (int(d['peak_x']), int(d['peak_y_actual'])), (255, 0, 255), 4)
-    cv2.circle(canvas, (int(d['peak_x']), int(d['peak_y_actual'])), 6, (255, 0, 255), -1)
+
+    M_inv = d.get("M_inv")
+
+    edge = np.column_stack(
+        (d['edge_x'], d['edge_y'])
+    ).astype(np.float32)
+
+    # Jika normalization aktif, kembalikan profile ke gambar asli.
+    if M_inv is not None:
+        edge_orig = _map_points_from_normalized(edge, M_inv)
+        left_orig = _map_point_from_normalized(
+            d['x_left'], d['y_left'], M_inv
+        )
+        right_orig = _map_point_from_normalized(
+            d['x_right'], d['y_right'], M_inv
+        )
+        peak_orig = _map_point_from_normalized(
+            d['peak_x'], d['peak_y_actual'], M_inv
+        )
+        proj_orig = _map_point_from_normalized(
+            d['proj_x'], d['proj_y'], M_inv
+        )
+
+        cv2.polylines(
+            canvas,
+            [np.asarray(d['quad'], np.int32)],
+            True,
+            (0, 200, 200),
+            2
+        )
+
+        # Reference line pada canonical plane, kemudian dipetakan ke image.
+        cv2.line(
+            canvas,
+            (int(left_orig[0]), int(left_orig[1])),
+            (int(right_orig[0]), int(right_orig[1])),
+            (0, 165, 255),
+            3
+        )
+
+        cv2.polylines(
+            canvas,
+            [edge_orig.astype(np.int32)],
+            False,
+            (255, 255, 0),
+            2
+        )
+
+        cv2.line(
+            canvas,
+            (int(proj_orig[0]), int(proj_orig[1])),
+            (int(peak_orig[0]), int(peak_orig[1])),
+            (255, 0, 255),
+            4
+        )
+
+        cv2.circle(
+            canvas,
+            (int(peak_orig[0]), int(peak_orig[1])),
+            6,
+            (255, 0, 255),
+            -1
+        )
+
+    else:
+        # Fallback untuk data lama tanpa normalization.
+        cv2.polylines(
+            canvas,
+            [d['pts']],
+            True,
+            (0, 200, 200),
+            1
+        )
+
+        cv2.line(
+            canvas,
+            (int(d['x_left']), int(d['y_left'])),
+            (int(d['x_right']), int(d['y_right'])),
+            (0, 165, 255),
+            3
+        )
+
+        cv2.polylines(
+            canvas,
+            [edge.astype(np.int32)],
+            False,
+            (255, 255, 0),
+            2
+        )
+
+        cv2.line(
+            canvas,
+            (int(d['proj_x']), int(d['proj_y'])),
+            (int(d['peak_x']), int(d['peak_y_actual'])),
+            (255, 0, 255),
+            4
+        )
+
+        cv2.circle(
+            canvas,
+            (int(d['peak_x']), int(d['peak_y_actual'])),
+            6,
+            (255, 0, 255),
+            -1
+        )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# KONTROL PROGRAM
+# KONTROL PROGRAM & WINDOW
 # ═════════════════════════════════════════════════════════════════════════════
 
 def reset_state():
@@ -677,7 +1191,7 @@ def interactive_multi_roi_session(initial_image_path, config=FILTER_CONFIG):
 
         h, w = frame.shape[:2]
         fn   = os.path.basename(image_path)
-        wn   = f"INSPEKSI SLAT & RIB V4.3 (ROBUST PROFILE) - [{fn}]"
+        wn   = f"INSPEKSI SLAT & RIB V4.4 (UPPER-EDGE LOCKED) - [{fn}]"
 
         cv2.namedWindow(wn, cv2.WINDOW_NORMAL)
         ww = min(1360, max(700, w));  wh = min(850, int(ww*h/w))
@@ -697,12 +1211,12 @@ def interactive_multi_roi_session(initial_image_path, config=FILTER_CONFIG):
               f"Morph={config['MORPH_KERNEL_SIZE']}")
         print(f"   SIRIP  : PV≤{t_spv}px, Max≤{t_smx}px")
         print(f"   SLAT   : PV≤{t_lpv}px, Max≤{t_lmx}px  "
-              f"| radius={config['SLAT_SEARCH_RADIUS']}px "
-              f"| min_str={config['SLAT_EDGE_MIN_STRENGTH']} "
+              f"| floor_str={config['SLAT_MIN_STR_FLOOR']} "
+              f"| adaptive_ratio={config['SLAT_ADAPTIVE_RATIO']} "
               f"| max_jump={config['SLAT_MAX_JUMP']}px")
-        print("📋 PANDUAN V4.3:")
+        print("📋 PANDUAN V4.4:")
         print("   [TAHAP 1] Klik >=4 sudut SIRIP (RIB)       → [ENTER]")
-        print("   [TAHAP 2] Klik >=4 sudut PLAT DASAR (SLAT) → [ENTER]")
+        print("   [TAHAP 2] Klik tepat 4 sudut PLAT DASAR (SLAT) → [ENTER]")
         print("   [Klik Kiri] Tambah  |  [Klik Kanan] Undo")
         print("   [P] Filter debug  |  [R] Reset  |  [N] Ganti foto")
         print("   [D/→] Foto berikut  |  [A/←] Foto sebelum  |  [Q/ESC] Keluar")
@@ -751,7 +1265,7 @@ def interactive_multi_roi_session(initial_image_path, config=FILTER_CONFIG):
             else:
                 cv2.imshow(wn, result_frame);  key = cv2.waitKey(30) & 0xFF
 
-            # ── Keyboard ─────────────────────────────────────────────────────
+            # ── Keyboard Handling ────────────────────────────────────────────
 
             if key in [13, 32]:   # ENTER / SPACE
                 if current_step == 1:
@@ -762,25 +1276,25 @@ def interactive_multi_roi_session(initial_image_path, config=FILTER_CONFIG):
                         print("  ⚠️ Klik minimal 3 titik untuk SIRIP!")
 
                 elif current_step == 2:
-                    if len(points_slat) >= 3:
-                        print("\n⚙️  Memproses V4.3 (Robust Profile)...")
+                    if len(points_slat) == 4:
+                        print("\n⚙️  Memproses V4.5 (Geometry Normalized + Upper-Edge Locked)...")
 
                         # SIRIP: algoritma topmost (tidak diubah)
-                        c_sir  = extract_clean_contour(frame, points_sirip, "SIRIP", config)
-                        l_sir  = analyze_sirip_pv(c_sir, config)
+                        c_sir = extract_clean_contour(frame, points_sirip, "SIRIP", config)
+                        l_sir = analyze_sirip_pv(c_sir, config)
 
-                        # SLAT: robust candidate-scoring pipeline
-                        px, py, dc, dr, sgrid, roi = \
-                            extract_slat_profile_robust(frame, points_slat, config)
-                        l_sla  = analyze_slat_profile(px, py, dc, dr, sgrid, roi, config)
+                        # SLAT: Upper-Edge Locked Robust Profile Pipeline V4.4
+                        px, py, dc, sgrid, roi = \
+                            extract_slat_profile_robust_v44(frame, points_slat, config)
+                        l_sla = analyze_slat_profile(px, py, dc, sgrid, roi, config)
 
                         if not l_sir.get('success') or not l_sla.get('success'):
                             msg = l_sir.get('msg','') if not l_sir.get('success') else l_sla.get('msg','')
                             print(f"  ⚠️ [ERROR] {msg}");  continue
 
                         # Simpan ke variabel sesi agar tombol P bisa akses
-                        last_sirip   = l_sir
-                        last_slat    = l_sla
+                        last_sirip = l_sir
+                        last_slat  = l_sla
 
                         result_frame = frame.copy()
                         draw_sirip_visuals(result_frame, last_sirip)
@@ -802,7 +1316,7 @@ def interactive_multi_roi_session(initial_image_path, config=FILTER_CONFIG):
                                     (20, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (220, 220, 220), 2)
 
                         print("\n" + "="*70)
-                        print("📊 LAPORAN METROLOGI V4.3:")
+                        print("📊 LAPORAN METROLOGI V4.4:")
                         print(f"   SIRIP      : {l_sir['status_str']}")
                         print(f"   → P-V: {l_sir['pv_flatness']:.1f}px (≤{t_spv}) | "
                               f"Max: {l_sir['max_abs']:.1f}px (≤{t_smx})")
@@ -810,17 +1324,22 @@ def interactive_multi_roi_session(initial_image_path, config=FILTER_CONFIG):
                         print(f"   → P-V: {l_sla['pv_flatness']:.1f}px (≤{t_lpv}) | "
                               f"Max: {l_sla['max_abs']:.1f}px (≤{t_lmx})")
                         print(f"   → Valid pts: {l_sla['n_valid']} | "
-                              f"Candidates: {l_sla['n_candidates']} | "
-                              f"Rejected cols: {l_sla['n_rejected']}")
+                              f"Candidates: {l_sla['n_candidates']}")
                         print("="*70)
 
                         current_step = 3
                         base, ext  = os.path.splitext(image_path)
-                        save_path  = f"{base}_hasil_v4_3{ext}"
+                        save_path  = f"{base}_hasil_v4_4{ext}"
                         cv2.imwrite(save_path, result_frame)
                         print(f"  💾 Disimpan: {os.path.basename(save_path)}")
+
+                        # ──────────────────────────────────────────────────────────────
+                        # ✅ SIMPAN KE SQL SERVER (Lengkap dengan Path Hasil Anotasi)
+                        # ──────────────────────────────────────────────────────────────
+                        save_inspection_to_db(image_path, l_sir, l_sla, annotated_path=save_path)
+                        # ──────────────────────────────────────────────────────────────
                     else:
-                        print("  ⚠️ Klik minimal 3 titik untuk PLAT DASAR!")
+                        print("  ⚠️ Klik tepat 4 titik sudut untuk PLAT DASAR (SLAT)!")
 
             elif key in [ord('p'), ord('P')] and current_step == 3:
                 if last_sirip is not None and last_sirip.get('grid') is not None:
@@ -829,7 +1348,7 @@ def interactive_multi_roi_session(initial_image_path, config=FILTER_CONFIG):
                     cv2.resizeWindow(ws_, 1500, 620)
                     cv2.imshow(ws_, last_sirip['grid'])
                 if last_slat is not None and last_slat.get('grid') is not None:
-                    wsl = "FILTER: PLAT DASAR (8 Panel V4.3)"
+                    wsl = "FILTER: PLAT DASAR (8 Panel V4.5)"
                     cv2.namedWindow(wsl, cv2.WINDOW_NORMAL)
                     cv2.resizeWindow(wsl, 1600, 680)
                     cv2.imshow(wsl, last_slat['grid'])
@@ -885,8 +1404,8 @@ def interactive_multi_roi_session(initial_image_path, config=FILTER_CONFIG):
 if __name__ == "__main__":
     print("\n" + "#"*75)
     print("  AI / Computer Vision - Inspeksi Deformasi Slat & Rib Conveyor")
-    print("  V4.3 - Robust Physical Profile Extraction")
-    print("  SLAT : Gradient Candidate Scoring + Continuity Tracking")
+    print("  V4.4 - Upper-Edge Locked Robust Profile Extraction")
+    print("  SLAT : Directional Sobel Y (Sy > 0) + Bidirectional Anchor Tracking")
     print("  SIRIP: Topmost Edge Algorithm (unchanged, proven)")
     print("#"*75)
 

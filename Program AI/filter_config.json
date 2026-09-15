@@ -1,0 +1,21 @@
+{
+  "ENV_NAME": "sample_03_tampak_samping_miring_ok.jpg",
+  "BEST_FILTER_NAME": "8. Adaptive Contrast Normalizer",
+  "SCORE": 100.0,
+  "SMOOTHNESS": 100.0,
+  "PV_FLATNESS": 0.0,
+  "SPIKES_COUNT": 0,
+  "EXEC_TIME_MS": 3.98,
+  "PARAMETERS": {
+    "filter_type": "adaptive_contrast",
+    "local_kernel": [
+      21,
+      5
+    ],
+    "thresh": 30,
+    "morph": [
+      11,
+      5
+    ]
+  }
+}

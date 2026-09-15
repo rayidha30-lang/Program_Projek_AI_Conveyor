@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
@@ -23,28 +23,22 @@ import {
   Wrench,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  fetchHealth,
+  fetchStats,
+  fetchInspections,
+  fetchEvidence,
+  submitInspectionAction,
+  fetchAnalytics,
+  getImageUrl,
+  type RecordRow,
+  type EvidenceItem,
+  type AbnormalComponentSummary,
+  type AnalyticsData,
+  type Severity,
+} from "@/lib/api";
 
 type View = "dashboard" | "live" | "abnormality" | "evidence" | "analytics";
-type Severity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
-type RecordRow = {
-  time: string;
-  id: string;
-  camera: string;
-  object: string;
-  type: string;
-  confidence: string;
-  severity: Severity;
-  status: string;
-};
-
-type AbnormalComponentSummary = {
-  id: string;
-  label: string;
-  shortLabel: string;
-  camera: string;
-  count: number;
-  dotColor: string;
-};
 
 const abnormalComponentCounts: AbnormalComponentSummary[] = [
   {
@@ -101,42 +95,50 @@ const records: RecordRow[] = [
   {
     time: "10:31:22",
     id: "ABN-20260913-00021",
+    inspectionId: 0,
     camera: "CAM-01",
     object: "Rib Plate #42",
     type: "Rib Deformation",
     confidence: "94.8%",
     severity: "CRITICAL",
     status: "UNACKNOWLEDGED",
+    statusLifecycle: "UNACKNOWLEDGED",
   },
   {
     time: "10:28:44",
     id: "ABN-20260913-00020",
+    inspectionId: 0,
     camera: "CAM-02",
     object: "Fastener M16",
     type: "Bolt Missing",
     confidence: "97.2%",
     severity: "HIGH",
     status: "ACK: Rudi S.",
+    statusLifecycle: "ACKNOWLEDGED",
   },
   {
     time: "10:21:05",
     id: "ABN-20260913-00019",
+    inspectionId: 0,
     camera: "CAM-03",
     object: "Connecting Pin",
     type: "Pin Missing",
     confidence: "91.4%",
     severity: "MEDIUM",
     status: "RESOLVED",
+    statusLifecycle: "RESOLVED",
   },
   {
     time: "10:14:18",
     id: "ABN-20260913-00018",
+    inspectionId: 0,
     camera: "CAM-01",
     object: "Slat C-09",
     type: "Plate Deformation",
     confidence: "88.0%",
     severity: "LOW",
     status: "RESOLVED",
+    statusLifecycle: "RESOLVED",
   },
 ];
 
@@ -174,6 +176,44 @@ const titles: Record<View, [string, string]> = {
 export default function Index() {
   const [view, setView] = useState<View>("dashboard");
   const [isCollapsed, setIsCollapsed] = useState(false);
+  const [apiStatus, setApiStatus] = useState<{ status: string; database: string }>({
+    status: "checking",
+    database: "checking",
+  });
+  const [statsData, setStatsData] = useState<AbnormalComponentSummary[]>(abnormalComponentCounts);
+  const [recordsData, setRecordsData] = useState<RecordRow[]>(records);
+  const [evidenceData, setEvidenceData] = useState<EvidenceItem[]>(evidence);
+  const [analyticsData, setAnalyticsData] = useState<AnalyticsData | null>(null);
+
+  // Polling data secara real-time dari backend SQL Server
+  const loadData = async () => {
+    try {
+      const h = await fetchHealth();
+      setApiStatus(h);
+
+      if (h.status === "online") {
+        const [s, recs, ev, an] = await Promise.all([
+          fetchStats().catch(() => null),
+          fetchInspections().catch(() => null),
+          fetchEvidence().catch(() => null),
+          fetchAnalytics().catch(() => null),
+        ]);
+
+        if (s?.components && s.components.length > 0) setStatsData(s.components);
+        if (recs && recs.length > 0) setRecordsData(recs);
+        if (ev && ev.length > 0) setEvidenceData(ev);
+        if (an) setAnalyticsData(an);
+      }
+    } catch (e) {
+      console.error("Gagal sinkronisasi data:", e);
+    }
+  };
+
+  useEffect(() => {
+    loadData();
+    const interval = setInterval(loadData, 4000);
+    return () => clearInterval(interval);
+  }, []);
 
   return (
     <div className="min-h-screen bg-background text-foreground lg:h-screen lg:overflow-hidden">
@@ -188,15 +228,21 @@ export default function Index() {
           isCollapsed ? "lg:ml-24" : "lg:ml-72"
         }`}
       >
-        <Header view={view} />
+        <Header view={view} apiStatus={apiStatus} />
         <main className="flex-1 overflow-y-auto px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
           {view === "dashboard" && (
-            <Dashboard onViewAll={() => setView("abnormality")} />
+            <Dashboard
+              onViewAll={() => setView("abnormality")}
+              statsList={statsData}
+              recentRecords={recordsData}
+            />
           )}
           {view === "live" && <LiveCamera />}
-          {view === "abnormality" && <Abnormality />}
-          {view === "evidence" && <Evidence />}
-          {view === "analytics" && <Analytics />}
+          {view === "abnormality" && <Abnormality allRecords={recordsData} />}
+          {view === "evidence" && (
+            <Evidence evidenceList={evidenceData} onRefresh={loadData} />
+          )}
+          {view === "analytics" && <Analytics data={analyticsData} />}
         </main>
       </div>
     </div>
@@ -408,7 +454,40 @@ function Sidebar({
   );
 }
 
-function Header({ view }: { view: View }) {
+function Header({
+  view,
+  apiStatus,
+}: {
+  view: View;
+  apiStatus: { status: string; database: string };
+}) {
+  const [timeStr, setTimeStr] = useState("");
+
+  useEffect(() => {
+    const updateTime = () => {
+      const now = new Date();
+      setTimeStr(
+        now.toLocaleDateString("id-ID", {
+          day: "2-digit",
+          month: "short",
+          year: "numeric",
+        }) +
+          " | " +
+          now.toLocaleTimeString("id-ID", {
+            hour: "2-digit",
+            minute: "2-digit",
+          }) +
+          " WIB"
+      );
+    };
+    updateTime();
+    const timer = setInterval(updateTime, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const isOnline = apiStatus.status === "online";
+  const isDb = apiStatus.database === "connected";
+
   return (
     <header className="flex items-center justify-between px-4 pt-5 pb-1 sm:px-6 lg:px-8 bg-transparent">
       <div>
@@ -421,11 +500,12 @@ function Header({ view }: { view: View }) {
       </div>
       <div className="flex items-center gap-2 sm:gap-3">
         <div className="hidden items-center gap-2 sm:flex">
-          <StatusPill text="API: Online" />
-          <StatusPill text="3 Cams: Online" />
+          <StatusPill text={isOnline ? "API: Online" : "API: Offline"} online={isOnline} />
+          <StatusPill text={isDb ? "SSMS: Connected" : "SSMS: Disconnected"} online={isDb} />
+          <StatusPill text="3 Cams: Online" online={true} />
           <span className="flex items-center gap-1.5 rounded-lg border border-border/60 bg-card px-2.5 py-1.5 font-mono text-[9px] font-semibold text-muted-foreground shadow-xs">
             <Clock3 className="size-3" />
-            13 Sep 2026 | 11:44 WIB
+            {timeStr || "15 Sep 2026 | 09:00 WIB"}
           </span>
         </div>
       </div>
@@ -433,10 +513,20 @@ function Header({ view }: { view: View }) {
   );
 }
 
-function StatusPill({ text }: { text: string }) {
+function StatusPill({ text, online = true }: { text: string; online?: boolean }) {
   return (
-    <span className="flex items-center gap-1 rounded-full border border-success/30 bg-success-soft px-2 py-1 text-[9px] font-bold text-success">
-      <span className="size-1.5 rounded-full bg-success" />
+    <span
+      className={`flex items-center gap-1 rounded-full border px-2 py-1 text-[9px] font-bold ${
+        online
+          ? "border-success/30 bg-success-soft text-success"
+          : "border-destructive/30 bg-destructive/10 text-destructive"
+      }`}
+    >
+      <span
+        className={`size-1.5 rounded-full ${
+          online ? "bg-success animate-pulse" : "bg-destructive"
+        }`}
+      />
       {text}
     </span>
   );
@@ -481,74 +571,80 @@ function SectionTitle({
   );
 }
 
-function Dashboard({ onViewAll }: { onViewAll: () => void }) {
-  const stats = [
-    {
-      label: "Total Abnormal Plat/Slat",
-      value: "5",
-      camera: "CAM-01 (Overhead)",
+function Dashboard({
+  onViewAll,
+  statsList,
+  recentRecords,
+}: {
+  onViewAll: () => void;
+  statsList: AbnormalComponentSummary[];
+  recentRecords: RecordRow[];
+}) {
+  const statsMeta: Record<
+    string,
+    { note: string; Icon: any; tone: string; bgTone: string }
+  > = {
+    "plat-slat": {
       note: "Plate Deform / Crack",
       Icon: Layers,
       tone: "text-danger",
       bgTone: "bg-danger-soft text-danger",
-      dotColor: "bg-danger",
     },
-    {
-      label: "Total Abnormal Rib/Sirip",
-      value: "3",
-      camera: "CAM-01 (Overhead)",
+    "rib-sirip": {
       note: "Rib Bending / Profile",
       Icon: AlertTriangle,
       tone: "text-warning",
       bgTone: "bg-warning-soft text-warning",
-      dotColor: "bg-warning",
     },
-    {
-      label: "Total Abnormal Bolt Sisi Kanan",
-      value: "4",
-      camera: "CAM-02 (RH Side)",
+    "bolt-kanan": {
       note: "Loose / Missing Bolt",
       Icon: Wrench,
       tone: "text-info",
       bgTone: "bg-info-soft text-info",
-      dotColor: "bg-info",
     },
-    {
-      label: "Total Abnormal Pin Sisi Kanan",
-      value: "2",
-      camera: "CAM-02 (RH Side)",
+    "pin-kanan": {
       note: "Dislodged Link Pin",
       Icon: ShieldAlert,
       tone: "text-primary",
       bgTone: "bg-primary/10 text-primary",
-      dotColor: "bg-primary",
     },
-    {
-      label: "Total Abnormal Bolt Sisi Kiri",
-      value: "3",
-      camera: "CAM-03 (LH Side)",
+    "bolt-kiri": {
       note: "Loose / Untorqued",
       Icon: Wrench,
       tone: "text-primary",
       bgTone: "bg-primary/10 text-primary",
-      dotColor: "bg-primary",
     },
-    {
-      label: "Total Abnormal Pin Sisi Kiri",
-      value: "1",
-      camera: "CAM-03 (LH Side)",
+    "pin-kiri": {
       note: "Critical Missing Pin",
       Icon: AlertTriangle,
       tone: "text-danger",
       bgTone: "bg-danger-soft text-danger",
-      dotColor: "bg-danger",
     },
-  ];
+  };
+
+  const displayStats = statsList.map((s) => {
+    const meta = statsMeta[s.id] || {
+      note: "Abnormal",
+      Icon: AlertTriangle,
+      tone: "text-danger",
+      bgTone: "bg-danger-soft text-danger",
+    };
+    return {
+      label: s.label,
+      value: s.count.toString(),
+      camera: s.camera,
+      note: meta.note,
+      Icon: meta.Icon,
+      tone: meta.tone,
+      bgTone: meta.bgTone,
+      dotColor: s.dotColor,
+    };
+  });
 
   return (
     <div className="space-y-6">
       <div className="grid gap-3.5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-        {stats.map((stat) => {
+        {displayStats.map((stat) => {
           const Icon = stat.Icon;
           return (
             <Panel
@@ -637,7 +733,7 @@ function Dashboard({ onViewAll }: { onViewAll: () => void }) {
             }
           />
         </div>
-        <RecordTable rows={records.slice(0, 3)} compact />
+        <RecordTable rows={recentRecords.slice(0, 5)} compact />
       </Panel>
     </div>
   );
@@ -817,20 +913,20 @@ function LiveCamera() {
   );
 }
 
-function Abnormality() {
+function Abnormality({ allRecords }: { allRecords: RecordRow[] }) {
   const [camera, setCamera] = useState("ALL");
   const [severity, setSeverity] = useState("ALL");
   const [status, setStatus] = useState("ALL");
 
   const filtered = useMemo(
     () =>
-      records.filter(
+      allRecords.filter(
         (r) =>
           (camera === "ALL" || r.camera === camera) &&
           (severity === "ALL" || r.severity === severity) &&
-          (status === "ALL" || r.status.startsWith(status))
+          (status === "ALL" || r.status.startsWith(status) || r.statusLifecycle === status)
       ),
-    [camera, severity, status]
+    [allRecords, camera, severity, status]
   );
 
   function exportCsv() {
@@ -987,14 +1083,19 @@ function RecordTable({
 }
 
 function Badge({ text }: { text: Severity }) {
-  const cls = {
+  const cls: Record<Severity, string> = {
     CRITICAL: "border-danger/30 bg-danger-soft text-danger",
     HIGH: "border-primary/30 bg-info-soft text-primary",
     MEDIUM: "border-warning/40 bg-warning-soft text-warning",
     LOW: "border-border bg-secondary text-muted-foreground",
-  }[text];
+    NONE: "border-border bg-secondary text-muted-foreground",
+  };
   return (
-    <span className={`rounded border px-2 py-0.5 text-[8px] font-bold ${cls}`}>
+    <span
+      className={`rounded border px-2 py-0.5 text-[8px] font-bold ${
+        cls[text] || cls.LOW
+      }`}
+    >
       {text}
     </span>
   );
@@ -1016,20 +1117,10 @@ function StatusBadge({ text }: { text: string }) {
   );
 }
 
-type EvidenceItem = {
-  id: string;
-  camera: string;
-  title: string;
-  severity: Severity;
-  object: string;
-  time: string;
-  area: string;
-  confidence: string;
-};
-
 const evidence: EvidenceItem[] = [
   {
     id: "ABN-20260913-00021",
+    inspectionId: 0,
     camera: "CAM-01",
     title: "Rib Deformation #00021",
     severity: "CRITICAL",
@@ -1037,9 +1128,11 @@ const evidence: EvidenceItem[] = [
     time: "10:31:22 WIB",
     area: "Conveyor Plate & Rib Overhead",
     confidence: "94.82%",
+    statusLifecycle: "UNACKNOWLEDGED",
   },
   {
     id: "ABN-20260913-00018",
+    inspectionId: 0,
     camera: "CAM-01",
     title: "Plate Crack #00018",
     severity: "LOW",
@@ -1047,9 +1140,11 @@ const evidence: EvidenceItem[] = [
     time: "10:14:18 WIB",
     area: "Conveyor Plate & Rib Overhead",
     confidence: "88.00%",
+    statusLifecycle: "RESOLVED",
   },
   {
     id: "ABN-20260913-00014",
+    inspectionId: 0,
     camera: "CAM-01",
     title: "Plate Misalignment #00014",
     severity: "MEDIUM",
@@ -1057,9 +1152,11 @@ const evidence: EvidenceItem[] = [
     time: "09:48:02 WIB",
     area: "Conveyor Plate & Rib Overhead",
     confidence: "90.21%",
+    statusLifecycle: "RESOLVED",
   },
   {
     id: "ABN-20260913-00020",
+    inspectionId: 0,
     camera: "CAM-02",
     title: "Bolt Loose / Untorqued #00020",
     severity: "HIGH",
@@ -1067,9 +1164,11 @@ const evidence: EvidenceItem[] = [
     time: "10:28:44 WIB",
     area: "Bolt & Pin Right Side",
     confidence: "97.20%",
+    statusLifecycle: "ACKNOWLEDGED",
   },
   {
     id: "ABN-20260913-00015",
+    inspectionId: 0,
     camera: "CAM-02",
     title: "Bolt Missing #00015",
     severity: "CRITICAL",
@@ -1077,9 +1176,11 @@ const evidence: EvidenceItem[] = [
     time: "09:55:10 WIB",
     area: "Bolt & Pin Right Side",
     confidence: "96.40%",
+    statusLifecycle: "UNACKNOWLEDGED",
   },
   {
     id: "ABN-20260913-00019",
+    inspectionId: 0,
     camera: "CAM-03",
     title: "Pin Missing / Dislodged #00019",
     severity: "MEDIUM",
@@ -1087,21 +1188,94 @@ const evidence: EvidenceItem[] = [
     time: "10:21:05 WIB",
     area: "Bolt & Pin Left Side",
     confidence: "91.40%",
+    statusLifecycle: "RESOLVED",
   },
 ];
 
-function Evidence() {
-  const [selected, setSelected] = useState<EvidenceItem>(evidence[0]!);
+function Evidence({
+  evidenceList,
+  onRefresh,
+}: {
+  evidenceList: EvidenceItem[];
+  onRefresh?: () => void;
+}) {
+  const [selected, setSelected] = useState<EvidenceItem>(evidenceList[0] || evidence[0]!);
   const [open, setOpen] = useState<Record<string, boolean>>({
     "CAM-01": true,
     "CAM-02": true,
     "CAM-03": true,
   });
-  const [action, setAction] = useState("UNACKNOWLEDGED");
-  const [maintenanceAction, setMaintenanceAction] = useState("");
-  const [picRemark, setPicRemark] = useState("");
+  const [action, setAction] = useState(selected?.statusLifecycle || "UNACKNOWLEDGED");
+  const [maintenanceAction, setMaintenanceAction] = useState(selected?.maintenanceNote || "");
+  const [picRemark, setPicRemark] = useState(selected?.picName || "");
+
+  const handleSelectItem = (item: EvidenceItem) => {
+    setSelected(item);
+    setAction(item.statusLifecycle || "UNACKNOWLEDGED");
+    setMaintenanceAction(item.maintenanceNote || "");
+    setPicRemark(item.picName || "");
+  };
+
+  // Sinkronisasi data background secara aman tanpa menimpa teks yang sedang diketik pengguna
+  useEffect(() => {
+    if (evidenceList.length === 0) return;
+
+    const match = evidenceList.find((e) => e.id === selected?.id);
+    if (match) {
+      // Pertahankan teks form lokal yang sedang diketik teknisi (draft state)
+      // Cukup sinkronkan metadata background (image, lifecycle dari DB)
+      setSelected((prev) => ({
+        ...match,
+        statusLifecycle: action !== "UNACKNOWLEDGED" ? action : match.statusLifecycle,
+      }));
+    } else if (!selected || selected.inspectionId === 0) {
+      // Hanya inisialisasi jika sebelumnya masih memakai mock data (inspectionId: 0)
+      const first = evidenceList[0];
+      setSelected(first);
+      setAction(first.statusLifecycle || "UNACKNOWLEDGED");
+      setMaintenanceAction(first.maintenanceNote || "");
+      setPicRemark(first.picName || "");
+    }
+  }, [evidenceList]);
 
   if (!selected) return null;
+
+  const currentItems = evidenceList.length > 0 ? evidenceList : evidence;
+  const userName = localStorage.getItem("userName") || "Sarah Jenkins";
+
+  const handleAcknowledge = async () => {
+    setAction("ACKNOWLEDGED");
+    try {
+      const picLabel = picRemark.trim() ? `${userName} - ${picRemark.trim()}` : userName;
+      const noteLabel = maintenanceAction.trim() || "Dikonfirmasi oleh QA PIC";
+      await submitInspectionAction(
+        selected.inspectionId,
+        "ACKNOWLEDGED",
+        picLabel,
+        noteLabel
+      );
+      if (onRefresh) onRefresh();
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleResolve = async () => {
+    setAction("RESOLVED");
+    try {
+      const picLabel = picRemark.trim() ? `${userName} - ${picRemark.trim()}` : userName;
+      const noteLabel = maintenanceAction.trim() || "Telah diperbaiki & dikalibrasi ulang";
+      await submitInspectionAction(
+        selected.inspectionId,
+        "RESOLVED",
+        picLabel,
+        noteLabel
+      );
+      if (onRefresh) onRefresh();
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const cameraFolders = [
     {
@@ -1130,6 +1304,10 @@ function Evidence() {
     },
   ];
 
+  const imgUrl = getImageUrl(
+    selected.annotatedPath || selected.rawImagePath || selected.imageUrl
+  );
+
   return (
     <div className="space-y-5">
       <SectionTitle
@@ -1147,14 +1325,14 @@ function Evidence() {
           <div className="border-b p-4">
             <h3 className="text-xs font-extrabold">Camera Area Explorer</h3>
             <p className="text-[9px] text-muted-foreground">
-              Klasifikasi Rekaman Anomali • 6 Files
+              Klasifikasi Rekaman Anomali • {currentItems.length} Files
             </p>
           </div>
           <div className="p-3 space-y-3">
             {cameraFolders.map((folder) => {
               const cam = folder.cam;
               const isOpen = open[cam];
-              const items = evidence.filter((e) => e.camera === cam);
+              const items = currentItems.filter((e) => e.camera === cam);
               return (
                 <div key={cam} className="rounded-2xl border border-border/60 bg-secondary/30 p-1.5 transition-all">
                   <button
@@ -1196,12 +1374,7 @@ function Evidence() {
                         <button
                           key={e.id}
                           type="button"
-                          onClick={() => {
-                            setSelected(e);
-                            setAction("UNACKNOWLEDGED");
-                            setMaintenanceAction("");
-                            setPicRemark("");
-                          }}
+                          onClick={() => handleSelectItem(e)}
                           className={`w-full rounded-xl border p-2.5 text-left transition-all cursor-pointer ${
                             selected.id === e.id
                               ? "border-primary bg-info-soft shadow-xs"
@@ -1239,21 +1412,30 @@ function Evidence() {
                   RAW Evidence Optical Capture • {selected.camera}
                 </h3>
                 <p className="mt-1 font-mono text-[9px] text-muted-foreground">
-                  {selected.camera.replace("-", "")}_20260913_
-                  {selected.time.replaceAll(":", "").slice(0, 6)}_
-                  {selected.id.slice(-8)}.jpg
+                  {selected.id} • {selected.captureTime || selected.time}
                 </p>
               </div>
               <Badge text={selected.severity} />
             </div>
-            <div className="camera-grid relative flex aspect-video max-h-[410px] items-center justify-center overflow-hidden">
-              <div className="h-2/5 w-1/3 border-2 border-danger">
-                <span className="-mt-6 block w-fit bg-danger px-2 py-1 font-mono text-[9px] font-bold text-primary-foreground">
-                  {selected.title.toUpperCase()} • {selected.confidence} CONF
-                </span>
-              </div>
-              <span className="absolute bottom-4 left-4 rounded bg-camera/80 px-2 py-1 font-mono text-[8px] text-sidebar-foreground">
-                SHA-256 VERIFIED
+            <div className="camera-grid relative flex aspect-video max-h-[410px] items-center justify-center overflow-hidden bg-black/90">
+              {imgUrl ? (
+                <img
+                  src={imgUrl}
+                  alt={selected.title}
+                  className="size-full object-contain"
+                  onError={() => {
+                    console.error("Gagal memuat gambar bukti:", imgUrl);
+                  }}
+                />
+              ) : (
+                <div className="h-2/5 w-1/3 border-2 border-danger flex items-center justify-center">
+                  <span className="-mt-6 block w-fit bg-danger px-2 py-1 font-mono text-[9px] font-bold text-primary-foreground">
+                    {selected.title.toUpperCase()} • {selected.confidence} CONF
+                  </span>
+                </div>
+              )}
+              <span className="absolute bottom-4 left-4 rounded bg-black/80 px-2 py-1 font-mono text-[8px] text-white">
+                {selected.annotatedPath ? "AI ANNOTATED OVERLAY" : "RAW OPTICAL EVIDENCE"}
               </span>
             </div>
           </Panel>
@@ -1276,7 +1458,7 @@ function Evidence() {
                 ["Object", selected.object],
                 ["Abnormality Type", selected.title.split(" #")[0] ?? ""],
                 ["AI Confidence", selected.confidence],
-                ["Capture Time", `13 Sep 2026, ${selected.time}`],
+                ["Capture Time", selected.captureTime || selected.time],
               ].map(([k, v]) => (
                 <div key={k}>
                   <dt className="text-muted-foreground">{k}</dt>
@@ -1308,7 +1490,8 @@ function Evidence() {
               <Button
                 variant="secondary"
                 size="sm"
-                onClick={() => setAction("ACKNOWLEDGED")}
+                onClick={handleAcknowledge}
+                disabled={action === "ACKNOWLEDGED" || action === "RESOLVED"}
               >
                 <Wrench className="size-4" />
                 Acknowledge
@@ -1316,7 +1499,8 @@ function Evidence() {
               <Button
                 size="sm"
                 className="bg-success text-white hover:bg-success/90"
-                onClick={() => setAction("RESOLVED")}
+                onClick={handleResolve}
+                disabled={action === "RESOLVED"}
               >
                 <Check className="size-4" />
                 Mark Resolved
@@ -1329,8 +1513,8 @@ function Evidence() {
   );
 }
 
-function Analytics() {
-  const days = [
+function Analytics({ data }: { data?: AnalyticsData | null }) {
+  const defaultDays = [
     { d: "Sen", n: 4 },
     { d: "Sel", n: 7 },
     { d: "Rab", n: 3 },
@@ -1340,7 +1524,7 @@ function Analytics() {
     { d: "Min", n: 2 },
   ];
 
-  const pareto = [
+  const defaultPareto = [
     {
       label: "Rib Deformation (CAM-01)",
       n: 32,
@@ -1367,6 +1551,10 @@ function Analytics() {
     },
   ];
 
+  const days = data?.weekly && data.weekly.length > 0 ? data.weekly : defaultDays;
+  const pareto = data?.pareto && data.pareto.length > 0 ? data.pareto : defaultPareto;
+  const maxN = Math.max(...days.map((x) => x.n), 1);
+
   return (
     <div className="space-y-5">
       <SectionTitle
@@ -1388,7 +1576,7 @@ function Analytics() {
                 <span className="mb-2 text-xs font-bold">{item.n}</span>
                 <div
                   className="w-full max-w-10 rounded-t bg-primary/80 transition hover:bg-primary"
-                  style={{ height: `${(item.n / 12) * 75}%` }}
+                  style={{ height: `${(item.n / maxN) * 75}%` }}
                 />
                 <span className="my-3 text-[9px] text-muted-foreground">
                   {item.d}
@@ -1400,7 +1588,7 @@ function Analytics() {
         <Panel className="p-5">
           <SectionTitle
             title="Pareto Abnormality by Defect Type"
-            subtitle="Total: 75 Insiden"
+            subtitle={`Total Insiden Terdeteksi: ${data?.totalIncidents ?? 75}`}
           />
           <div className="mt-7 space-y-6">
             {pareto.map((item) => (
