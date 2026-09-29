@@ -1,6 +1,25 @@
-﻿__pycache__/
-*.pyc
+# Python & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.ipynb_checkpoints/
+
+# Node & Frontend Build
 node_modules/
 dist/
+build/
 *.tsbuildinfo
-graphify-out/cache/
+
+# Graphify Knowledge Graph & AI Agent Artifacts (Tidak perlu di-push ke GitHub)
+graphify-out/
+**/graphify-out/
+.agents/
+.gemini/
+
+# File Video / Media Berat
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.wmv
+
