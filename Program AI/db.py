@@ -1,68 +1,74 @@
-import pyodbc
+import sqlite3
 import os
 from datetime import datetime
+
+# Path default ke file database SQLite
+DB_PATH = r"c:\File Rayidha\Internship\Project\5. Project AI Slat Rib Conveyor\Database\AI_Slat_Rib_Conveyor.db"
+
+
+def resolve_db_path():
+    """
+    Mencari lokasi file database SQLite dengan prioritas fleksibel untuk Windows & Linux Jetson:
+    1. Environment variable CONVEYOR_DB_PATH
+    2. Path folder ../../Database/AI_Slat_Rib_Conveyor.db (struktur project lokal & Jetson)
+    3. Path folder ../Database/AI_Slat_Rib_Conveyor.db (jika diletakkan di dalam Program)
+    4. Path lokal folder saat ini AI_Slat_Rib_Conveyor.db
+    5. Path default Windows DB_PATH
+    """
+    env_path = os.environ.get("CONVEYOR_DB_PATH")
+    if env_path and os.path.exists(env_path):
+        return env_path
+
+    candidates = [
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Database", "AI_Slat_Rib_Conveyor.db")),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Database", "AI_Slat_Rib_Conveyor.db")),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "AI_Slat_Rib_Conveyor.db")),
+        DB_PATH
+    ]
+
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+
+    # Fallback default aman jika belum ada (memastikan direktori dibuat)
+    default_target = candidates[0]
+    os.makedirs(os.path.dirname(default_target), exist_ok=True)
+    return default_target
 
 
 def get_connection():
     """
-    Membuat koneksi ke database SQL Server ConveyorInspection.
+    Membuat koneksi ke database SQLite AI_Slat_Rib_Conveyor.db.
     """
-    return pyodbc.connect(
-        "DRIVER={ODBC Driver 18 for SQL Server};"
-        "SERVER=localhost\\MSSQLSERVER01;"
-        "DATABASE=ConveyorInspection;"
-        "Trusted_Connection=yes;"
-        "TrustServerCertificate=yes;"
-    )
-
-
-def determine_shift():
-    """
-    Menentukan shift kerja saat ini:
-    - Shift 1: 07:00 - 15:00
-    - Shift 2: 15:00 - 23:00
-    - Shift 3: 23:00 - 07:00
-    """
-    hour = datetime.now().hour
-    if 7 <= hour < 15:
-        return 1
-    elif 15 <= hour < 23:
-        return 2
-    else:
-        return 3
+    target = resolve_db_path()
+    return sqlite3.connect(target, timeout=5.0)
 
 
 def map_plat_rib_status(is_ng, status_str=""):
     """
-    Memetakan status Plat / Rib ke nilai baku CHECK constraint database:
-    - 'NORMAL'
-    - 'BEND_UP'
-    - 'BEND_DOWN'
+    Memetakan status Plat / Rib:
+    - Normal -> 'NORMAL'
+    - Cacat -> 'BENDING'
     """
     if not is_ng:
         return "NORMAL"
-    
-    st_upper = str(status_str).upper()
-    if "TURUN" in st_upper or "DOWN" in st_upper or "-" in st_upper:
-        return "BEND_DOWN"
-    else:
-        # Default jika bengkok ke atas atau bergelombang
-        return "BEND_UP"
+    return "BENDING"
 
 
 def determine_severity_and_result(detections):
     """
-    Menghitung OverallResult dan OverallSeverity berdasarkan seluruh deteksi:
+    Menghitung OverallResult dan OverallSeverity:
     - NORMAL / OK_PRESENT -> NONE
-    - PLAT / RIB BEND_UP / BEND_DOWN -> MEDIUM
+    - PLAT / RIB BENDING -> MEDIUM
     - BOLT MISSING -> HIGH
     - PIN MISSING -> CRITICAL (karena resiko rantai putus)
     """
     severity_rank = {
         "NONE": 1,
-        "MEDIUM": 2,
-        "HIGH": 3,
-        "CRITICAL": 4
+        "LOW": 2,
+        "MEDIUM": 3,
+        "HIGH": 4,
+        "CRITICAL": 5
     }
 
     max_severity = "NONE"
@@ -94,18 +100,14 @@ def determine_severity_and_result(detections):
 def generate_traceability_code(cursor, is_ng=False):
     """
     Menghasilkan TraceabilityCode yang unik dan urut per hari,
-    contoh: ABN-20260915-00001 (untuk NG) atau INSP-20260915-00001 (untuk OK).
+    contoh: ABN-20261009-00001 (untuk NG) atau INSP-20261009-00001 (untuk OK).
     """
     today_str = datetime.now().strftime("%Y%m%d")
     prefix = "ABN" if is_ng else "INSP"
 
-    # Hitung jumlah inspeksi hari ini untuk nomor urut
+    # Hitung jumlah inspeksi hari ini di SQLite
     cursor.execute(
-        """
-        SELECT COUNT(1) 
-        FROM Inspections 
-        WHERE CAST(InspectionTime AS DATE) = CAST(GETDATE() AS DATE)
-        """
+        "SELECT COUNT(1) FROM Inspections WHERE date(InspectionTime) = date('now', 'localtime')"
     )
     daily_count = cursor.fetchone()[0] + 1
     return f"{prefix}-{today_str}-{daily_count:05d}"
@@ -200,32 +202,30 @@ def save_inspection_to_db(image_path, l_sir=None, l_sla=None, detections=None, s
                 TraceabilityCode,
                 SlatNumber,
                 InspectionTime,
-                Shift,
                 OverallResult,
                 OverallSeverity,
                 StatusLifecycle
             )
-            OUTPUT INSERTED.InspectionID
             VALUES
             (
                 ?,
                 ?,
-                GETDATE(),
-                ?,
+                CURRENT_TIMESTAMP,
                 ?,
                 ?,
                 ?
             )
             """,
-            traceability_code,
-            slat_number,
-            shift_val,
-            overall_result,
-            overall_severity,
-            status_lifecycle
+            (
+                traceability_code,
+                slat_number,
+                overall_result,
+                overall_severity,
+                status_lifecycle
+            )
         )
 
-        inspection_id = cursor.fetchone()[0]
+        inspection_id = cursor.lastrowid
 
         # 6. INSERT ke tabel Detail: Inspection_Detections
         insert_query = """
