@@ -130,6 +130,10 @@
 
 @utility panel-shadow { box-shadow: var(--shadow-panel); }
 
+@utility sidebar-gradient-emerald {
+  background: linear-gradient(180deg, #00FF9D 0%, #00E599 15%, #108A74 40%, #144445 66%, #0C1117 100%);
+}
+
 @utility camera-grid {
   background-color: var(--color-camera);
   background-image:

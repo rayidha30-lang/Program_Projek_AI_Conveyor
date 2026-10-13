@@ -350,8 +350,8 @@ function Sidebar({
     <aside
       className={`fixed inset-y-3 left-3 z-30 flex flex-col justify-between rounded-3xl transition-all duration-300 ease-in-out ${
         isDark
-          ? "border border-white/10 bg-linear-to-b from-[#181c26] via-[#12151e] to-[#0c0e14] text-slate-100 shadow-2xl shadow-black/80"
-          : "border border-white/20 bg-linear-to-b from-[#7645f7] via-[#6a37eb] to-[#5a24e2] text-white shadow-2xl shadow-purple-900/30"
+          ? "sidebar-gradient-emerald border border-emerald-400/40 text-white shadow-2xl shadow-emerald-950/60"
+          : "bg-linear-to-b from-[#7645f7] via-[#6a37eb] to-[#5a24e2] border border-white/20 text-white shadow-2xl shadow-purple-900/30"
       } ${isCollapsed ? "w-20 py-5 px-2 items-center" : "w-64 py-5 px-4"}`}
     >
       <div>
@@ -360,20 +360,20 @@ function Sidebar({
             {/* Logo Cloud / Vision icon */}
             <button
               onClick={() => setIsCollapsed(false)}
-              className={`flex size-11 items-center justify-center rounded-2xl shadow-md transition-all cursor-pointer ${
+              className={`flex size-11 items-center justify-center rounded-2xl shadow-sm transition-all cursor-pointer ${
                 isDark
-                  ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/25"
+                  ? "bg-black/25 text-slate-950 border border-black/15 hover:bg-black/35"
                   : "bg-white/20 text-white hover:bg-white/30"
               }`}
               title="Perbesar Side Bar"
             >
-              <Cpu className="size-6" />
+              <Cpu className={`size-6 ${isDark ? "text-slate-950" : "text-white"}`} />
             </button>
             <button
               onClick={() => setIsCollapsed(false)}
               className={`flex size-7 items-center justify-center rounded-lg transition-colors cursor-pointer ${
                 isDark
-                  ? "bg-white/5 text-slate-300 hover:bg-white/15 hover:text-white"
+                  ? "bg-black/15 text-slate-950 hover:bg-black/25"
                   : "bg-white/10 text-white/80 hover:bg-white/25 hover:text-white"
               }`}
               title="Perbesar Side Bar"
@@ -385,21 +385,27 @@ function Sidebar({
           <div className="mb-6 flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div
-                className={`flex size-10 items-center justify-center rounded-2xl shadow-md ${
+                className={`flex size-10 items-center justify-center rounded-2xl shadow-sm ${
                   isDark
-                    ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30"
+                    ? "bg-black/20 text-slate-950 border border-black/15"
                     : "bg-white/20 text-white"
                 }`}
               >
-                <Cpu className="size-5" />
+                <Cpu className={`size-5 ${isDark ? "text-slate-950" : "text-white"}`} />
               </div>
               <div className="overflow-hidden">
-                <p className="text-xs font-extrabold text-white leading-tight truncate">
+                <p
+                  className={`text-xs leading-tight truncate ${
+                    isDark ? "font-black text-slate-950" : "font-extrabold text-white"
+                  }`}
+                >
                   Die Cast Machine #2
                 </p>
                 <p
-                  className={`mt-0.5 text-[8.5px] font-bold tracking-wider truncate ${
-                    isDark ? "text-emerald-400/90" : "text-purple-200"
+                  className={`mt-0.5 text-[8.5px] tracking-wider truncate ${
+                    isDark
+                      ? "font-black text-emerald-950/90"
+                      : "font-bold text-purple-200"
                   }`}
                 >
                   SLAT RIB VISION SYSTEM
@@ -410,7 +416,7 @@ function Sidebar({
               onClick={() => setIsCollapsed(true)}
               className={`flex size-8 shrink-0 items-center justify-center rounded-lg transition-colors cursor-pointer ${
                 isDark
-                  ? "bg-white/5 text-slate-300 hover:bg-white/15 hover:text-white"
+                  ? "bg-black/15 text-slate-950 hover:bg-black/25"
                   : "bg-white/10 text-white/80 hover:bg-white/20 hover:text-white"
               }`}
               title="Perkecil Side Bar"
@@ -429,9 +435,33 @@ function Sidebar({
           }`}
           aria-label="Main navigation"
         >
-          {nav.map((item) => {
+          {nav.map((item, idx) => {
             const Icon = item.icon;
             const active = view === item.id;
+
+            // Di tema gelap (gradient hijau):
+            // - Bagian atas (idx < 2): berlatar neon hijau -> teks gelap
+            // - Bagian bawah (idx >= 2): berlatar teal/charcoal -> teks terang / neon pill
+            const isUpper = idx < 2;
+
+            let activeClass = "";
+            let inactiveClass = "";
+
+            if (isDark) {
+              activeClass = isUpper
+                ? "bg-black/30 text-slate-950 font-black shadow-md ring-1 ring-black/20"
+                : "bg-[#00E599] text-slate-950 font-black shadow-lg shadow-emerald-500/35 ring-1 ring-emerald-300";
+              inactiveClass = isUpper
+                ? "text-slate-950 font-bold hover:bg-black/15 hover:text-black"
+                : "text-slate-100 font-semibold hover:bg-white/15 hover:text-white";
+            } else {
+              // Tema terang: ungu klasik seperti sebelumnya
+              activeClass = isCollapsed
+                ? "bg-black/25 text-white font-bold shadow-inner ring-1 ring-white/30"
+                : "bg-black/20 text-white font-bold shadow-inner ring-1 ring-white/30";
+              inactiveClass = "text-white/80 font-bold hover:bg-white/15 hover:text-white";
+            }
+
             return (
               <button
                 key={item.id}
@@ -440,22 +470,10 @@ function Sidebar({
                 className={`group relative flex items-center transition-all duration-200 cursor-pointer ${
                   isCollapsed
                     ? `size-11 justify-center rounded-2xl ${
-                        active
-                          ? isDark
-                            ? "bg-[#00E599] text-black font-extrabold shadow-lg shadow-emerald-500/30 ring-1 ring-emerald-300"
-                            : "bg-black/25 text-white shadow-inner ring-1 ring-white/30"
-                          : isDark
-                          ? "text-slate-300 hover:bg-white/10 hover:text-white"
-                          : "text-white/80 hover:bg-white/15 hover:text-white"
+                        active ? activeClass : inactiveClass
                       }`
-                    : `h-11 w-full gap-3 rounded-xl px-3.5 text-xs font-bold ${
-                        active
-                          ? isDark
-                            ? "bg-[#00E599] text-black font-extrabold shadow-lg shadow-emerald-500/30 ring-1 ring-emerald-300"
-                            : "bg-black/20 text-white shadow-inner ring-1 ring-white/30"
-                          : isDark
-                          ? "text-slate-300 hover:bg-white/10 hover:text-white"
-                          : "text-white/80 hover:bg-white/15 hover:text-white"
+                    : `h-11 w-full gap-3 rounded-xl px-3.5 text-xs ${
+                        active ? activeClass : inactiveClass
                       }`
                 }`}
               >
@@ -495,7 +513,9 @@ function Sidebar({
           {/* User Avatar */}
           <div
             className={`group relative flex size-10 items-center justify-center overflow-hidden rounded-xl border-2 shadow-md cursor-pointer ${
-              isDark ? "border-emerald-500/40 bg-white/10" : "border-white/50 bg-white/20"
+              isDark
+                ? "border-emerald-400/50 bg-black/30"
+                : "border-white/50 bg-white/20"
             }`}
             title={`${userName} (QA Lead / PIC)`}
           >
@@ -517,7 +537,7 @@ function Sidebar({
             onClick={handleLogout}
             className={`flex size-10 items-center justify-center rounded-xl transition-colors cursor-pointer ${
               isDark
-                ? "text-slate-300 hover:bg-white/10 hover:text-white"
+                ? "text-slate-300 hover:bg-white/15 hover:text-white"
                 : "text-white/80 hover:bg-white/20 hover:text-white"
             }`}
             title="Logout System"
@@ -528,14 +548,18 @@ function Sidebar({
       ) : (
         <div className="space-y-3 pt-4">
           <div
-            className={`rounded-xl border p-3 backdrop-blur-xs transition-colors ${
+            className={`rounded-xl border p-3 backdrop-blur-md shadow-sm transition-colors ${
               isDark
-                ? "border-emerald-500/20 bg-emerald-950/25 text-slate-200"
+                ? "border-white/15 bg-black/40 text-white"
                 : "border-white/20 bg-white/10 text-white"
             }`}
           >
             <div className="mb-1.5 flex items-center justify-between text-[10px]">
-              <span className={isDark ? "text-emerald-400 font-medium" : "text-purple-200"}>
+              <span
+                className={
+                  isDark ? "text-emerald-400 font-semibold" : "text-purple-200"
+                }
+              >
                 System Status
               </span>
               <span className="flex items-center gap-1 font-bold text-white">
@@ -545,7 +569,7 @@ function Sidebar({
             </div>
             <div
               className={`flex justify-between font-mono text-[9px] ${
-                isDark ? "text-slate-400" : "text-purple-200"
+                isDark ? "text-slate-300" : "text-purple-200"
               }`}
             >
               <span>Uptime: 99.8%</span>
@@ -557,7 +581,9 @@ function Sidebar({
             <div className="flex items-center gap-2.5 overflow-hidden">
               <div
                 className={`size-9 shrink-0 overflow-hidden rounded-xl border-2 shadow-sm relative flex items-center justify-center text-xs font-bold ${
-                  isDark ? "border-emerald-500/40 bg-white/10" : "border-white/50 bg-white/20"
+                  isDark
+                    ? "border-emerald-400/50 bg-black/30"
+                    : "border-white/50 bg-white/20"
                 }`}
               >
                 <img
@@ -577,8 +603,8 @@ function Sidebar({
                   {userName}
                 </p>
                 <p
-                  className={`text-[9px] truncate ${
-                    isDark ? "text-emerald-400/90 font-medium" : "text-purple-200"
+                  className={`text-[9px] font-medium truncate ${
+                    isDark ? "text-emerald-300/80" : "text-purple-200"
                   }`}
                 >
                   QA Lead / PIC
@@ -592,7 +618,7 @@ function Sidebar({
                   onClick={onToggleTheme}
                   className={`flex size-8 shrink-0 items-center justify-center rounded-lg transition-colors cursor-pointer ${
                     isDark
-                      ? "text-amber-400 hover:bg-white/10 hover:text-amber-300"
+                      ? "text-amber-400 hover:bg-white/15 hover:text-amber-300"
                       : "text-white/80 hover:bg-white/20 hover:text-white"
                   }`}
                   title={isDark ? "Ganti ke Mode Terang" : "Ganti ke Mode Gelap"}
@@ -604,7 +630,7 @@ function Sidebar({
                 onClick={handleLogout}
                 className={`flex size-8 shrink-0 items-center justify-center rounded-lg transition-colors cursor-pointer ${
                   isDark
-                    ? "text-slate-300 hover:bg-white/10 hover:text-white"
+                    ? "text-slate-300 hover:bg-white/15 hover:text-white"
                     : "text-white/80 hover:bg-white/20 hover:text-white"
                 }`}
                 title="Logout System"
