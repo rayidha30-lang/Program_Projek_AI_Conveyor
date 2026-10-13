@@ -20,10 +20,12 @@ import {
   Layers,
   LayoutDashboard,
   LogOut,
+  Moon,
   RotateCcw,
   Search,
   ShieldAlert,
   ShieldCheck,
+  Sun,
   Wrench,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -202,6 +204,30 @@ export default function Index() {
   const [evidenceData, setEvidenceData] = useState<EvidenceItem[]>(evidence);
   const [analyticsData, setAnalyticsData] = useState<AnalyticsData | null>(null);
 
+  // Pengendali tema (Dark / Light) dengan persistensi localStorage
+  const [theme, setTheme] = useState<"light" | "dark">(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("dashboard_theme");
+      if (saved === "dark" || saved === "light") return saved;
+      return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    return "light";
+  });
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === "dark") {
+      root.classList.add("dark");
+    } else {
+      root.classList.remove("dark");
+    }
+    localStorage.setItem("dashboard_theme", theme);
+  }, [theme]);
+
+  const toggleTheme = () => {
+    setTheme((prev) => (prev === "dark" ? "light" : "dark"));
+  };
+
   const handleSelectRecord = (record: RecordRow) => {
     setSelectedEvidenceId(record.id);
     setView("evidence");
@@ -238,19 +264,26 @@ export default function Index() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-background text-foreground lg:h-screen lg:overflow-hidden">
+    <div className="min-h-screen bg-background text-foreground lg:h-screen lg:overflow-hidden transition-colors duration-300">
       <Sidebar
         view={view}
         setView={setView}
         isCollapsed={isCollapsed}
         setIsCollapsed={setIsCollapsed}
+        theme={theme}
+        onToggleTheme={toggleTheme}
       />
       <div
         className={`transition-all duration-300 ease-in-out lg:flex lg:h-screen lg:flex-col ${
           isCollapsed ? "lg:ml-24" : "lg:ml-72"
         }`}
       >
-        <Header view={view} apiStatus={apiStatus} />
+        <Header
+          view={view}
+          apiStatus={apiStatus}
+          theme={theme}
+          onToggleTheme={toggleTheme}
+        />
         <main className="flex-1 overflow-y-auto px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
           {view === "dashboard" && (
             <Dashboard
@@ -287,11 +320,15 @@ function Sidebar({
   setView,
   isCollapsed,
   setIsCollapsed,
+  theme,
+  onToggleTheme,
 }: {
   view: View;
   setView: (view: View) => void;
   isCollapsed: boolean;
   setIsCollapsed: React.Dispatch<React.SetStateAction<boolean>>;
+  theme: "light" | "dark";
+  onToggleTheme?: () => void;
 }) {
   const navigate = useNavigate();
   const userName = localStorage.getItem("userName") || "Sarah Jenkins";
@@ -307,11 +344,15 @@ function Sidebar({
     navigate("/login");
   };
 
+  const isDark = theme === "dark";
+
   return (
     <aside
-      className={`fixed inset-y-3 left-3 z-30 flex flex-col justify-between rounded-3xl border border-white/20 bg-linear-to-b from-[#7645f7] via-[#6a37eb] to-[#5a24e2] text-white shadow-2xl shadow-purple-900/30 transition-all duration-300 ease-in-out ${
-        isCollapsed ? "w-20 py-5 px-2 items-center" : "w-64 py-5 px-4"
-      }`}
+      className={`fixed inset-y-3 left-3 z-30 flex flex-col justify-between rounded-3xl transition-all duration-300 ease-in-out ${
+        isDark
+          ? "border border-white/10 bg-linear-to-b from-[#181c26] via-[#12151e] to-[#0c0e14] text-slate-100 shadow-2xl shadow-black/80"
+          : "border border-white/20 bg-linear-to-b from-[#7645f7] via-[#6a37eb] to-[#5a24e2] text-white shadow-2xl shadow-purple-900/30"
+      } ${isCollapsed ? "w-20 py-5 px-2 items-center" : "w-64 py-5 px-4"}`}
     >
       <div>
         {isCollapsed ? (
@@ -319,14 +360,22 @@ function Sidebar({
             {/* Logo Cloud / Vision icon */}
             <button
               onClick={() => setIsCollapsed(false)}
-              className="flex size-11 items-center justify-center rounded-2xl bg-white/20 text-white shadow-md hover:bg-white/30 transition-all cursor-pointer"
+              className={`flex size-11 items-center justify-center rounded-2xl shadow-md transition-all cursor-pointer ${
+                isDark
+                  ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/25"
+                  : "bg-white/20 text-white hover:bg-white/30"
+              }`}
               title="Perbesar Side Bar"
             >
               <Cpu className="size-6" />
             </button>
             <button
               onClick={() => setIsCollapsed(false)}
-              className="flex size-7 items-center justify-center rounded-lg bg-white/10 text-white/80 hover:bg-white/25 hover:text-white transition-colors cursor-pointer"
+              className={`flex size-7 items-center justify-center rounded-lg transition-colors cursor-pointer ${
+                isDark
+                  ? "bg-white/5 text-slate-300 hover:bg-white/15 hover:text-white"
+                  : "bg-white/10 text-white/80 hover:bg-white/25 hover:text-white"
+              }`}
               title="Perbesar Side Bar"
             >
               <ChevronRight className="size-4" />
@@ -335,21 +384,35 @@ function Sidebar({
         ) : (
           <div className="mb-6 flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <div className="flex size-10 items-center justify-center rounded-2xl bg-white/20 shadow-md text-white">
+              <div
+                className={`flex size-10 items-center justify-center rounded-2xl shadow-md ${
+                  isDark
+                    ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30"
+                    : "bg-white/20 text-white"
+                }`}
+              >
                 <Cpu className="size-5" />
               </div>
               <div className="overflow-hidden">
                 <p className="text-xs font-extrabold text-white leading-tight truncate">
                   Die Cast Machine #2
                 </p>
-                <p className="mt-0.5 text-[8.5px] font-bold tracking-wider text-purple-200 truncate">
+                <p
+                  className={`mt-0.5 text-[8.5px] font-bold tracking-wider truncate ${
+                    isDark ? "text-emerald-400/90" : "text-purple-200"
+                  }`}
+                >
                   SLAT RIB VISION SYSTEM
                 </p>
               </div>
             </div>
             <button
               onClick={() => setIsCollapsed(true)}
-              className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-white/10 text-white/80 hover:bg-white/20 hover:text-white transition-colors cursor-pointer"
+              className={`flex size-8 shrink-0 items-center justify-center rounded-lg transition-colors cursor-pointer ${
+                isDark
+                  ? "bg-white/5 text-slate-300 hover:bg-white/15 hover:text-white"
+                  : "bg-white/10 text-white/80 hover:bg-white/20 hover:text-white"
+              }`}
               title="Perkecil Side Bar"
             >
               <ChevronLeft className="size-4" />
@@ -378,12 +441,20 @@ function Sidebar({
                   isCollapsed
                     ? `size-11 justify-center rounded-2xl ${
                         active
-                          ? "bg-black/25 text-white shadow-inner ring-1 ring-white/30"
+                          ? isDark
+                            ? "bg-[#00E599] text-black font-extrabold shadow-lg shadow-emerald-500/30 ring-1 ring-emerald-300"
+                            : "bg-black/25 text-white shadow-inner ring-1 ring-white/30"
+                          : isDark
+                          ? "text-slate-300 hover:bg-white/10 hover:text-white"
                           : "text-white/80 hover:bg-white/15 hover:text-white"
                       }`
                     : `h-11 w-full gap-3 rounded-xl px-3.5 text-xs font-bold ${
                         active
-                          ? "bg-black/20 text-white shadow-inner ring-1 ring-white/30"
+                          ? isDark
+                            ? "bg-[#00E599] text-black font-extrabold shadow-lg shadow-emerald-500/30 ring-1 ring-emerald-300"
+                            : "bg-black/20 text-white shadow-inner ring-1 ring-white/30"
+                          : isDark
+                          ? "text-slate-300 hover:bg-white/10 hover:text-white"
                           : "text-white/80 hover:bg-white/15 hover:text-white"
                       }`
                 }`}
@@ -406,9 +477,26 @@ function Sidebar({
       {/* Bottom Footer Section */}
       {isCollapsed ? (
         <div className="flex flex-col items-center gap-3">
+          {/* Quick Theme Toggle in Collapsed */}
+          {onToggleTheme && (
+            <button
+              onClick={onToggleTheme}
+              className={`flex size-10 items-center justify-center rounded-xl transition-all cursor-pointer ${
+                isDark
+                  ? "bg-white/10 text-amber-400 hover:bg-white/20 hover:text-amber-300"
+                  : "bg-white/15 text-white hover:bg-white/25"
+              }`}
+              title={isDark ? "Ganti ke Mode Terang (Light Mode)" : "Ganti ke Mode Gelap (Dark Mode)"}
+            >
+              {isDark ? <Sun className="size-4.5" /> : <Moon className="size-4.5" />}
+            </button>
+          )}
+
           {/* User Avatar */}
           <div
-            className="group relative flex size-10 items-center justify-center overflow-hidden rounded-xl border-2 border-white/50 bg-white/20 shadow-md cursor-pointer"
+            className={`group relative flex size-10 items-center justify-center overflow-hidden rounded-xl border-2 shadow-md cursor-pointer ${
+              isDark ? "border-emerald-500/40 bg-white/10" : "border-white/50 bg-white/20"
+            }`}
             title={`${userName} (QA Lead / PIC)`}
           >
             <img
@@ -427,7 +515,11 @@ function Sidebar({
           {/* Logout Icon */}
           <button
             onClick={handleLogout}
-            className="flex size-10 items-center justify-center rounded-xl text-white/80 hover:bg-white/20 hover:text-white transition-colors cursor-pointer"
+            className={`flex size-10 items-center justify-center rounded-xl transition-colors cursor-pointer ${
+              isDark
+                ? "text-slate-300 hover:bg-white/10 hover:text-white"
+                : "text-white/80 hover:bg-white/20 hover:text-white"
+            }`}
             title="Logout System"
           >
             <LogOut className="size-4.5" />
@@ -435,15 +527,27 @@ function Sidebar({
         </div>
       ) : (
         <div className="space-y-3 pt-4">
-          <div className="rounded-xl border border-white/20 bg-white/10 p-3 backdrop-blur-xs text-white">
+          <div
+            className={`rounded-xl border p-3 backdrop-blur-xs transition-colors ${
+              isDark
+                ? "border-emerald-500/20 bg-emerald-950/25 text-slate-200"
+                : "border-white/20 bg-white/10 text-white"
+            }`}
+          >
             <div className="mb-1.5 flex items-center justify-between text-[10px]">
-              <span className="text-purple-200">System Status</span>
+              <span className={isDark ? "text-emerald-400 font-medium" : "text-purple-200"}>
+                System Status
+              </span>
               <span className="flex items-center gap-1 font-bold text-white">
                 <span className="size-1.5 rounded-full bg-emerald-400 animate-pulse" />{" "}
                 ONLINE
               </span>
             </div>
-            <div className="flex justify-between font-mono text-[9px] text-purple-200">
+            <div
+              className={`flex justify-between font-mono text-[9px] ${
+                isDark ? "text-slate-400" : "text-purple-200"
+              }`}
+            >
               <span>Uptime: 99.8%</span>
               <span>SSMS Connected</span>
             </div>
@@ -451,7 +555,11 @@ function Sidebar({
 
           <div className="flex items-center justify-between pt-1">
             <div className="flex items-center gap-2.5 overflow-hidden">
-              <div className="size-9 shrink-0 overflow-hidden rounded-xl border-2 border-white/50 bg-white/20 shadow-sm relative flex items-center justify-center text-xs font-bold">
+              <div
+                className={`size-9 shrink-0 overflow-hidden rounded-xl border-2 shadow-sm relative flex items-center justify-center text-xs font-bold ${
+                  isDark ? "border-emerald-500/40 bg-white/10" : "border-white/50 bg-white/20"
+                }`}
+              >
                 <img
                   src="https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&auto=format&fit=crop&q=80"
                   alt={userName}
@@ -468,18 +576,42 @@ function Sidebar({
                 <p className="text-[11px] font-extrabold text-white leading-tight truncate">
                   {userName}
                 </p>
-                <p className="text-[9px] text-purple-200 truncate">
+                <p
+                  className={`text-[9px] truncate ${
+                    isDark ? "text-emerald-400/90 font-medium" : "text-purple-200"
+                  }`}
+                >
                   QA Lead / PIC
                 </p>
               </div>
             </div>
-            <button
-              onClick={handleLogout}
-              className="flex size-8 shrink-0 items-center justify-center rounded-lg text-white/80 hover:bg-white/20 hover:text-white transition-colors cursor-pointer"
-              title="Logout System"
-            >
-              <LogOut className="size-4" />
-            </button>
+            <div className="flex items-center gap-1">
+              {onToggleTheme && (
+                <button
+                  type="button"
+                  onClick={onToggleTheme}
+                  className={`flex size-8 shrink-0 items-center justify-center rounded-lg transition-colors cursor-pointer ${
+                    isDark
+                      ? "text-amber-400 hover:bg-white/10 hover:text-amber-300"
+                      : "text-white/80 hover:bg-white/20 hover:text-white"
+                  }`}
+                  title={isDark ? "Ganti ke Mode Terang" : "Ganti ke Mode Gelap"}
+                >
+                  {isDark ? <Sun className="size-4" /> : <Moon className="size-4" />}
+                </button>
+              )}
+              <button
+                onClick={handleLogout}
+                className={`flex size-8 shrink-0 items-center justify-center rounded-lg transition-colors cursor-pointer ${
+                  isDark
+                    ? "text-slate-300 hover:bg-white/10 hover:text-white"
+                    : "text-white/80 hover:bg-white/20 hover:text-white"
+                }`}
+                title="Logout System"
+              >
+                <LogOut className="size-4" />
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -490,9 +622,13 @@ function Sidebar({
 function Header({
   view,
   apiStatus,
+  theme,
+  onToggleTheme,
 }: {
   view: View;
   apiStatus: { status: string; database: string };
+  theme: "light" | "dark";
+  onToggleTheme: () => void;
 }) {
   const [timeStr, setTimeStr] = useState("");
 
@@ -520,6 +656,7 @@ function Header({
 
   const isOnline = apiStatus.status === "online";
   const isDb = apiStatus.database === "connected";
+  const isDark = theme === "dark";
 
   return (
     <header className="flex items-center justify-between px-4 pt-5 pb-1 sm:px-6 lg:px-8 bg-transparent">
@@ -541,6 +678,30 @@ function Header({
             {timeStr || "15 Sep 2026 | 09:00 WIB"}
           </span>
         </div>
+
+        {/* Theme Toggle Button */}
+        <button
+          type="button"
+          onClick={onToggleTheme}
+          className={`group flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-[11px] font-bold shadow-xs transition-all duration-300 cursor-pointer ${
+            isDark
+              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 hover:border-emerald-400/50 shadow-emerald-950/20"
+              : "border-border/80 bg-card text-foreground hover:bg-muted/70 hover:border-border"
+          }`}
+          title={isDark ? "Ganti ke Mode Terang (Light Mode)" : "Ganti ke Mode Gelap (Dark Mode)"}
+        >
+          {isDark ? (
+            <>
+              <Sun className="size-3.5 text-amber-400 transition-transform duration-300 group-hover:rotate-45" />
+              <span className="font-bold text-[10px]">Light</span>
+            </>
+          ) : (
+            <>
+              <Moon className="size-3.5 text-indigo-500 transition-transform duration-300 group-hover:-rotate-12" />
+              <span className="font-bold text-[10px]">Dark</span>
+            </>
+          )}
+        </button>
       </div>
     </header>
   );
