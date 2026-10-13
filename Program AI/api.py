@@ -1,5 +1,11 @@
 from flask import Flask, jsonify, request, send_file
-from flask_cors import CORS
+
+try:
+    from flask_cors import CORS
+    has_flask_cors = True
+except ImportError:
+    has_flask_cors = False
+
 import os
 import sys
 from datetime import datetime, timedelta
@@ -11,8 +17,41 @@ if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 app = Flask(__name__)
-# Izinkan CORS untuk semua origin (terutama Vite dev server port 5173)
-CORS(app)
+if has_flask_cors:
+    # Izinkan CORS untuk semua origin (terutama Vite dev server port 5173)
+    CORS(app)
+else:
+    # Fallback CORS native jika modul flask_cors belum terpasang
+    @app.after_request
+    def add_cors_headers(response):
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return response
+
+    @app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+    @app.route('/<path:path>', methods=['OPTIONS'])
+    def handle_options_requests(path):
+        res = jsonify({"status": "ok"})
+        res.headers['Access-Control-Allow-Origin'] = '*'
+        res.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        res.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return res
+
+
+def parse_dt(val):
+    """Konversi string datetime dari SQLite ke objek datetime Python."""
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val
+    try:
+        return datetime.fromisoformat(str(val))
+    except Exception:
+        try:
+            return datetime.strptime(str(val).split(".")[0], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
 
 
 # ==========================================================
@@ -238,7 +277,7 @@ def get_inspections():
         for r in rows[:limit]:
             insp_id = r[0]
             code = r[1]
-            insp_time = r[2]
+            insp_time = parse_dt(r[2])
             sev = r[3]
             status_life = r[4]
             pic = r[5]
@@ -255,8 +294,10 @@ def get_inspections():
             raw_path = r[16]
             ann_path = r[17]
 
-            # Format waktu: HH:MM:SS
+            # Format waktu & tanggal
             time_str = insp_time.strftime("%H:%M:%S") if insp_time else ""
+            date_str = insp_time.strftime("%Y-%m-%d") if insp_time else ""
+            display_date_str = insp_time.strftime("%d %b %Y") if insp_time else ""
             full_time_str = insp_time.strftime("%d %b %Y, %H:%M:%S WIB") if insp_time else ""
 
             # Deskripsi objek & jenis cacat
@@ -290,6 +331,8 @@ def get_inspections():
                 "id": code,
                 "inspectionId": insp_id,
                 "detectionId": det_id,
+                "date": date_str,
+                "displayDate": display_date_str,
                 "time": time_str,
                 "fullTime": full_time_str,
                 "camera": cam_id,
@@ -360,7 +403,7 @@ def get_evidence():
         for r in rows:
             insp_id = r[0]
             code = r[1]
-            insp_time = r[2]
+            insp_time = parse_dt(r[2])
             sev = r[3]
             status_life = r[4]
             pic = r[5]
@@ -375,6 +418,8 @@ def get_evidence():
             ann_path = r[14]
 
             time_str = insp_time.strftime("%H:%M:%S WIB") if insp_time else ""
+            date_str = insp_time.strftime("%Y-%m-%d") if insp_time else ""
+            display_date_str = insp_time.strftime("%d %b %Y") if insp_time else ""
             full_date_str = insp_time.strftime("%d %b %Y, %H:%M:%S") if insp_time else ""
 
             area_desc = "Conveyor Plate & Rib Overhead"
@@ -383,7 +428,10 @@ def get_evidence():
             elif cam_id == "CAM-03":
                 area_desc = "Bolt & Pin Left Side"
 
-            title_desc = f"{comp} {stat_detail} #{insp_id:05d}"
+            # Ekstrak nomor urut harian dari TraceabilityCode (misal ABN-20261012-00002 -> 00002)
+            # agar judul selaras penuh dengan Abnormality ID dan mereset setiap hari baru
+            daily_seq = code.split("-")[-1] if ("-" in code) else f"{insp_id:05d}"
+            title_desc = f"{comp} {stat_detail} #{daily_seq}"
             obj_desc = f"{comp} (Slat #{slat_num})" if slat_num else f"{comp} Fastener"
 
             conf_str = f"{float(conf):.2f}%" if conf is not None else "95.50%"
@@ -399,6 +447,8 @@ def get_evidence():
                 "title": title_desc,
                 "severity": sev,
                 "object": obj_desc,
+                "date": date_str,
+                "displayDate": display_date_str,
                 "time": time_str,
                 "captureTime": full_date_str,
                 "area": area_desc,
@@ -430,7 +480,22 @@ def get_image():
     """
     path = request.args.get("path")
     if not path or not os.path.exists(path):
-        return jsonify({"error": "Image file not found"}), 404
+        # Cek path relatif jika path awal tidak langsung ditemukan
+        if path:
+            base_proj = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            candidates = [
+                os.path.join(base_proj, path.lstrip("/\\")),
+                os.path.join(base_proj, "Database", path.lstrip("/\\")),
+                os.path.join(base_proj, "Database", "captures", path.lstrip("/\\")),
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    path = c
+                    break
+            else:
+                return jsonify({"error": "Image file not found"}), 404
+        else:
+            return jsonify({"error": "Image file not found"}), 404
 
     try:
         # Tentukan mimetype
@@ -480,12 +545,10 @@ def update_inspection_action(inspection_id):
                     StatusLifecycle = 'RESOLVED',
                     PICName = ?,
                     MaintenanceNote = ?,
-                    ResolvedAt = GETDATE()
+                    ResolvedAt = CURRENT_TIMESTAMP
                 WHERE InspectionID = ?
                 """,
-                pic_name,
-                note,
-                inspection_id
+                (pic_name, note, inspection_id)
             )
         else:
             cursor.execute(
@@ -497,10 +560,7 @@ def update_inspection_action(inspection_id):
                     MaintenanceNote = ?
                 WHERE InspectionID = ?
                 """,
-                action,
-                pic_name,
-                note,
-                inspection_id
+                (action, pic_name, note, inspection_id)
             )
 
         conn.commit()
@@ -542,13 +602,13 @@ def get_analytics():
         cursor.execute(
             """
             SELECT 
-                DATEPART(dw, InspectionTime) - 1 as DayIndex,
+                CAST(strftime('%w', InspectionTime) AS INTEGER) as DayIndex,
                 COUNT(1) as TotalNG
             FROM Inspections
-            WHERE OverallResult = 'NG' AND InspectionTime >= ?
-            GROUP BY DATEPART(dw, InspectionTime)
+            WHERE OverallResult = 'NG' AND date(InspectionTime) >= date(?)
+            GROUP BY strftime('%w', InspectionTime)
             """,
-            start_date.strftime("%Y-%m-%d")
+            (start_date.strftime("%Y-%m-%d"),)
         )
         for r in cursor.fetchall():
             idx = int(r[0]) % 7

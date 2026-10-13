@@ -1,4 +1,5 @@
-export const API_BASE_URL = "http://localhost:5000/api";
+const API_HOST = typeof window !== "undefined" ? window.location.hostname : "localhost";
+export const API_BASE_URL = `http://${API_HOST}:5000/api`;
 
 export type Severity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "NONE";
 
@@ -15,6 +16,8 @@ export type RecordRow = {
   id: string;
   inspectionId: number;
   detectionId?: number;
+  date?: string;
+  displayDate?: string;
   time: string;
   fullTime?: string;
   camera: string;
@@ -32,6 +35,81 @@ export type RecordRow = {
   annotatedPath?: string | null;
 };
 
+export const MONTH_NAMES_ID = [
+  "Januari",
+  "Februari",
+  "Maret",
+  "April",
+  "Mei",
+  "Juni",
+  "Juli",
+  "Agustus",
+  "September",
+  "Oktober",
+  "November",
+  "Desember",
+] as const;
+
+export const MONTH_SHORT_ID = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "Mei",
+  "Jun",
+  "Jul",
+  "Ags",
+  "Sep",
+  "Okt",
+  "Nov",
+  "Des",
+] as const;
+
+/**
+ * Ekstraksi informasi penanggalan (tanggal, bulan, tahun) dari RecordRow
+ */
+export function extractRecordDate(r: RecordRow): {
+  date: string; // YYYY-MM-DD
+  displayDate: string; // misal: "12 Okt 2026"
+  year: number;
+  month: number; // 1-12
+  day: number;
+} {
+  if (r.date && r.date.includes("-")) {
+    const parts = r.date.split("-");
+    const y = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10);
+    const d = parseInt(parts[2], 10);
+    const display = r.displayDate || `${d} ${MONTH_SHORT_ID[m - 1] || m} ${y}`;
+    return { date: r.date, displayDate: display, year: y, month: m, day: d };
+  }
+
+  // Fallback: Ekstraksi dari pola ID ABN-YYYYMMDD-XXXXX
+  const idMatch = r.id?.match(/ABN-(\d{4})(\d{2})(\d{2})-/i);
+  if (idMatch) {
+    const y = parseInt(idMatch[1], 10);
+    const m = parseInt(idMatch[2], 10);
+    const d = parseInt(idMatch[3], 10);
+    const dateFormatted = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    const display = `${d} ${MONTH_SHORT_ID[m - 1] || m} ${y}`;
+    return { date: dateFormatted, displayDate: display, year: y, month: m, day: d };
+  }
+
+  // Fallback default: Tanggal hari ini
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth() + 1;
+  const d = now.getDate();
+  const dateFormatted = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  return {
+    date: dateFormatted,
+    displayDate: `${d} ${MONTH_SHORT_ID[m - 1] || m} ${y}`,
+    year: y,
+    month: m,
+    day: d,
+  };
+}
+
 export type EvidenceItem = {
   id: string;
   inspectionId: number;
@@ -39,6 +117,8 @@ export type EvidenceItem = {
   title: string;
   severity: Severity;
   object: string;
+  date?: string;
+  displayDate?: string;
   time: string;
   captureTime?: string;
   area: string;
@@ -50,6 +130,64 @@ export type EvidenceItem = {
   annotatedPath?: string | null;
   imageUrl?: string | null;
 };
+
+/**
+ * Ekstraksi informasi penanggalan dari EvidenceItem
+ */
+export function extractEvidenceDate(e: EvidenceItem): {
+  date: string; // YYYY-MM-DD
+  displayDate: string; // misal: "12 Okt 2026"
+  year: number;
+  month: number;
+  day: number;
+} {
+  if (e.date && e.date.includes("-")) {
+    const parts = e.date.split("-");
+    const y = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10);
+    const d = parseInt(parts[2], 10);
+    const display = e.displayDate || `${d} ${MONTH_SHORT_ID[m - 1] || m} ${y}`;
+    return { date: e.date, displayDate: display, year: y, month: m, day: d };
+  }
+
+  // Fallback 1: Pola ID ABN-YYYYMMDD-XXXXX
+  const idMatch = e.id?.match(/ABN-(\d{4})(\d{2})(\d{2})-/i);
+  if (idMatch) {
+    const y = parseInt(idMatch[1], 10);
+    const m = parseInt(idMatch[2], 10);
+    const d = parseInt(idMatch[3], 10);
+    const dateFormatted = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    const display = `${d} ${MONTH_SHORT_ID[m - 1] || m} ${y}`;
+    return { date: dateFormatted, displayDate: display, year: y, month: m, day: d };
+  }
+
+  // Fallback 2: captureTime string (misal "12 Oct 2026, 20:10:44")
+  if (e.captureTime) {
+    const parsed = new Date(e.captureTime.replace(" WIB", ""));
+    if (!isNaN(parsed.getTime())) {
+      const y = parsed.getFullYear();
+      const m = parsed.getMonth() + 1;
+      const d = parsed.getDate();
+      const dateFormatted = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+      const display = `${d} ${MONTH_SHORT_ID[m - 1] || m} ${y}`;
+      return { date: dateFormatted, displayDate: display, year: y, month: m, day: d };
+    }
+  }
+
+  // Fallback default: Hari ini
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth() + 1;
+  const d = now.getDate();
+  const dateFormatted = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  return {
+    date: dateFormatted,
+    displayDate: `${d} ${MONTH_SHORT_ID[m - 1] || m} ${y}`,
+    year: y,
+    month: m,
+    day: d,
+  };
+}
 
 export type AnalyticsData = {
   weekly: { d: string; n: number }[];
@@ -64,7 +202,7 @@ export function getImageUrl(path?: string | null): string | null {
   if (!path) return null;
   if (path.startsWith("http://") || path.startsWith("https://")) return path;
   if (path.startsWith("/api/image")) {
-    return `http://localhost:5000${path}`;
+    return `http://${API_HOST}:5000${path}`;
   }
   return `${API_BASE_URL}/image?path=${encodeURIComponent(path)}`;
 }

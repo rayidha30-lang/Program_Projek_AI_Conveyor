@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
   BarChart3,
+  Calendar,
   Camera,
   Check,
   ChevronDown,
@@ -11,6 +12,7 @@ import {
   Clock3,
   Cpu,
   Download,
+  ExternalLink,
   Eye,
   Folder,
   FolderOpen,
@@ -18,6 +20,8 @@ import {
   Layers,
   LayoutDashboard,
   LogOut,
+  RotateCcw,
+  Search,
   ShieldAlert,
   ShieldCheck,
   Wrench,
@@ -31,6 +35,10 @@ import {
   submitInspectionAction,
   fetchAnalytics,
   getImageUrl,
+  extractRecordDate,
+  extractEvidenceDate,
+  MONTH_NAMES_ID,
+  MONTH_SHORT_ID,
   type RecordRow,
   type EvidenceItem,
   type AbnormalComponentSummary,
@@ -93,6 +101,8 @@ const abnormalComponentCounts: AbnormalComponentSummary[] = [
 
 const records: RecordRow[] = [
   {
+    date: "2026-09-13",
+    displayDate: "13 Sep 2026",
     time: "10:31:22",
     id: "ABN-20260913-00021",
     inspectionId: 0,
@@ -105,6 +115,8 @@ const records: RecordRow[] = [
     statusLifecycle: "UNACKNOWLEDGED",
   },
   {
+    date: "2026-09-13",
+    displayDate: "13 Sep 2026",
     time: "10:28:44",
     id: "ABN-20260913-00020",
     inspectionId: 0,
@@ -117,6 +129,8 @@ const records: RecordRow[] = [
     statusLifecycle: "ACKNOWLEDGED",
   },
   {
+    date: "2026-09-13",
+    displayDate: "13 Sep 2026",
     time: "10:21:05",
     id: "ABN-20260913-00019",
     inspectionId: 0,
@@ -129,6 +143,8 @@ const records: RecordRow[] = [
     statusLifecycle: "RESOLVED",
   },
   {
+    date: "2026-09-13",
+    displayDate: "13 Sep 2026",
     time: "10:14:18",
     id: "ABN-20260913-00018",
     inspectionId: 0,
@@ -175,6 +191,7 @@ const titles: Record<View, [string, string]> = {
 
 export default function Index() {
   const [view, setView] = useState<View>("dashboard");
+  const [selectedEvidenceId, setSelectedEvidenceId] = useState<string | null>(null);
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [apiStatus, setApiStatus] = useState<{ status: string; database: string }>({
     status: "checking",
@@ -184,6 +201,11 @@ export default function Index() {
   const [recordsData, setRecordsData] = useState<RecordRow[]>(records);
   const [evidenceData, setEvidenceData] = useState<EvidenceItem[]>(evidence);
   const [analyticsData, setAnalyticsData] = useState<AnalyticsData | null>(null);
+
+  const handleSelectRecord = (record: RecordRow) => {
+    setSelectedEvidenceId(record.id);
+    setView("evidence");
+  };
 
   // Polling data secara real-time dari backend SQL Server
   const loadData = async () => {
@@ -233,14 +255,25 @@ export default function Index() {
           {view === "dashboard" && (
             <Dashboard
               onViewAll={() => setView("abnormality")}
+              onSelectRecord={handleSelectRecord}
               statsList={statsData}
               recentRecords={recordsData}
             />
           )}
           {view === "live" && <LiveCamera />}
-          {view === "abnormality" && <Abnormality allRecords={recordsData} />}
+          {view === "abnormality" && (
+            <Abnormality
+              allRecords={recordsData}
+              onSelectRecord={handleSelectRecord}
+            />
+          )}
           {view === "evidence" && (
-            <Evidence evidenceList={evidenceData} onRefresh={loadData} />
+            <Evidence
+              evidenceList={evidenceData}
+              onRefresh={loadData}
+              initialSelectedId={selectedEvidenceId}
+              onBackToHistory={() => setView("abnormality")}
+            />
           )}
           {view === "analytics" && <Analytics data={analyticsData} />}
         </main>
@@ -573,10 +606,12 @@ function SectionTitle({
 
 function Dashboard({
   onViewAll,
+  onSelectRecord,
   statsList,
   recentRecords,
 }: {
   onViewAll: () => void;
+  onSelectRecord?: (record: RecordRow) => void;
   statsList: AbnormalComponentSummary[];
   recentRecords: RecordRow[];
 }) {
@@ -733,7 +768,11 @@ function Dashboard({
             }
           />
         </div>
-        <RecordTable rows={recentRecords.slice(0, 5)} compact />
+        <RecordTable
+          rows={recentRecords.slice(0, 5)}
+          compact
+          onSelectRecord={onSelectRecord}
+        />
       </Panel>
     </div>
   );
@@ -913,71 +952,250 @@ function LiveCamera() {
   );
 }
 
-function Abnormality({ allRecords }: { allRecords: RecordRow[] }) {
+function Abnormality({
+  allRecords,
+  onSelectRecord,
+}: {
+  allRecords: RecordRow[];
+  onSelectRecord?: (record: RecordRow) => void;
+}) {
   const [camera, setCamera] = useState("ALL");
   const [severity, setSeverity] = useState("ALL");
   const [status, setStatus] = useState("ALL");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedYear, setSelectedYear] = useState("ALL");
+  const [selectedMonth, setSelectedMonth] = useState("ALL");
+  const [selectedDate, setSelectedDate] = useState("");
 
-  const filtered = useMemo(
-    () =>
-      allRecords.filter(
-        (r) =>
-          (camera === "ALL" || r.camera === camera) &&
-          (severity === "ALL" || r.severity === severity) &&
-          (status === "ALL" || r.status.startsWith(status) || r.statusLifecycle === status)
-      ),
-    [allRecords, camera, severity, status]
-  );
+  const availableYears = useMemo(() => {
+    const years = new Set<string>();
+    allRecords.forEach((r) => {
+      const d = extractRecordDate(r);
+      if (d.year) years.add(d.year.toString());
+    });
+    const arr = Array.from(years).sort().reverse();
+    return arr.length > 0 ? arr : ["2026", "2025"];
+  }, [allRecords]);
+
+  const monthOptions = [
+    { value: "01", label: "01 - Januari" },
+    { value: "02", label: "02 - Februari" },
+    { value: "03", label: "03 - Maret" },
+    { value: "04", label: "04 - April" },
+    { value: "05", label: "05 - Mei" },
+    { value: "06", label: "06 - Juni" },
+    { value: "07", label: "07 - Juli" },
+    { value: "08", label: "08 - Agustus" },
+    { value: "09", label: "09 - September" },
+    { value: "10", label: "10 - Oktober" },
+    { value: "11", label: "11 - November" },
+    { value: "12", label: "12 - Desember" },
+  ];
+
+  const filtered = useMemo(() => {
+    return allRecords.filter((r) => {
+      if (camera !== "ALL" && r.camera !== camera) return false;
+      if (severity !== "ALL" && r.severity !== severity) return false;
+      if (
+        status !== "ALL" &&
+        !r.status.startsWith(status) &&
+        r.statusLifecycle !== status
+      )
+        return false;
+
+      const dateInfo = extractRecordDate(r);
+
+      if (selectedYear !== "ALL" && dateInfo.year.toString() !== selectedYear) {
+        return false;
+      }
+
+      if (selectedMonth !== "ALL") {
+        const mStr = String(dateInfo.month).padStart(2, "0");
+        if (mStr !== selectedMonth) return false;
+      }
+
+      if (selectedDate && dateInfo.date !== selectedDate) {
+        return false;
+      }
+
+      if (searchQuery.trim()) {
+        const q = searchQuery.toLowerCase().trim();
+        const matchId = r.id.toLowerCase().includes(q);
+        const matchObj = r.object.toLowerCase().includes(q);
+        const matchType = r.type.toLowerCase().includes(q);
+        if (!matchId && !matchObj && !matchType) return false;
+      }
+
+      return true;
+    });
+  }, [allRecords, camera, severity, status, selectedYear, selectedMonth, selectedDate, searchQuery]);
+
+  const isFiltered =
+    camera !== "ALL" ||
+    severity !== "ALL" ||
+    status !== "ALL" ||
+    selectedYear !== "ALL" ||
+    selectedMonth !== "ALL" ||
+    selectedDate !== "" ||
+    searchQuery !== "";
+
+  const handleResetFilters = () => {
+    setCamera("ALL");
+    setSeverity("ALL");
+    setStatus("ALL");
+    setSelectedYear("ALL");
+    setSelectedMonth("ALL");
+    setSelectedDate("");
+    setSearchQuery("");
+  };
 
   function exportCsv() {
     const head =
-      "Time,Abnormality ID,Camera,Object,Type,Confidence,Severity,Status\n";
+      "Tanggal,Waktu,Abnormality ID,Kamera,Objek,Tipe Kelainan,AI Confidence,Severity,Status,Timestamp Penuh\n";
     const csv =
-      head + filtered.map((r) => Object.values(r).join(",")).join("\n");
+      head +
+      filtered
+        .map((r) => {
+          const d = extractRecordDate(r);
+          return [
+            `"${d.displayDate}"`,
+            `"${r.time}"`,
+            `"${r.id}"`,
+            `"${r.camera}"`,
+            `"${r.object.replace(/"/g, '""')}"`,
+            `"${r.type.replace(/"/g, '""')}"`,
+            `"${r.confidence}"`,
+            `"${r.severity}"`,
+            `"${r.status.replace(/"/g, '""')}"`,
+            `"${(r.fullTime || "").replace(/"/g, '""')}"`,
+          ].join(",");
+        })
+        .join("\n");
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-    a.download = "abnormality-history.csv";
+    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8;" }));
+    a.download = `abnormality-history-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(a.href);
   }
 
   return (
     <Panel className="overflow-hidden">
-      <div className="p-5 pb-4">
-        <SectionTitle
-          title="Abnormality History & Traceability Ledger"
-          subtitle="Pencatatan seluruh histori kelainan dengan kemampuan filter multi-parameter"
-        />
-        <div className="mt-4 flex flex-wrap items-center gap-2">
+      <div className="p-5 pb-4 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+          <SectionTitle
+            title="Abnormality History & Traceability Ledger"
+            subtitle="Pencatatan seluruh histori kelainan dengan kemampuan filter multi-parameter"
+          />
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="text-[10px] font-mono text-muted-foreground hidden lg:inline">
+              Total: <b className="text-foreground">{filtered.length}</b> dari {allRecords.length}
+            </span>
+            <Button size="sm" onClick={exportCsv} className="h-8 text-xs gap-1.5 cursor-pointer">
+              <Download className="size-3.5" />
+              Export CSV
+            </Button>
+          </div>
+        </div>
+
+        {/* Filter Bar Multi-Parameter */}
+        <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-border/50">
+          {/* 1. Pencarian Kata Kunci */}
+          <div className="relative inline-flex items-center min-w-[200px] flex-1 sm:flex-initial">
+            <Search className="absolute left-2.5 pointer-events-none size-3 text-muted-foreground" />
+            <input
+              type="text"
+              placeholder="Cari ID, objek, tipe..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="h-8 w-full rounded-lg border bg-secondary/70 py-1 pl-7.5 pr-3 text-[10px] placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary text-foreground transition-all hover:bg-secondary"
+            />
+          </div>
+
+          {/* 2. Filter Tanggal Spesifik (Date Picker) */}
+          <div className="relative inline-flex items-center">
+            <Calendar className="absolute left-2.5 pointer-events-none size-3 text-muted-foreground" />
+            <input
+              type="date"
+              value={selectedDate}
+              onChange={(e) => setSelectedDate(e.target.value)}
+              className="h-8 rounded-lg border bg-secondary/70 py-1 pl-7.5 pr-2.5 text-[10px] font-semibold outline-none focus:ring-1 focus:ring-primary text-foreground transition-all hover:bg-secondary cursor-pointer"
+              title="Filter tanggal spesifik (YYYY-MM-DD)"
+            />
+          </div>
+
+          {/* 3. Filter Tahun */}
+          <Filter
+            value={selectedYear}
+            setValue={setSelectedYear}
+            label="Semua Tahun"
+            options={availableYears.map((y) => ({ value: y, label: `Tahun ${y}` }))}
+          />
+
+          {/* 4. Filter Bulan */}
+          <Filter
+            value={selectedMonth}
+            setValue={setSelectedMonth}
+            label="Semua Bulan"
+            options={monthOptions}
+          />
+
+          {/* 5. Filter Kamera */}
           <Filter
             value={camera}
             setValue={setCamera}
-            label="Semua Kamera (CAM 01, 02, 03)"
+            label="Semua Kamera"
             options={["CAM-01", "CAM-02", "CAM-03"]}
           />
+
+          {/* 6. Filter Severity */}
           <Filter
             value={severity}
             setValue={setSeverity}
             label="Semua Severity"
             options={["CRITICAL", "HIGH", "MEDIUM", "LOW"]}
           />
+
+          {/* 7. Filter Status */}
           <Filter
             value={status}
             setValue={setStatus}
             label="Semua Status"
             options={["UNACKNOWLEDGED", "ACK", "RESOLVED"]}
           />
-          <Button size="sm" onClick={exportCsv} className="h-8 text-xs">
-            <Download className="size-3.5" />
-            Export CSV
-          </Button>
+
+          {/* 8. Tombol Reset Filter */}
+          {isFiltered && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={handleResetFilters}
+              className="h-8 text-[10px] text-muted-foreground hover:text-foreground gap-1 px-2.5 cursor-pointer"
+              title="Reset semua filter ke kondisi awal"
+            >
+              <RotateCcw className="size-3" />
+              Reset Filter
+            </Button>
+          )}
         </div>
       </div>
-      <RecordTable rows={filtered} />
+
+      <RecordTable rows={filtered} onSelectRecord={onSelectRecord} />
       {filtered.length === 0 && (
-        <p className="p-8 text-center text-xs text-muted-foreground">
-          No records match the selected filters.
-        </p>
+        <div className="p-8 text-center space-y-2">
+          <p className="text-xs font-semibold text-muted-foreground">
+            Tidak ada riwayat kelainan yang cocok dengan kriteria filter.
+          </p>
+          {isFiltered && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleResetFilters}
+              className="text-[10px] h-7"
+            >
+              Reset Filter
+            </Button>
+          )}
+        </div>
       )}
     </Panel>
   );
@@ -992,7 +1210,7 @@ function Filter({
   value: string;
   setValue: (v: string) => void;
   label: string;
-  options: string[] | readonly string[];
+  options: (string | { value: string; label: string })[] | readonly string[];
 }) {
   return (
     <label className="relative inline-block">
@@ -1000,14 +1218,18 @@ function Filter({
       <select
         value={value}
         onChange={(e) => setValue(e.target.value)}
-        className="h-8 appearance-none rounded-lg border bg-secondary py-1 pl-3 pr-8 text-[10px] font-semibold outline-none focus:ring-1 focus:ring-ring text-foreground"
+        className="h-8 appearance-none rounded-lg border bg-secondary/70 py-1 pl-3 pr-7.5 text-[10px] font-semibold outline-none focus:ring-1 focus:ring-primary text-foreground transition-all hover:bg-secondary cursor-pointer"
       >
         <option value="ALL">{label}</option>
-        {options.map((x) => (
-          <option key={x} value={x}>
-            {x}
-          </option>
-        ))}
+        {options.map((opt) => {
+          const val = typeof opt === "string" ? opt : opt.value;
+          const lbl = typeof opt === "string" ? opt : opt.label;
+          return (
+            <option key={val} value={val}>
+              {lbl}
+            </option>
+          );
+        })}
       </select>
       <ChevronDown className="pointer-events-none absolute top-2.5 right-2 size-3 text-muted-foreground" />
     </label>
@@ -1017,65 +1239,112 @@ function Filter({
 function RecordTable({
   rows,
   compact = false,
+  onSelectRecord,
 }: {
   rows: RecordRow[];
   compact?: boolean;
+  onSelectRecord?: (record: RecordRow) => void;
 }) {
   return (
     <div className="overflow-x-auto">
-      <table className="w-full min-w-[850px] text-left">
+      <table className="w-full min-w-[950px] text-left">
         <thead className="bg-secondary/70 text-[9px] uppercase text-muted-foreground">
           <tr>
-            {[
-              "Time",
-              "Abnormality ID",
-              "Camera",
-              "Object",
-              "Abnormality Type",
-              "AI Conf.",
-              "Severity",
-              "Status Lifecycle",
-            ].map((x) => (
-              <th key={x} className="px-5 py-3 font-bold">
-                {x}
-              </th>
-            ))}
+            <th className="px-5 py-3 font-bold">Tanggal</th>
+            <th className="px-5 py-3 font-bold">Waktu</th>
+            <th className="px-5 py-3 font-bold">Abnormality ID</th>
+            <th className="px-5 py-3 font-bold">Kamera</th>
+            <th className="px-5 py-3 font-bold">Objek</th>
+            <th className="px-5 py-3 font-bold">Abnormality Type</th>
+            <th className="px-5 py-3 font-bold">AI Conf.</th>
+            <th className="px-5 py-3 font-bold">Severity</th>
+            <th className="px-5 py-3 font-bold">Status Lifecycle</th>
+            <th className="px-5 py-3 font-bold text-right">Aksi</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-border">
-          {rows.map((r) => (
-            <tr key={r.id} className="text-[10px] hover:bg-secondary/40">
-              <td className="px-5 py-4 font-mono text-muted-foreground">
-                {r.time}
-                {compact && " WIB"}
-              </td>
-              <td className="px-5 py-4 font-mono font-bold text-primary">
-                {r.id}
-              </td>
-              <td className="px-5 py-4 font-bold">{r.camera}</td>
-              <td className="px-5 py-4">{r.object}</td>
-              <td
-                className={`px-5 py-4 font-semibold ${
-                  r.severity === "CRITICAL"
-                    ? "text-danger"
-                    : r.severity === "HIGH"
-                    ? "text-primary"
-                    : r.severity === "MEDIUM"
-                    ? "text-warning"
-                    : ""
-                }`}
+          {rows.map((r) => {
+            const dateInfo = extractRecordDate(r);
+            return (
+              <tr
+                key={r.id + (r.detectionId ? `-${r.detectionId}` : "")}
+                onClick={() => onSelectRecord?.(r)}
+                className="group text-[10px] hover:bg-primary/5 transition-colors cursor-pointer"
+                title="Klik untuk membuka bukti visual di Evidence Viewer"
               >
-                {r.type}
-              </td>
-              <td className="px-5 py-4 font-mono font-bold">{r.confidence}</td>
-              <td className="px-5 py-4">
-                <Badge text={r.severity} />
-              </td>
-              <td className="px-5 py-4">
-                <StatusBadge text={r.status} />
-              </td>
-            </tr>
-          ))}
+                {/* Kolom Tanggal (Date) */}
+                <td className="px-5 py-3.5 whitespace-nowrap">
+                  <div className="flex items-center gap-1.5 font-mono text-[10px] font-semibold text-foreground">
+                    <Calendar className="size-3 text-primary/70 shrink-0" />
+                    <span>{dateInfo.displayDate}</span>
+                  </div>
+                </td>
+
+                {/* Kolom Waktu (Time) */}
+                <td className="px-5 py-3.5 font-mono text-muted-foreground whitespace-nowrap">
+                  {r.time}
+                  {compact && " WIB"}
+                </td>
+
+                {/* Kolom Abnormality ID dengan Deep Link */}
+                <td className="px-5 py-3.5 font-mono font-bold text-primary whitespace-nowrap">
+                  <span className="inline-flex items-center gap-1 group-hover:underline">
+                    {r.id}
+                    <ExternalLink className="size-2.5 opacity-0 group-hover:opacity-100 transition-opacity text-primary" />
+                  </span>
+                </td>
+
+                {/* Kamera */}
+                <td className="px-5 py-3.5 font-bold whitespace-nowrap">{r.camera}</td>
+
+                {/* Objek */}
+                <td className="px-5 py-3.5 whitespace-nowrap">{r.object}</td>
+
+                {/* Tipe Cacat */}
+                <td
+                  className={`px-5 py-3.5 font-semibold whitespace-nowrap ${
+                    r.severity === "CRITICAL"
+                      ? "text-danger"
+                      : r.severity === "HIGH"
+                      ? "text-primary"
+                      : r.severity === "MEDIUM"
+                      ? "text-warning"
+                      : ""
+                  }`}
+                >
+                  {r.type}
+                </td>
+
+                {/* AI Confidence */}
+                <td className="px-5 py-3.5 font-mono font-bold whitespace-nowrap">{r.confidence}</td>
+
+                {/* Severity */}
+                <td className="px-5 py-3.5 whitespace-nowrap">
+                  <Badge text={r.severity} />
+                </td>
+
+                {/* Status Lifecycle */}
+                <td className="px-5 py-3.5 whitespace-nowrap">
+                  <StatusBadge text={r.status} />
+                </td>
+
+                {/* Tombol Aksi: Lihat Bukti */}
+                <td className="px-5 py-3.5 whitespace-nowrap text-right">
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSelectRecord?.(r);
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-primary/10 text-primary hover:bg-primary hover:text-white transition-all text-[9px] font-bold cursor-pointer shadow-2xs group-hover:scale-105"
+                  >
+                    <Eye className="size-3" />
+                    <span>Lihat Bukti</span>
+                  </button>
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -1119,72 +1388,98 @@ function StatusBadge({ text }: { text: string }) {
 
 const evidence: EvidenceItem[] = [
   {
-    id: "ABN-20260913-00021",
-    inspectionId: 0,
+    id: "ABN-20261012-00002",
+    inspectionId: 16,
     camera: "CAM-01",
-    title: "Rib Deformation #00021",
-    severity: "CRITICAL",
-    object: "Rib Plate #42",
-    time: "10:31:22 WIB",
+    title: "Plat Bending #00002",
+    severity: "MEDIUM",
+    object: "Plat (Slat #4)",
+    date: "2026-10-12",
+    displayDate: "12 Okt 2026",
+    time: "10:10:44 WIB",
     area: "Conveyor Plate & Rib Overhead",
-    confidence: "94.82%",
+    confidence: "92.00%",
     statusLifecycle: "UNACKNOWLEDGED",
   },
   {
-    id: "ABN-20260913-00018",
-    inspectionId: 0,
+    id: "ABN-20261012-00002",
+    inspectionId: 16,
     camera: "CAM-01",
-    title: "Plate Crack #00018",
-    severity: "LOW",
-    object: "Slat Plate C-09",
-    time: "10:14:18 WIB",
+    title: "Rib Bending #00002",
+    severity: "MEDIUM",
+    object: "Rib (Slat #4)",
+    date: "2026-10-12",
+    displayDate: "12 Okt 2026",
+    time: "10:10:44 WIB",
     area: "Conveyor Plate & Rib Overhead",
-    confidence: "88.00%",
-    statusLifecycle: "RESOLVED",
+    confidence: "95.00%",
+    statusLifecycle: "UNACKNOWLEDGED",
   },
   {
-    id: "ABN-20260913-00014",
-    inspectionId: 0,
+    id: "ABN-20261012-00001",
+    inspectionId: 15,
     camera: "CAM-01",
-    title: "Plate Misalignment #00014",
+    title: "Rib Bending #00001",
     severity: "MEDIUM",
-    object: "Slat Joint B-12",
-    time: "09:48:02 WIB",
+    object: "Rib (Slat #3)",
+    date: "2026-10-12",
+    displayDate: "12 Okt 2026",
+    time: "10:10:43 WIB",
     area: "Conveyor Plate & Rib Overhead",
-    confidence: "90.21%",
-    statusLifecycle: "RESOLVED",
+    confidence: "95.00%",
+    statusLifecycle: "UNACKNOWLEDGED",
+  },
+  {
+    id: "ABN-20261009-00014",
+    inspectionId: 14,
+    camera: "CAM-01",
+    title: "Rib Bending #00014",
+    severity: "MEDIUM",
+    object: "Rib (Slat #53)",
+    date: "2026-10-09",
+    displayDate: "09 Okt 2026",
+    time: "21:15:52 WIB",
+    area: "Conveyor Plate & Rib Overhead",
+    confidence: "95.00%",
+    statusLifecycle: "UNACKNOWLEDGED",
+  },
+  {
+    id: "ABN-20261009-00013",
+    inspectionId: 13,
+    camera: "CAM-01",
+    title: "Rib Bending #00013",
+    severity: "MEDIUM",
+    object: "Rib (Slat #52)",
+    date: "2026-10-09",
+    displayDate: "09 Okt 2026",
+    time: "21:15:50 WIB",
+    area: "Conveyor Plate & Rib Overhead",
+    confidence: "95.00%",
+    statusLifecycle: "UNACKNOWLEDGED",
   },
   {
     id: "ABN-20260913-00020",
-    inspectionId: 0,
+    inspectionId: 5,
     camera: "CAM-02",
-    title: "Bolt Loose / Untorqued #00020",
+    title: "Bolt Loose #00020",
     severity: "HIGH",
     object: "Fastener M16",
+    date: "2026-09-13",
+    displayDate: "13 Sep 2026",
     time: "10:28:44 WIB",
     area: "Bolt & Pin Right Side",
     confidence: "97.20%",
     statusLifecycle: "ACKNOWLEDGED",
   },
   {
-    id: "ABN-20260913-00015",
-    inspectionId: 0,
-    camera: "CAM-02",
-    title: "Bolt Missing #00015",
-    severity: "CRITICAL",
-    object: "RH Guide Bolt #18",
-    time: "09:55:10 WIB",
-    area: "Bolt & Pin Right Side",
-    confidence: "96.40%",
-    statusLifecycle: "UNACKNOWLEDGED",
-  },
-  {
     id: "ABN-20260913-00019",
-    inspectionId: 0,
+    inspectionId: 4,
     camera: "CAM-03",
-    title: "Pin Missing / Dislodged #00019",
+    title: "Pin Missing #00019",
     severity: "MEDIUM",
     object: "Connecting Pin #11",
+    date: "2026-09-13",
+    displayDate: "13 Sep 2026",
     time: "10:21:05 WIB",
     area: "Bolt & Pin Left Side",
     confidence: "91.40%",
@@ -1195,19 +1490,73 @@ const evidence: EvidenceItem[] = [
 function Evidence({
   evidenceList,
   onRefresh,
+  initialSelectedId,
+  onBackToHistory,
 }: {
   evidenceList: EvidenceItem[];
   onRefresh?: () => void;
+  initialSelectedId?: string | null;
+  onBackToHistory?: () => void;
 }) {
-  const [selected, setSelected] = useState<EvidenceItem>(evidenceList[0] || evidence[0]!);
+  const currentItems = evidenceList.length > 0 ? evidenceList : evidence;
+  const [selected, setSelected] = useState<EvidenceItem>(() => {
+    if (initialSelectedId) {
+      const match = currentItems.find(
+        (e) => e.id === initialSelectedId || e.inspectionId.toString() === initialSelectedId
+      );
+      if (match) return match;
+    }
+    return currentItems[0] || evidence[0]!;
+  });
   const [open, setOpen] = useState<Record<string, boolean>>({
     "CAM-01": true,
-    "CAM-02": true,
-    "CAM-03": true,
+    "CAM-02": false,
+    "CAM-03": false,
   });
+  const [openDates, setOpenDates] = useState<Record<string, boolean>>({});
   const [action, setAction] = useState(selected?.statusLifecycle || "UNACKNOWLEDGED");
   const [maintenanceAction, setMaintenanceAction] = useState(selected?.maintenanceNote || "");
   const [picRemark, setPicRemark] = useState(selected?.picName || "");
+
+  useEffect(() => {
+    if (selected?.camera) {
+      setOpen((prev) => ({ ...prev, [selected.camera]: true }));
+      const matchDate = extractEvidenceDate(selected).date;
+      setOpenDates((prev) => ({
+        ...prev,
+        [`${selected.camera}_${matchDate}`]: true,
+      }));
+    }
+  }, [selected?.camera]);
+
+  // Ketika initialSelectedId dipilih dari Abnormality History, sinkronkan selected item & buka folder kamera serta subfolder tanggal
+  useEffect(() => {
+    if (!initialSelectedId) return;
+    const match = currentItems.find(
+      (e) => e.id === initialSelectedId || e.inspectionId.toString() === initialSelectedId
+    );
+    if (match) {
+      setSelected(match);
+      setAction(match.statusLifecycle || "UNACKNOWLEDGED");
+      setMaintenanceAction(match.maintenanceNote || "");
+      setPicRemark(match.picName || "");
+      if (match.camera) {
+        setOpen((prev) => ({ ...prev, [match.camera]: true }));
+        const matchDate = extractEvidenceDate(match).date;
+        setOpenDates((prev) => ({
+          ...prev,
+          [`${match.camera}_${matchDate}`]: true,
+        }));
+      }
+    }
+  }, [initialSelectedId, currentItems]);
+
+  const toggleDateFolder = (key: string, currentOpenState: boolean) => {
+    setOpenDates((prev) => ({
+      ...prev,
+      [key]: !currentOpenState,
+    }));
+  };
 
   const handleSelectItem = (item: EvidenceItem) => {
     setSelected(item);
@@ -1240,7 +1589,6 @@ function Evidence({
 
   if (!selected) return null;
 
-  const currentItems = evidenceList.length > 0 ? evidenceList : evidence;
   const userName = localStorage.getItem("userName") || "Sarah Jenkins";
 
   const handleAcknowledge = async () => {
@@ -1314,14 +1662,45 @@ function Evidence({
         title="Evidence Archive & Area Inspection Explorer"
         subtitle="Jelajahi rekaman anomali tersimpan per area target kamera sesuai spesifikasi PRD"
         aside={
-          <div className="flex gap-2">
+          <div className="flex items-center gap-2">
+            {initialSelectedId && onBackToHistory && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onBackToHistory}
+                className="h-7 text-[10px] gap-1 font-semibold text-primary border-primary/30 hover:bg-primary/10 cursor-pointer"
+              >
+                <ChevronLeft className="size-3" />
+                Kembali ke Histori
+              </Button>
+            )}
             <StatusPill text="3 Target Camera Directories" />
             <StatusPill text="Sync Storage" />
           </div>
         }
       />
-      <div className="grid gap-5 xl:grid-cols-[320px_1fr]">
-        <Panel className="overflow-hidden">
+
+      {initialSelectedId && (
+        <div className="flex items-center justify-between rounded-xl border border-primary/30 bg-primary/10 px-4 py-2.5 text-xs text-primary shadow-xs">
+          <div className="flex items-center gap-2">
+            <Eye className="size-4 shrink-0" />
+            <span>
+              Menampilkan bukti rekaman visual untuk: <b className="font-mono">{selected.id}</b> ({selected.object} • {selected.camera})
+            </span>
+          </div>
+          {onBackToHistory && (
+            <button
+              type="button"
+              onClick={onBackToHistory}
+              className="text-[10px] font-bold underline hover:text-foreground cursor-pointer"
+            >
+              Lihat di Daftar Histori &rarr;
+            </button>
+          )}
+        </div>
+      )}
+      <div className="grid gap-5 xl:grid-cols-[320px_1fr] items-start">
+        <Panel className="overflow-hidden xl:sticky xl:top-4 self-start">
           <div className="border-b p-4">
             <h3 className="text-xs font-extrabold">Camera Area Explorer</h3>
             <p className="text-[9px] text-muted-foreground">
@@ -1368,37 +1747,124 @@ function Evidence({
                       )}
                     </div>
                   </button>
-                  {isOpen && (
-                    <div className="space-y-1.5 pt-2 px-1 pb-1">
-                      {items.map((e) => (
-                        <button
-                          key={e.id}
-                          type="button"
-                          onClick={() => handleSelectItem(e)}
-                          className={`w-full rounded-xl border p-2.5 text-left transition-all cursor-pointer ${
-                            selected.id === e.id
-                              ? "border-primary bg-info-soft shadow-xs"
-                              : "border-border/70 bg-card hover:bg-secondary/70"
-                          }`}
-                        >
-                          <div className="flex justify-between items-center gap-2">
-                            <span
-                              className={`text-[10px] font-bold ${
-                                selected.id === e.id ? "text-primary font-extrabold" : "text-foreground"
-                              }`}
-                            >
-                              {e.title}
-                            </span>
-                            <Badge text={e.severity} />
+                  {isOpen && (() => {
+                    const dateGroupMap: Record<string, { date: string; displayDate: string; items: EvidenceItem[] }> = {};
+                    items.forEach((item) => {
+                      const d = extractEvidenceDate(item);
+                      if (!dateGroupMap[d.date]) {
+                        dateGroupMap[d.date] = {
+                          date: d.date,
+                          displayDate: d.displayDate,
+                          items: [],
+                        };
+                      }
+                      dateGroupMap[d.date].items.push(item);
+                    });
+                    const sortedDateGroups = Object.values(dateGroupMap).sort((a, b) => b.date.localeCompare(a.date));
+
+                    return (
+                      <div className="space-y-2 pt-2 px-1 pb-1 max-h-[420px] overflow-y-auto custom-scrollbar pr-1.5">
+                        {items.length === 0 ? (
+                          <div className="rounded-xl border border-dashed border-border/70 p-3 text-center text-[10px] text-muted-foreground">
+                            Belum ada rekaman file pada folder ini
                           </div>
-                          <div className="mt-1 flex justify-between text-[8.5px] text-muted-foreground">
-                            <span>{e.object}</span>
-                            <span className="font-mono">{e.time}</span>
-                          </div>
-                        </button>
-                      ))}
-                    </div>
-                  )}
+                        ) : (
+                          sortedDateGroups.map((group, groupIdx) => {
+                            const subfolderKey = `${cam}_${group.date}`;
+                            const hasSelected = group.items.some((e) => e.id === selected?.id);
+                            const isDateOpen = openDates[subfolderKey] !== undefined ? openDates[subfolderKey] : (groupIdx === 0 || hasSelected);
+
+                            return (
+                              <div
+                                key={group.date}
+                                className="rounded-xl border border-border/70 bg-card/60 p-1.5 transition-all shadow-2xs"
+                              >
+                                {/* Header Subfolder Tanggal */}
+                                <button
+                                  type="button"
+                                  onClick={() => toggleDateFolder(subfolderKey, isDateOpen)}
+                                  className="w-full flex items-center justify-between p-2 rounded-lg bg-secondary/50 hover:bg-secondary text-foreground transition-all cursor-pointer"
+                                >
+                                  <div className="flex items-center gap-2 text-left">
+                                    <div className="flex size-6 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
+                                      <Calendar className="size-3.5" />
+                                    </div>
+                                    <div>
+                                      <div className="flex items-center gap-1.5">
+                                        <b className="text-[10px] font-bold text-foreground">
+                                          {group.displayDate}
+                                        </b>
+                                        {groupIdx === 0 && (
+                                          <span className="rounded bg-primary/15 px-1.5 py-0.2 text-[7.5px] font-extrabold text-primary">
+                                            Terbaru
+                                          </span>
+                                        )}
+                                      </div>
+                                      <span className="text-[8px] text-muted-foreground font-mono">
+                                        {group.date}
+                                      </span>
+                                    </div>
+                                  </div>
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="rounded-full bg-secondary px-1.5 py-0.5 text-[8px] font-semibold text-muted-foreground border">
+                                      {group.items.length} file
+                                    </span>
+                                    {isDateOpen ? (
+                                      <ChevronDown className="size-3.5 text-muted-foreground" />
+                                    ) : (
+                                      <ChevronRight className="size-3.5 text-muted-foreground" />
+                                    )}
+                                  </div>
+                                </button>
+
+                                {/* Daftar File di dalam Subfolder Tanggal */}
+                                {isDateOpen && (
+                                  <div className="mt-1.5 space-y-1.5 pl-1 pr-0.5">
+                                    {group.items.map((e) => {
+                                      // Nomor urut harian selaras dengan Abnormality ID (misal #00002)
+                                      const seq = e.id.split("-").pop() || `${e.inspectionId}`;
+                                      const normalizedTitle = e.title.includes("#")
+                                        ? e.title.replace(/#\d+/, `#${seq}`)
+                                        : `${e.title} #${seq}`;
+                                      const isSelected = selected.id === e.id && (selected.object === e.object || selected.inspectionId === e.inspectionId);
+
+                                      return (
+                                        <button
+                                          key={e.id + (e.title || "")}
+                                          type="button"
+                                          onClick={() => handleSelectItem(e)}
+                                          className={`w-full rounded-lg border p-2 text-left transition-all cursor-pointer ${
+                                            isSelected
+                                              ? "border-primary bg-primary/10 shadow-xs ring-1 ring-primary/40 font-semibold"
+                                              : "border-border/60 bg-card hover:bg-secondary/70"
+                                          }`}
+                                        >
+                                          <div className="flex justify-between items-center gap-1.5">
+                                            <span
+                                              className={`text-[9.5px] ${
+                                                isSelected ? "text-primary font-extrabold" : "font-bold text-foreground"
+                                              }`}
+                                            >
+                                              {normalizedTitle}
+                                            </span>
+                                            <Badge text={e.severity} />
+                                          </div>
+                                          <div className="mt-1 flex justify-between text-[8px] text-muted-foreground">
+                                            <span className="truncate max-w-[140px]">{e.object}</span>
+                                            <span className="font-mono shrink-0">{e.time}</span>
+                                          </div>
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
               );
             })}
@@ -1408,8 +1874,16 @@ function Evidence({
           <Panel className="overflow-hidden">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b p-4">
               <div>
-                <h3 className="text-xs font-extrabold">
-                  RAW Evidence Optical Capture • {selected.camera}
+                <h3 className="text-xs font-extrabold flex items-center gap-2">
+                  <span>RAW Evidence Optical Capture • {selected.camera}</span>
+                  <span className="rounded bg-primary/10 px-2 py-0.5 text-[9px] font-bold text-primary font-mono">
+                    {(() => {
+                      const seq = selected.id.split("-").pop() || `${selected.inspectionId}`;
+                      return selected.title.includes("#")
+                        ? selected.title.replace(/#\d+/, `#${seq}`)
+                        : `${selected.title} #${seq}`;
+                    })()}
+                  </span>
                 </h3>
                 <p className="mt-1 font-mono text-[9px] text-muted-foreground">
                   {selected.id} • {selected.captureTime || selected.time}
@@ -1430,7 +1904,13 @@ function Evidence({
               ) : (
                 <div className="h-2/5 w-1/3 border-2 border-danger flex items-center justify-center">
                   <span className="-mt-6 block w-fit bg-danger px-2 py-1 font-mono text-[9px] font-bold text-primary-foreground">
-                    {selected.title.toUpperCase()} • {selected.confidence} CONF
+                    {(() => {
+                      const seq = selected.id.split("-").pop() || `${selected.inspectionId}`;
+                      const cleanT = selected.title.includes("#")
+                        ? selected.title.replace(/#\d+/, `#${seq}`)
+                        : `${selected.title} #${seq}`;
+                      return cleanT.toUpperCase();
+                    })()} • {selected.confidence} CONF
                   </span>
                 </div>
               )}
