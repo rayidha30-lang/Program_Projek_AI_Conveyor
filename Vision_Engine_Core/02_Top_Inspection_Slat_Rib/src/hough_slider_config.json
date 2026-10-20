@@ -1,0 +1,11 @@
+{
+  "Opsi Posisi 1 - Slat Rib.mp4": {
+    "angle_tolerance": 30,
+    "min_line_len": 85,
+    "max_line_gap": 35,
+    "hough_threshold": 35,
+    "filter_non_garis": 0,
+    "gate_y_pct": 56,
+    "gate_h_pct": 8
+  }
+}

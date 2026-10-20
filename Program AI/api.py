@@ -8,8 +8,11 @@ except ImportError:
 
 import os
 import sys
+import json
+import threading
+import time
 from datetime import datetime, timedelta
-from db import get_connection
+from db import get_connection, purge_expired_inspections
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -226,7 +229,8 @@ def get_inspections():
         camera_filter = request.args.get("camera", "ALL").upper()
         severity_filter = request.args.get("severity", "ALL").upper()
         status_filter = request.args.get("status", "ALL").upper()
-        limit = request.args.get("limit", default=50, type=int)
+        days_filter = request.args.get("days", default=7, type=int)
+        limit = request.args.get("limit", default=300, type=int)
 
         conn = get_connection()
         cursor = conn.cursor()
@@ -258,6 +262,10 @@ def get_inspections():
         """
 
         params = []
+        if days_filter and days_filter > 0:
+            seven_days_ago = (datetime.now() - timedelta(days=days_filter)).strftime("%Y-%m-%d 00:00:00")
+            sql += " AND i.InspectionTime >= ?"
+            params.append(seven_days_ago)
         if camera_filter != "ALL":
             sql += " AND d.CameraID = ?"
             params.append(camera_filter)
@@ -304,6 +312,8 @@ def get_inspections():
             obj_desc = f"{comp}"
             if slat_num:
                 obj_desc = f"{comp} (Slat #{slat_num})"
+            elif comp == "LEKUKAN":
+                obj_desc = f"Bracket Lekukan ({side} Side)" if side and side != "NONE" else "Bracket Lekukan"
             elif side and side != "NONE":
                 obj_desc = f"{comp} ({side} Side)"
 
@@ -315,6 +325,8 @@ def get_inspections():
                 type_label = f"Bolt {stat_detail.replace('_', ' ')}"
             elif comp == "PIN":
                 type_label = f"Pin {stat_detail.replace('_', ' ')}"
+            elif comp == "LEKUKAN":
+                type_label = f"Bracket Lekukan ({stat_detail})"
 
             # Confidence
             conf_str = f"{float(conf):.1f}%" if conf is not None else "95.4%"
@@ -371,6 +383,7 @@ def get_evidence():
     """
     conn = None
     try:
+        limit = request.args.get("limit", default=100, type=int)
         conn = get_connection()
         cursor = conn.cursor()
 
@@ -395,8 +408,9 @@ def get_evidence():
             INNER JOIN Inspection_Detections d ON i.InspectionID = d.InspectionID
             WHERE d.Result = 'NG'
             ORDER BY i.InspectionTime DESC, d.DetectionID DESC
+            LIMIT ?
         """
-        cursor.execute(sql)
+        cursor.execute(sql, (limit,))
         rows = cursor.fetchall()
 
         evidence_items = []
@@ -431,8 +445,12 @@ def get_evidence():
             # Ekstrak nomor urut harian dari TraceabilityCode (misal ABN-20261012-00002 -> 00002)
             # agar judul selaras penuh dengan Abnormality ID dan mereset setiap hari baru
             daily_seq = code.split("-")[-1] if ("-" in code) else f"{insp_id:05d}"
-            title_desc = f"{comp} {stat_detail} #{daily_seq}"
-            obj_desc = f"{comp} (Slat #{slat_num})" if slat_num else f"{comp} Fastener"
+            if comp == "LEKUKAN":
+                title_desc = f"BRACKET {stat_detail} #{daily_seq}"
+                obj_desc = f"Bracket Lekukan (Slat #{slat_num})" if slat_num else "Bracket Lekukan"
+            else:
+                title_desc = f"{comp} {stat_detail} #{daily_seq}"
+                obj_desc = f"{comp} (Slat #{slat_num})" if slat_num else f"{comp} Fastener"
 
             conf_str = f"{float(conf):.2f}%" if conf is not None else "95.50%"
 
@@ -675,6 +693,108 @@ def get_analytics():
     finally:
         if conn:
             conn.close()
+
+
+# ==========================================================
+# 7. TOP INSPECTION TUNING CONFIG (HOT-RELOAD API)
+# ==========================================================
+TOP_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "Jetson_Vision_Engine",
+    "02_Top_Inspection_Slat_Rib",
+    "configs",
+    "top_inspection_config.json"
+)
+
+@app.route("/api/config/top-inspection", methods=["GET"])
+def get_top_inspection_config():
+    """Mengambil konfigurasi ambang batas (thresholds) top inspection saat ini."""
+    try:
+        if not os.path.exists(TOP_CONFIG_PATH):
+            return jsonify({"status": "error", "message": "File konfigurasi tidak ditemukan"}), 404
+
+        with open(TOP_CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+
+        return jsonify({
+            "status": "success",
+            "config": cfg,
+            "file_path": TOP_CONFIG_PATH
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/config/top-inspection", methods=["POST"])
+def update_top_inspection_config():
+    """
+    Memperbarui parameter ambang batas inspeksi dari Dashboard.
+    File JSON ditulis secara aman sehingga auto hot-reload di Python langsung terpicu.
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"status": "error", "message": "Payload JSON kosong"}), 400
+
+        if not os.path.exists(TOP_CONFIG_PATH):
+            return jsonify({"status": "error", "message": "File konfigurasi tidak ditemukan"}), 404
+
+        with open(TOP_CONFIG_PATH, "r", encoding="utf-8") as f:
+            current_cfg = json.load(f)
+
+        thresholds = current_cfg.setdefault("thresholds", {})
+        incoming_th = data.get("thresholds", data)
+
+        # Mapping parameter aman & konversi tipe data
+        float_fields = [
+            "rib_tip_threshold", "rib_dev_threshold", "rib_pv_threshold",
+            "rib_sagitta_threshold", "rib_conf_threshold",
+            "max_flatness_pv", "max_sagitta", "min_continuity_cov",
+            "slat_delta_limit", "slat_max_gap_limit", "slat_valley_sens"
+        ]
+        int_fields = ["max_center_void", "total_slats_in_loop"]
+
+        for field in float_fields:
+            if field in incoming_th:
+                try:
+                    val = float(incoming_th[field])
+                    thresholds[field] = val
+                    if field == "rib_dev_threshold":
+                        thresholds["rib_max_dev_threshold"] = val
+                except (ValueError, TypeError):
+                    pass
+
+        for field in int_fields:
+            if field in incoming_th:
+                try:
+                    thresholds[field] = int(incoming_th[field])
+                except (ValueError, TypeError):
+                    pass
+
+        current_cfg["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Atomic write file via temporary file agar aman dari korupsi data
+        temp_path = TOP_CONFIG_PATH + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(current_cfg, f, indent=2)
+
+        if os.name == "nt":
+            # On Windows, replace target atomically
+            if os.path.exists(TOP_CONFIG_PATH):
+                os.replace(temp_path, TOP_CONFIG_PATH)
+            else:
+                os.rename(temp_path, TOP_CONFIG_PATH)
+        else:
+            os.replace(temp_path, TOP_CONFIG_PATH)
+
+        return jsonify({
+            "status": "success",
+            "message": "Konfigurasi berhasil disimpan dan auto hot-reload telah aktif!",
+            "thresholds": thresholds,
+            "updated_at": current_cfg["updated_at"]
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 # ==========================================================

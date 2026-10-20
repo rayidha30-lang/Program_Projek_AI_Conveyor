@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useQueryState, parseAsString, parseAsStringLiteral } from "nuqs";
 import {
   AlertTriangle,
   BarChart3,
@@ -9,6 +10,8 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
   Clock3,
   Cpu,
   Download,
@@ -47,8 +50,9 @@ import {
   type AnalyticsData,
   type Severity,
 } from "@/lib/api";
+import TuningSettings from "@/components/TuningSettings";
 
-type View = "dashboard" | "live" | "abnormality" | "evidence" | "analytics";
+type View = "dashboard" | "live" | "abnormality" | "evidence" | "analytics" | "settings";
 
 const abnormalComponentCounts: AbnormalComponentSummary[] = [
   {
@@ -166,6 +170,7 @@ const nav = [
   { id: "abnormality" as const, label: "Abnormality", icon: AlertTriangle },
   { id: "evidence" as const, label: "Evidence Viewer", icon: Eye },
   { id: "analytics" as const, label: "Analytics", icon: BarChart3 },
+  { id: "settings" as const, label: "Tuning Settings", icon: Wrench },
 ];
 
 const titles: Record<View, [string, string]> = {
@@ -175,25 +180,45 @@ const titles: Record<View, [string, string]> = {
   ],
   live: [
     "Live Camera Monitoring",
-    "Synchronous optical stream from 3 target areas",
+    "Synchronous optical stream dari 3 sudut kamera inspeksi conveyor",
   ],
   abnormality: [
     "Abnormality History & Traceability Ledger",
-    "Real-time AI Vision Inspection & Traceability System",
+    "Pencatatan riwayat kelainan, filter multi-parameter, dan audit trail",
   ],
   evidence: [
     "Evidence Viewer",
-    "Archived optical evidence and maintenance traceability",
+    "Arsip bukti optik inspeksi kamera & penelusuran status perbaikan",
   ],
   analytics: [
     "Analytics & Maintenance Insights",
-    "Recurring abnormality trends and inspection performance",
+    "Pola cacat berulang (recurring abnormality) & performa inspeksi",
+  ],
+  settings: [
+    "Inspection Tuning & Threshold Settings",
+    "Parameter ambang batas deteksi real-time (Auto Hot-Reload tanpa restart)",
   ],
 };
 
 export default function Index() {
-  const [view, setView] = useState<View>("dashboard");
-  const [selectedEvidenceId, setSelectedEvidenceId] = useState<string | null>(null);
+  // Type-safe URL State via nuqs
+  const [viewQuery, setViewQuery] = useQueryState(
+    "view",
+    parseAsStringLiteral(["dashboard", "live", "abnormality", "evidence", "analytics", "settings"]).withDefault("dashboard")
+  );
+  const [traceId, setTraceId] = useQueryState("trace", parseAsString);
+  const [camId, setCamId] = useQueryState("cam", parseAsString);
+
+  // Jika parameter trace atau cam terdeteksi di URL, utamakan tampilan evidence
+  const view: View = (traceId || camId) ? "evidence" : viewQuery;
+  const setView = (newView: View) => {
+    setViewQuery(newView);
+    if (newView !== "evidence") {
+      setTraceId(null);
+      setCamId(null);
+    }
+  };
+
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [apiStatus, setApiStatus] = useState<{ status: string; database: string }>({
     status: "checking",
@@ -201,7 +226,7 @@ export default function Index() {
   });
   const [statsData, setStatsData] = useState<AbnormalComponentSummary[]>(abnormalComponentCounts);
   const [recordsData, setRecordsData] = useState<RecordRow[]>(records);
-  const [evidenceData, setEvidenceData] = useState<EvidenceItem[]>(evidence);
+  const [evidenceData, setEvidenceData] = useState<EvidenceItem[]>([]);
   const [analyticsData, setAnalyticsData] = useState<AnalyticsData | null>(null);
 
   // Pengendali tema (Dark / Light) dengan persistensi localStorage
@@ -229,8 +254,11 @@ export default function Index() {
   };
 
   const handleSelectRecord = (record: RecordRow) => {
-    setSelectedEvidenceId(record.id);
-    setView("evidence");
+    setTraceId(record.id);
+    if ((record as any).camera) {
+      setCamId((record as any).camera);
+    }
+    setViewQuery("evidence");
   };
 
   // Polling data secara real-time dari backend SQL Server
@@ -250,17 +278,44 @@ export default function Index() {
         if (s?.components && s.components.length > 0) setStatsData(s.components);
         if (recs && recs.length > 0) setRecordsData(recs);
         if (ev && ev.length > 0) setEvidenceData(ev);
+        else setEvidenceData(evidence);
         if (an) setAnalyticsData(an);
+      } else {
+        setEvidenceData(evidence);
       }
     } catch (e) {
       console.error("Gagal sinkronisasi data:", e);
+      setEvidenceData((prev) => (prev.length === 0 ? evidence : prev));
     }
   };
 
   useEffect(() => {
+    let intervalId: any;
+
+    const startPolling = (ms: number) => {
+      if (intervalId) clearInterval(intervalId);
+      intervalId = setInterval(loadData, ms);
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        // Saat tab di background / operator fokus di GUI OpenCV, perlambat polling agar tidak membebani CPU & SQLite
+        startPolling(20000);
+      } else {
+        // Saat operator beralih kembali membuka dashboard, segera fetch data terbaru dan kembalikan polling aktif
+        loadData();
+        startPolling(4000);
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
     loadData();
-    const interval = setInterval(loadData, 4000);
-    return () => clearInterval(interval);
+    startPolling(4000);
+
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
   }, []);
 
   return (
@@ -283,6 +338,36 @@ export default function Index() {
           apiStatus={apiStatus}
           theme={theme}
           onToggleTheme={toggleTheme}
+          contextActions={
+            view === "live" ? (
+              <div className="hidden md:flex items-center gap-1.5">
+                <StatusPill text="Bounding Box: ON" />
+                <StatusPill text="Shutter Sync: 100%" />
+              </div>
+            ) : view === "evidence" ? (
+              <div className="flex items-center gap-1.5">
+                {traceId && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setTraceId(null);
+                      setCamId(null);
+                      setViewQuery("abnormality");
+                    }}
+                    className="h-7 text-[10px] gap-1 font-semibold text-primary border-primary/30 hover:bg-primary/10 cursor-pointer"
+                  >
+                    <ChevronLeft className="size-3" />
+                    Kembali ke Histori
+                  </Button>
+                )}
+                <div className="hidden md:flex items-center gap-1.5">
+                  <StatusPill text="3 Target Camera Directories" />
+                  <StatusPill text="Sync Storage" />
+                </div>
+              </div>
+            ) : undefined
+          }
         />
         <main className="flex-1 overflow-y-auto px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
           {view === "dashboard" && (
@@ -304,11 +389,19 @@ export default function Index() {
             <Evidence
               evidenceList={evidenceData}
               onRefresh={loadData}
-              initialSelectedId={selectedEvidenceId}
-              onBackToHistory={() => setView("abnormality")}
+              selectedTraceId={traceId}
+              selectedCamera={camId}
+              onSelectTraceId={setTraceId}
+              onSelectCamera={setCamId}
+              onBackToHistory={() => {
+                setTraceId(null);
+                setCamId(null);
+                setViewQuery("abnormality");
+              }}
             />
           )}
           {view === "analytics" && <Analytics data={analyticsData} />}
+          {view === "settings" && <TuningSettings theme={theme} />}
         </main>
       </div>
     </div>
@@ -650,11 +743,13 @@ function Header({
   apiStatus,
   theme,
   onToggleTheme,
+  contextActions,
 }: {
   view: View;
   apiStatus: { status: string; database: string };
   theme: "light" | "dark";
   onToggleTheme: () => void;
+  contextActions?: React.ReactNode;
 }) {
   const [timeStr, setTimeStr] = useState("");
 
@@ -685,7 +780,7 @@ function Header({
   const isDark = theme === "dark";
 
   return (
-    <header className="flex items-center justify-between px-4 pt-5 pb-1 sm:px-6 lg:px-8 bg-transparent">
+    <header className="flex flex-wrap items-center justify-between gap-3 px-4 pt-5 pb-2 sm:px-6 lg:px-8 bg-transparent">
       <div>
         <h1 className="text-base font-extrabold sm:text-lg tracking-tight">
           {titles[view][0]}
@@ -694,7 +789,11 @@ function Header({
           {titles[view][1]}
         </p>
       </div>
-      <div className="flex items-center gap-2 sm:gap-3">
+      <div className="flex items-center gap-2 sm:gap-2.5 flex-wrap">
+        {/* Contextual Badges / Actions per View */}
+        {contextActions}
+
+        {/* Global System Status Pills */}
         <div className="hidden items-center gap-2 sm:flex">
           <StatusPill text={isOnline ? "API: Online" : "API: Offline"} online={isOnline} />
           <StatusPill text={isDb ? "SSMS: Connected" : "SSMS: Disconnected"} online={isDb} />
@@ -1078,65 +1177,68 @@ function LiveCamera() {
   ];
 
   return (
-    <div className="space-y-5">
-      <SectionTitle
-        title="Dedicated 3 Camera Industrial Feed"
-        subtitle="Monitoring visual individual untuk tiap sudut kamera conveyor"
-        aside={
-          <div className="flex gap-2">
-            <StatusPill text="Bounding Box: ON" />
-            <StatusPill text="Shutter Sync: 100%" />
-          </div>
-        }
-      />
-      <div className="grid gap-5 xl:grid-cols-3">
-        {cameras.map((c) => (
-          <Panel key={c.cam} className="overflow-hidden">
-            <div className="flex justify-between p-4 pb-3">
-              <div>
-                <p className="text-xs font-extrabold">
-                  {c.cam}{" "}
-                  <span className={c.alert ? "text-danger" : "text-success"}>
-                    {c.status}
-                  </span>
-                </p>
-                <p className="mt-1 text-[9px] text-muted-foreground">
-                  {c.station}
-                </p>
-              </div>
-              <Camera className="size-5 text-muted-foreground" />
-            </div>
-            <div className="camera-grid relative flex aspect-4/3 items-center justify-center overflow-hidden">
-              <div
-                className={`h-32 w-40 border-2 ${
-                  c.alert ? "border-danger" : "border-success"
-                }`}
-              />
-              <div
-                className={`absolute bottom-3 left-3 rounded px-2 py-1 font-mono text-[9px] ${
-                  c.alert ? "bg-danger" : "bg-success"
-                } text-primary-foreground`}
-              >
-                {c.alert ? "CRITICAL DEFECT DETECTED" : "STREAM VIEW • OK"}
-              </div>
-            </div>
-            <div className="p-4">
-              <h3 className="text-sm font-bold">{c.title}</h3>
-              <p className="mt-1 text-[10px] text-muted-foreground">{c.desc}</p>
-              <div className="mt-4 flex justify-between border-t pt-3 text-[9px] font-mono">
-                <span>
-                  FPS: <b>30</b> • 1080p RAW
+    <div className="grid gap-5 xl:grid-cols-3">
+      {cameras.map((c) => (
+        <Panel key={c.cam} className="overflow-hidden">
+          <div className="flex justify-between p-4 pb-3">
+            <div>
+              <p className="text-xs font-extrabold">
+                {c.cam}{" "}
+                <span className={c.alert ? "text-danger" : "text-success"}>
+                  {c.status}
                 </span>
-                <b className={c.alert ? "text-danger" : "text-success"}>
-                  {c.obj}
-                </b>
-              </div>
+              </p>
+              <p className="mt-1 text-[9px] text-muted-foreground">
+                {c.station}
+              </p>
             </div>
-          </Panel>
-        ))}
-      </div>
+            <Camera className="size-5 text-muted-foreground" />
+          </div>
+          <div className="camera-grid relative flex aspect-4/3 items-center justify-center overflow-hidden">
+            <div
+              className={`h-32 w-40 border-2 ${
+                c.alert ? "border-danger" : "border-success"
+              }`}
+            />
+            <div
+              className={`absolute bottom-3 left-3 rounded px-2 py-1 font-mono text-[9px] ${
+                c.alert ? "bg-danger" : "bg-success"
+              } text-primary-foreground`}
+            >
+              {c.alert ? "CRITICAL DEFECT DETECTED" : "STREAM VIEW • OK"}
+            </div>
+          </div>
+          <div className="p-4">
+            <h3 className="text-sm font-bold">{c.title}</h3>
+            <p className="mt-1 text-[10px] text-muted-foreground">{c.desc}</p>
+            <div className="mt-4 flex justify-between border-t pt-3 text-[9px] font-mono">
+              <span>
+                FPS: <b>30</b> • 1080p RAW
+              </span>
+              <b className={c.alert ? "text-danger" : "text-success"}>
+                {c.obj}
+              </b>
+            </div>
+          </div>
+        </Panel>
+      ))}
     </div>
   );
+}
+
+function getSlidePageNumbers(current: number, total: number): (number | "...")[] {
+  if (total <= 5) {
+    return Array.from({ length: total }, (_, i) => i + 1);
+  }
+  const pages: (number | "...")[] = [];
+  if (current <= 3) {
+    pages.push(1, 2, 3, 4, "...", total);
+  } else if (current >= total - 2) {
+    pages.push(1, "...", total - 3, total - 2, total - 1, total);
+  } else {
+    pages.push(1, "...", current - 1, current, current + 1, "...", total);
+  }
+  return pages;
 }
 
 function Abnormality({
@@ -1153,6 +1255,11 @@ function Abnormality({
   const [selectedYear, setSelectedYear] = useState("ALL");
   const [selectedMonth, setSelectedMonth] = useState("ALL");
   const [selectedDate, setSelectedDate] = useState("");
+
+  // Slide / Pagination state
+  // Default 10 riwayat per slide agar pas satu layar dashboard tanpa perlu scroll vertikal
+  const [pageSize, setPageSize] = useState<number>(10);
+  const [currentSlide, setCurrentSlide] = useState<number>(1);
 
   const availableYears = useMemo(() => {
     const years = new Set<string>();
@@ -1217,6 +1324,29 @@ function Abnormality({
     });
   }, [allRecords, camera, severity, status, selectedYear, selectedMonth, selectedDate, searchQuery]);
 
+  // Hitung total slide berdasarkan jumlah record hasil filter & pageSize
+  const totalSlides = Math.max(1, Math.ceil(filtered.length / pageSize));
+
+  // Auto-reset ke slide 1 ketika kriteria filter atau ukuran slide berubah
+  useEffect(() => {
+    setCurrentSlide(1);
+  }, [camera, severity, status, selectedYear, selectedMonth, selectedDate, searchQuery, pageSize]);
+
+  // Proteksi bounds slide jika data berkurang akibat polling
+  useEffect(() => {
+    if (currentSlide > totalSlides) {
+      setCurrentSlide(totalSlides);
+    }
+  }, [totalSlides, currentSlide]);
+
+  const startIndex = (currentSlide - 1) * pageSize;
+  const endIndex = Math.min(startIndex + pageSize, filtered.length);
+
+  // Data baris aktif untuk slide saat ini
+  const paginatedRecords = useMemo(() => {
+    return filtered.slice(startIndex, endIndex);
+  }, [filtered, startIndex, endIndex]);
+
   const isFiltered =
     camera !== "ALL" ||
     severity !== "ALL" ||
@@ -1267,12 +1397,90 @@ function Abnormality({
 
   return (
     <Panel className="overflow-hidden">
-      <div className="p-5 pb-4 space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-          <SectionTitle
-            title="Abnormality History & Traceability Ledger"
-            subtitle="Pencatatan seluruh histori kelainan dengan kemampuan filter multi-parameter"
-          />
+      <div className="p-4 pb-3 space-y-3">
+        {/* Filter Bar Multi-Parameter & Aksi Cepat */}
+        <div className="flex flex-wrap items-center justify-between gap-2.5">
+          <div className="flex flex-wrap items-center gap-2 flex-1">
+            {/* 1. Pencarian Kata Kunci */}
+            <div className="relative inline-flex items-center min-w-[180px] flex-1 sm:flex-initial">
+              <Search className="absolute left-2.5 pointer-events-none size-3 text-muted-foreground" />
+              <input
+                type="text"
+                placeholder="Cari ID, objek, tipe..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="h-8 w-full rounded-lg border bg-secondary/70 py-1 pl-7.5 pr-3 text-[10px] placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary text-foreground transition-all hover:bg-secondary"
+              />
+            </div>
+
+            {/* 2. Filter Tanggal Spesifik (Date Picker) */}
+            <div className="relative inline-flex items-center">
+              <Calendar className="absolute left-2.5 pointer-events-none size-3 text-muted-foreground" />
+              <input
+                type="date"
+                value={selectedDate}
+                onChange={(e) => setSelectedDate(e.target.value)}
+                className="h-8 rounded-lg border bg-secondary/70 py-1 pl-7.5 pr-2.5 text-[10px] font-semibold outline-none focus:ring-1 focus:ring-primary text-foreground transition-all hover:bg-secondary cursor-pointer"
+                title="Filter tanggal spesifik (YYYY-MM-DD)"
+              />
+            </div>
+
+            {/* 3. Filter Tahun */}
+            <Filter
+              value={selectedYear}
+              setValue={setSelectedYear}
+              label="Semua Tahun"
+              options={availableYears.map((y) => ({ value: y, label: `Tahun ${y}` }))}
+            />
+
+            {/* 4. Filter Bulan */}
+            <Filter
+              value={selectedMonth}
+              setValue={setSelectedMonth}
+              label="Semua Bulan"
+              options={monthOptions}
+            />
+
+            {/* 5. Filter Kamera */}
+            <Filter
+              value={camera}
+              setValue={setCamera}
+              label="Semua Kamera"
+              options={["CAM-01", "CAM-02", "CAM-03"]}
+            />
+
+            {/* 6. Filter Severity */}
+            <Filter
+              value={severity}
+              setValue={setSeverity}
+              label="Semua Severity"
+              options={["CRITICAL", "HIGH", "MEDIUM", "LOW"]}
+            />
+
+            {/* 7. Filter Status */}
+            <Filter
+              value={status}
+              setValue={setStatus}
+              label="Semua Status"
+              options={["UNACKNOWLEDGED", "ACK", "RESOLVED"]}
+            />
+
+            {/* 8. Tombol Reset Filter */}
+            {isFiltered && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={handleResetFilters}
+                className="h-8 text-[10px] text-muted-foreground hover:text-foreground gap-1 px-2.5 cursor-pointer"
+                title="Reset semua filter ke kondisi awal"
+              >
+                <RotateCcw className="size-3" />
+                Reset Filter
+              </Button>
+            )}
+          </div>
+
+          {/* Sisi Kanan: Total Counter & Tombol Export CSV */}
           <div className="flex items-center gap-2 shrink-0">
             <span className="text-[10px] font-mono text-muted-foreground hidden lg:inline">
               Total: <b className="text-foreground">{filtered.length}</b> dari {allRecords.length}
@@ -1283,91 +1491,11 @@ function Abnormality({
             </Button>
           </div>
         </div>
-
-        {/* Filter Bar Multi-Parameter */}
-        <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-border/50">
-          {/* 1. Pencarian Kata Kunci */}
-          <div className="relative inline-flex items-center min-w-[200px] flex-1 sm:flex-initial">
-            <Search className="absolute left-2.5 pointer-events-none size-3 text-muted-foreground" />
-            <input
-              type="text"
-              placeholder="Cari ID, objek, tipe..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="h-8 w-full rounded-lg border bg-secondary/70 py-1 pl-7.5 pr-3 text-[10px] placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary text-foreground transition-all hover:bg-secondary"
-            />
-          </div>
-
-          {/* 2. Filter Tanggal Spesifik (Date Picker) */}
-          <div className="relative inline-flex items-center">
-            <Calendar className="absolute left-2.5 pointer-events-none size-3 text-muted-foreground" />
-            <input
-              type="date"
-              value={selectedDate}
-              onChange={(e) => setSelectedDate(e.target.value)}
-              className="h-8 rounded-lg border bg-secondary/70 py-1 pl-7.5 pr-2.5 text-[10px] font-semibold outline-none focus:ring-1 focus:ring-primary text-foreground transition-all hover:bg-secondary cursor-pointer"
-              title="Filter tanggal spesifik (YYYY-MM-DD)"
-            />
-          </div>
-
-          {/* 3. Filter Tahun */}
-          <Filter
-            value={selectedYear}
-            setValue={setSelectedYear}
-            label="Semua Tahun"
-            options={availableYears.map((y) => ({ value: y, label: `Tahun ${y}` }))}
-          />
-
-          {/* 4. Filter Bulan */}
-          <Filter
-            value={selectedMonth}
-            setValue={setSelectedMonth}
-            label="Semua Bulan"
-            options={monthOptions}
-          />
-
-          {/* 5. Filter Kamera */}
-          <Filter
-            value={camera}
-            setValue={setCamera}
-            label="Semua Kamera"
-            options={["CAM-01", "CAM-02", "CAM-03"]}
-          />
-
-          {/* 6. Filter Severity */}
-          <Filter
-            value={severity}
-            setValue={setSeverity}
-            label="Semua Severity"
-            options={["CRITICAL", "HIGH", "MEDIUM", "LOW"]}
-          />
-
-          {/* 7. Filter Status */}
-          <Filter
-            value={status}
-            setValue={setStatus}
-            label="Semua Status"
-            options={["UNACKNOWLEDGED", "ACK", "RESOLVED"]}
-          />
-
-          {/* 8. Tombol Reset Filter */}
-          {isFiltered && (
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={handleResetFilters}
-              className="h-8 text-[10px] text-muted-foreground hover:text-foreground gap-1 px-2.5 cursor-pointer"
-              title="Reset semua filter ke kondisi awal"
-            >
-              <RotateCcw className="size-3" />
-              Reset Filter
-            </Button>
-          )}
-        </div>
       </div>
 
-      <RecordTable rows={filtered} onSelectRecord={onSelectRecord} />
-      {filtered.length === 0 && (
+      <RecordTable rows={paginatedRecords} compact onSelectRecord={onSelectRecord} />
+
+      {filtered.length === 0 ? (
         <div className="p-8 text-center space-y-2">
           <p className="text-xs font-semibold text-muted-foreground">
             Tidak ada riwayat kelainan yang cocok dengan kriteria filter.
@@ -1382,6 +1510,114 @@ function Abnormality({
               Reset Filter
             </Button>
           )}
+        </div>
+      ) : (
+        /* Slide Navigation Bar Eksklusif di Bawah Tabel */
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-5 py-3 border-t border-border/60 bg-secondary/30 text-xs">
+          {/* Sisi Kiri: Rentang Data & Indikator Slide */}
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <span className="text-[11px] text-muted-foreground font-mono">
+              Menampilkan <b className="text-foreground">{startIndex + 1}–{endIndex}</b> dari <b className="text-foreground">{filtered.length}</b> riwayat
+            </span>
+            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-primary/10 text-primary border border-primary/20">
+              Slide {currentSlide} dari {totalSlides}
+            </span>
+          </div>
+
+          {/* Sisi Kanan: Pilihan Baris & Tombol Navigasi Slide */}
+          <div className="flex items-center gap-3 flex-wrap">
+            {/* Opsi Ukuran Baris per Slide */}
+            <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+              <span>Per slide:</span>
+              <select
+                value={pageSize}
+                onChange={(e) => setPageSize(Number(e.target.value))}
+                className="h-7 rounded-md border bg-background px-2 text-[10px] font-semibold outline-none focus:ring-1 focus:ring-primary cursor-pointer text-foreground"
+                title="Jumlah riwayat per slide (10 direkomendasikan agar pas di layar tanpa scroll)"
+              >
+                <option value={10}>10 (Pas Layar)</option>
+                <option value={15}>15</option>
+                <option value={25}>25</option>
+                <option value={50}>50</option>
+              </select>
+            </div>
+
+            {/* Tombol Paging Slide */}
+            <div className="flex items-center gap-1">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setCurrentSlide(1)}
+                disabled={currentSlide === 1}
+                className="h-7 w-7 p-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                title="Ke Slide Pertama (Data Terbaru)"
+              >
+                <ChevronsLeft className="size-3.5" />
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setCurrentSlide((prev) => Math.max(1, prev - 1))}
+                disabled={currentSlide === 1}
+                className="h-7 px-2 text-[10px] gap-1 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                title="Slide Sebelumnya"
+              >
+                <ChevronLeft className="size-3" />
+                <span className="hidden sm:inline">Prev</span>
+              </Button>
+
+              {/* Angka Slide Interaktif */}
+              <div className="flex items-center gap-1">
+                {getSlidePageNumbers(currentSlide, totalSlides).map((pageNum, idx) => {
+                  if (pageNum === "...") {
+                    return (
+                      <span key={`ellipsis-${idx}`} className="px-1 text-[10px] text-muted-foreground">
+                        …
+                      </span>
+                    );
+                  }
+                  const num = Number(pageNum);
+                  const isActive = num === currentSlide;
+                  return (
+                    <button
+                      key={`page-${num}`}
+                      type="button"
+                      onClick={() => setCurrentSlide(num)}
+                      className={`h-7 min-w-[28px] px-1.5 rounded-md text-[10px] font-bold transition-all cursor-pointer ${
+                        isActive
+                          ? "bg-primary text-primary-foreground shadow-2xs"
+                          : "hover:bg-secondary text-foreground"
+                      }`}
+                    >
+                      {num}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setCurrentSlide((prev) => Math.min(totalSlides, prev + 1))}
+                disabled={currentSlide === totalSlides}
+                className="h-7 px-2 text-[10px] gap-1 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                title="Slide Berikutnya (Data Lebih Lampau)"
+              >
+                <span className="hidden sm:inline">Next</span>
+                <ChevronRight className="size-3" />
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setCurrentSlide(totalSlides)}
+                disabled={currentSlide === totalSlides}
+                className="h-7 w-7 p-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                title="Ke Slide Terakhir (Data Terlampau)"
+              >
+                <ChevronsRight className="size-3.5" />
+              </Button>
+            </div>
+          </div>
         </div>
       )}
     </Panel>
@@ -1432,21 +1668,25 @@ function RecordTable({
   compact?: boolean;
   onSelectRecord?: (record: RecordRow) => void;
 }) {
+  const cellPy = compact ? "py-2.5" : "py-3.5";
+  const cellPx = compact ? "px-4" : "px-5";
+  const headPy = compact ? "py-2.5" : "py-3";
+
   return (
     <div className="overflow-x-auto">
       <table className="w-full min-w-[950px] text-left">
         <thead className="bg-secondary/70 text-[9px] uppercase text-muted-foreground">
           <tr>
-            <th className="px-5 py-3 font-bold">Tanggal</th>
-            <th className="px-5 py-3 font-bold">Waktu</th>
-            <th className="px-5 py-3 font-bold">Abnormality ID</th>
-            <th className="px-5 py-3 font-bold">Kamera</th>
-            <th className="px-5 py-3 font-bold">Objek</th>
-            <th className="px-5 py-3 font-bold">Abnormality Type</th>
-            <th className="px-5 py-3 font-bold">AI Conf.</th>
-            <th className="px-5 py-3 font-bold">Severity</th>
-            <th className="px-5 py-3 font-bold">Status Lifecycle</th>
-            <th className="px-5 py-3 font-bold text-right">Aksi</th>
+            <th className={`${cellPx} ${headPy} font-bold`}>Tanggal</th>
+            <th className={`${cellPx} ${headPy} font-bold`}>Waktu</th>
+            <th className={`${cellPx} ${headPy} font-bold`}>Abnormality ID</th>
+            <th className={`${cellPx} ${headPy} font-bold`}>Kamera</th>
+            <th className={`${cellPx} ${headPy} font-bold`}>Objek</th>
+            <th className={`${cellPx} ${headPy} font-bold`}>Abnormality Type</th>
+            <th className={`${cellPx} ${headPy} font-bold`}>AI Conf.</th>
+            <th className={`${cellPx} ${headPy} font-bold`}>Severity</th>
+            <th className={`${cellPx} ${headPy} font-bold`}>Status Lifecycle</th>
+            <th className={`${cellPx} ${headPy} font-bold text-right`}>Aksi</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-border">
@@ -1460,7 +1700,7 @@ function RecordTable({
                 title="Klik untuk membuka bukti visual di Evidence Viewer"
               >
                 {/* Kolom Tanggal (Date) */}
-                <td className="px-5 py-3.5 whitespace-nowrap">
+                <td className={`${cellPx} ${cellPy} whitespace-nowrap`}>
                   <div className="flex items-center gap-1.5 font-mono text-[10px] font-semibold text-foreground">
                     <Calendar className="size-3 text-primary/70 shrink-0" />
                     <span>{dateInfo.displayDate}</span>
@@ -1468,13 +1708,13 @@ function RecordTable({
                 </td>
 
                 {/* Kolom Waktu (Time) */}
-                <td className="px-5 py-3.5 font-mono text-muted-foreground whitespace-nowrap">
+                <td className={`${cellPx} ${cellPy} font-mono text-muted-foreground whitespace-nowrap`}>
                   {r.time}
                   {compact && " WIB"}
                 </td>
 
                 {/* Kolom Abnormality ID dengan Deep Link */}
-                <td className="px-5 py-3.5 font-mono font-bold text-primary whitespace-nowrap">
+                <td className={`${cellPx} ${cellPy} font-mono font-bold text-primary whitespace-nowrap`}>
                   <span className="inline-flex items-center gap-1 group-hover:underline">
                     {r.id}
                     <ExternalLink className="size-2.5 opacity-0 group-hover:opacity-100 transition-opacity text-primary" />
@@ -1482,14 +1722,14 @@ function RecordTable({
                 </td>
 
                 {/* Kamera */}
-                <td className="px-5 py-3.5 font-bold whitespace-nowrap">{r.camera}</td>
+                <td className={`${cellPx} ${cellPy} font-bold whitespace-nowrap`}>{r.camera}</td>
 
                 {/* Objek */}
-                <td className="px-5 py-3.5 whitespace-nowrap">{r.object}</td>
+                <td className={`${cellPx} ${cellPy} whitespace-nowrap`}>{r.object}</td>
 
                 {/* Tipe Cacat */}
                 <td
-                  className={`px-5 py-3.5 font-semibold whitespace-nowrap ${
+                  className={`${cellPx} ${cellPy} font-semibold whitespace-nowrap ${
                     r.severity === "CRITICAL"
                       ? "text-danger"
                       : r.severity === "HIGH"
@@ -1503,20 +1743,20 @@ function RecordTable({
                 </td>
 
                 {/* AI Confidence */}
-                <td className="px-5 py-3.5 font-mono font-bold whitespace-nowrap">{r.confidence}</td>
+                <td className={`${cellPx} ${cellPy} font-mono font-bold whitespace-nowrap`}>{r.confidence}</td>
 
                 {/* Severity */}
-                <td className="px-5 py-3.5 whitespace-nowrap">
+                <td className={`${cellPx} ${cellPy} whitespace-nowrap`}>
                   <Badge text={r.severity} />
                 </td>
 
                 {/* Status Lifecycle */}
-                <td className="px-5 py-3.5 whitespace-nowrap">
+                <td className={`${cellPx} ${cellPy} whitespace-nowrap`}>
                   <StatusBadge text={r.status} />
                 </td>
 
                 {/* Tombol Aksi: Lihat Bukti */}
-                <td className="px-5 py-3.5 whitespace-nowrap text-right">
+                <td className={`${cellPx} ${cellPy} whitespace-nowrap text-right`}>
                   <button
                     type="button"
                     onClick={(e) => {
@@ -1677,66 +1917,114 @@ const evidence: EvidenceItem[] = [
 function Evidence({
   evidenceList,
   onRefresh,
-  initialSelectedId,
+  selectedTraceId,
+  selectedCamera,
+  onSelectTraceId,
+  onSelectCamera,
   onBackToHistory,
 }: {
   evidenceList: EvidenceItem[];
   onRefresh?: () => void;
-  initialSelectedId?: string | null;
+  selectedTraceId?: string | null;
+  selectedCamera?: string | null;
+  onSelectTraceId?: (id: string | null) => void;
+  onSelectCamera?: (cam: string | null) => void;
   onBackToHistory?: () => void;
 }) {
   const currentItems = evidenceList.length > 0 ? evidenceList : evidence;
-  const [selected, setSelected] = useState<EvidenceItem>(() => {
-    if (initialSelectedId) {
-      const match = currentItems.find(
-        (e) => e.id === initialSelectedId || e.inspectionId.toString() === initialSelectedId
-      );
-      if (match) return match;
+
+  // Single Source of Truth: Item aktif langsung di-derive dari selectedTraceId, selectedCamera, dan currentItems
+  const selected = useMemo(() => {
+    // 1. Coba cari match dari selectedTraceId di URL
+    if (selectedTraceId && currentItems.length > 0) {
+      // Prioritaskan kecocokan ID DAN Kamera jika kamera dispesifikasikan di URL
+      let match = null;
+      if (selectedCamera) {
+        match = currentItems.find(
+          (e) =>
+            (e.id === selectedTraceId || e.inspectionId.toString() === selectedTraceId) &&
+            e.camera.toUpperCase() === selectedCamera.toUpperCase()
+        );
+      }
+      if (!match) {
+        match = currentItems.find(
+          (e) => e.id === selectedTraceId || e.inspectionId.toString() === selectedTraceId
+        );
+      }
+      if (match) {
+        // HANYA simpan ke sessionStorage jika match berasal dari data riil database (evidenceList)
+        if (typeof window !== "undefined" && evidenceList.length > 0) {
+          sessionStorage.setItem("last_valid_trace_id", match.id);
+        }
+        return match;
+      }
     }
+
+    // 1b. Jika hanya selectedCamera tanpa trace ID
+    if (selectedCamera && currentItems.length > 0) {
+      const camMatch = currentItems.find(
+        (e) => e.camera.toUpperCase() === selectedCamera.toUpperCase()
+      );
+      if (camMatch) return camMatch;
+    }
+
+    // 2. Jika ID di URL tidak ditemukan di database (misal user mengetik 00015 padahal baru ada sampai 00014):
+    // Prioritaskan kembali ke trace ID valid terakhir yang sedang/pernah dibuka user di tab ini!
+    if (typeof window !== "undefined") {
+      const lastValid = sessionStorage.getItem("last_valid_trace_id");
+      if (lastValid && currentItems.length > 0) {
+        const prevMatch = currentItems.find(
+          (e) => e.id === lastValid || e.inspectionId.toString() === lastValid
+        );
+        if (prevMatch) return prevMatch;
+      }
+    }
+
+    // 3. Fallback jika sesi baru / belum pernah buka item apa pun: gunakan item pertama/terbaru
+    // (JANGAN menimpa sessionStorage di sini agar riwayat valid sebelumnya tidak hilang!)
     return currentItems[0] || evidence[0]!;
-  });
+  }, [selectedTraceId, selectedCamera, currentItems, evidenceList.length]);
+
   const [open, setOpen] = useState<Record<string, boolean>>({
-    "CAM-01": true,
-    "CAM-02": false,
-    "CAM-03": false,
+    "CAM-01": selectedCamera ? selectedCamera.toUpperCase() === "CAM-01" : true,
+    "CAM-02": selectedCamera ? selectedCamera.toUpperCase() === "CAM-02" : false,
+    "CAM-03": selectedCamera ? selectedCamera.toUpperCase() === "CAM-03" : false,
   });
   const [openDates, setOpenDates] = useState<Record<string, boolean>>({});
   const [action, setAction] = useState(selected?.statusLifecycle || "UNACKNOWLEDGED");
   const [maintenanceAction, setMaintenanceAction] = useState(selected?.maintenanceNote || "");
   const [picRemark, setPicRemark] = useState(selected?.picName || "");
 
+  // Sinkronkan form teknisi & buka direktori folder saat item terpilih berubah
   useEffect(() => {
-    if (selected?.camera) {
-      setOpen((prev) => ({ ...prev, [selected.camera]: true }));
-      const matchDate = extractEvidenceDate(selected).date;
-      setOpenDates((prev) => ({
-        ...prev,
-        [`${selected.camera}_${matchDate}`]: true,
-      }));
-    }
-  }, [selected?.camera]);
+    if (selected) {
+      setAction(selected.statusLifecycle || "UNACKNOWLEDGED");
+      setMaintenanceAction(selected.maintenanceNote || "");
+      setPicRemark(selected.picName || "");
 
-  // Ketika initialSelectedId dipilih dari Abnormality History, sinkronkan selected item & buka folder kamera serta subfolder tanggal
-  useEffect(() => {
-    if (!initialSelectedId) return;
-    const match = currentItems.find(
-      (e) => e.id === initialSelectedId || e.inspectionId.toString() === initialSelectedId
-    );
-    if (match) {
-      setSelected(match);
-      setAction(match.statusLifecycle || "UNACKNOWLEDGED");
-      setMaintenanceAction(match.maintenanceNote || "");
-      setPicRemark(match.picName || "");
-      if (match.camera) {
-        setOpen((prev) => ({ ...prev, [match.camera]: true }));
-        const matchDate = extractEvidenceDate(match).date;
+      if (selected.camera) {
+        setOpen((prev) => ({ ...prev, [selected.camera]: true }));
+        const matchDate = extractEvidenceDate(selected).date;
         setOpenDates((prev) => ({
           ...prev,
-          [`${match.camera}_${matchDate}`]: true,
+          [`${selected.camera}_${matchDate}`]: true,
         }));
       }
     }
-  }, [initialSelectedId, currentItems]);
+  }, [selected?.id, selected?.inspectionId, selected?.statusLifecycle]);
+
+  // Auto-Redirect URL: Jika parameter trace di URL tidak ditemukan di database (misal ID 00015 padahal baru sampai 00014),
+  // otomatis selaraskan (redirect) URL di browser kembali ke ID yang terakhir dibuka user (selected.id)
+  useEffect(() => {
+    if (selectedTraceId && evidenceList.length > 0) {
+      const match = evidenceList.find(
+        (e) => e.id === selectedTraceId || e.inspectionId.toString() === selectedTraceId
+      );
+      if (!match && selected?.id && onSelectTraceId) {
+        onSelectTraceId(selected.id);
+      }
+    }
+  }, [selectedTraceId, evidenceList, selected?.id, onSelectTraceId]);
 
   const toggleDateFolder = (key: string, currentOpenState: boolean) => {
     setOpenDates((prev) => ({
@@ -1745,34 +2033,27 @@ function Evidence({
     }));
   };
 
+  // Sinkronkan folder saat parameter kamera berubah di URL
+  useEffect(() => {
+    if (selectedCamera) {
+      setOpen((prev) => ({ ...prev, [selectedCamera.toUpperCase()]: true }));
+    }
+  }, [selectedCamera]);
+
   const handleSelectItem = (item: EvidenceItem) => {
-    setSelected(item);
+    if (typeof window !== "undefined") {
+      sessionStorage.setItem("last_valid_trace_id", item.id);
+    }
+    if (onSelectTraceId) {
+      onSelectTraceId(item.id);
+    }
+    if (onSelectCamera && item.camera) {
+      onSelectCamera(item.camera);
+    }
     setAction(item.statusLifecycle || "UNACKNOWLEDGED");
     setMaintenanceAction(item.maintenanceNote || "");
     setPicRemark(item.picName || "");
   };
-
-  // Sinkronisasi data background secara aman tanpa menimpa teks yang sedang diketik pengguna
-  useEffect(() => {
-    if (evidenceList.length === 0) return;
-
-    const match = evidenceList.find((e) => e.id === selected?.id);
-    if (match) {
-      // Pertahankan teks form lokal yang sedang diketik teknisi (draft state)
-      // Cukup sinkronkan metadata background (image, lifecycle dari DB)
-      setSelected((prev) => ({
-        ...match,
-        statusLifecycle: action !== "UNACKNOWLEDGED" ? action : match.statusLifecycle,
-      }));
-    } else if (!selected || selected.inspectionId === 0) {
-      // Hanya inisialisasi jika sebelumnya masih memakai mock data (inspectionId: 0)
-      const first = evidenceList[0];
-      setSelected(first);
-      setAction(first.statusLifecycle || "UNACKNOWLEDGED");
-      setMaintenanceAction(first.maintenanceNote || "");
-      setPicRemark(first.picName || "");
-    }
-  }, [evidenceList]);
 
   if (!selected) return null;
 
@@ -1844,30 +2125,8 @@ function Evidence({
   );
 
   return (
-    <div className="space-y-5">
-      <SectionTitle
-        title="Evidence Archive & Area Inspection Explorer"
-        subtitle="Jelajahi rekaman anomali tersimpan per area target kamera sesuai spesifikasi PRD"
-        aside={
-          <div className="flex items-center gap-2">
-            {initialSelectedId && onBackToHistory && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={onBackToHistory}
-                className="h-7 text-[10px] gap-1 font-semibold text-primary border-primary/30 hover:bg-primary/10 cursor-pointer"
-              >
-                <ChevronLeft className="size-3" />
-                Kembali ke Histori
-              </Button>
-            )}
-            <StatusPill text="3 Target Camera Directories" />
-            <StatusPill text="Sync Storage" />
-          </div>
-        }
-      />
-
-      {initialSelectedId && (
+    <div className="space-y-4">
+      {selectedTraceId && (
         <div className="flex items-center justify-between rounded-xl border border-primary/30 bg-primary/10 px-4 py-2.5 text-xs text-primary shadow-xs">
           <div className="flex items-center gap-2">
             <Eye className="size-4 shrink-0" />
@@ -2223,60 +2482,54 @@ function Analytics({ data }: { data?: AnalyticsData | null }) {
   const maxN = Math.max(...days.map((x) => x.n), 1);
 
   return (
-    <div className="space-y-5">
-      <SectionTitle
-        title="Analytics & Maintenance Insights"
-        subtitle="Pola cacat berulang (recurring abnormality) dan performa inspeksi berdasarkan PRD Section 20"
-      />
-      <div className="grid gap-5 xl:grid-cols-2">
-        <Panel className="p-5">
-          <SectionTitle
-            title="Weekly Abnormality Trend"
-            subtitle="7 Hari Terakhir"
-          />
-          <div className="mt-8 flex h-60 items-end justify-around gap-2 border-b border-l px-4">
-            {days.map((item) => (
+    <div className="grid gap-5 xl:grid-cols-2">
+      <Panel className="p-5">
+        <SectionTitle
+          title="Weekly Abnormality Trend"
+          subtitle="7 Hari Terakhir"
+        />
+        <div className="mt-8 flex h-60 items-end justify-around gap-2 border-b border-l px-4">
+          {days.map((item) => (
+            <div
+              key={item.d}
+              className="flex h-full flex-1 flex-col items-center justify-end"
+            >
+              <span className="mb-2 text-xs font-bold">{item.n}</span>
               <div
-                key={item.d}
-                className="flex h-full flex-1 flex-col items-center justify-end"
-              >
-                <span className="mb-2 text-xs font-bold">{item.n}</span>
-                <div
-                  className="w-full max-w-10 rounded-t bg-primary/80 transition hover:bg-primary"
-                  style={{ height: `${(item.n / maxN) * 75}%` }}
-                />
-                <span className="my-3 text-[9px] text-muted-foreground">
-                  {item.d}
+                className="w-full max-w-10 rounded-t bg-primary/80 transition hover:bg-primary"
+                style={{ height: `${(item.n / maxN) * 75}%` }}
+              />
+              <span className="my-3 text-[9px] text-muted-foreground">
+                {item.d}
+              </span>
+            </div>
+          ))}
+        </div>
+      </Panel>
+      <Panel className="p-5">
+        <SectionTitle
+          title="Pareto Abnormality by Defect Type"
+          subtitle={`Total Insiden Terdeteksi: ${data?.totalIncidents ?? 75}`}
+        />
+        <div className="mt-7 space-y-6">
+          {pareto.map((item) => (
+            <div key={item.label}>
+              <div className="mb-2 flex justify-between text-[10px]">
+                <b>{item.label}</b>
+                <span className="font-mono font-bold">
+                  {item.n} ({item.p})
                 </span>
               </div>
-            ))}
-          </div>
-        </Panel>
-        <Panel className="p-5">
-          <SectionTitle
-            title="Pareto Abnormality by Defect Type"
-            subtitle={`Total Insiden Terdeteksi: ${data?.totalIncidents ?? 75}`}
-          />
-          <div className="mt-7 space-y-6">
-            {pareto.map((item) => (
-              <div key={item.label}>
-                <div className="mb-2 flex justify-between text-[10px]">
-                  <b>{item.label}</b>
-                  <span className="font-mono font-bold">
-                    {item.n} ({item.p})
-                  </span>
-                </div>
-                <div className="h-3 overflow-hidden rounded-full bg-secondary">
-                  <div
-                    className={`h-full rounded-full ${item.barCls}`}
-                    style={{ width: item.p }}
-                  />
-                </div>
+              <div className="h-3 overflow-hidden rounded-full bg-secondary">
+                <div
+                  className={`h-full rounded-full ${item.barCls}`}
+                  style={{ width: item.p }}
+                />
               </div>
-            ))}
-          </div>
-        </Panel>
-      </div>
+            </div>
+          ))}
+        </div>
+      </Panel>
     </div>
   );
 }

@@ -23,3 +23,11 @@ graphify-out/
 *.mov
 *.wmv
 
+# Archives & Compiled Engines
+*.zip
+*.engine
+scratch/
+*_backup/
+**/02_Top_Inspection_Slat_Rib_backup/
+
+
