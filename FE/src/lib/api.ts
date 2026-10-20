@@ -245,12 +245,16 @@ export async function fetchInspections(params?: {
   severity?: string;
   status?: string;
   limit?: number;
+  days?: number;
 }): Promise<RecordRow[]> {
   const query = new URLSearchParams();
   if (params?.camera && params.camera !== "ALL") query.append("camera", params.camera);
   if (params?.severity && params.severity !== "ALL") query.append("severity", params.severity);
   if (params?.status && params.status !== "ALL") query.append("status", params.status);
-  if (params?.limit) query.append("limit", params.limit.toString());
+  const limit = params?.limit ?? 300;
+  query.append("limit", limit.toString());
+  const days = params?.days ?? 7;
+  query.append("days", days.toString());
 
   const res = await fetch(`${API_BASE_URL}/inspections?${query.toString()}`);
   if (!res.ok) throw new Error("Gagal mengambil data inspeksi");
@@ -299,3 +303,54 @@ export async function fetchAnalytics(): Promise<AnalyticsData> {
   if (!res.ok) throw new Error("Gagal mengambil data analitik");
   return await res.json();
 }
+
+export interface TopInspectionThresholds {
+  rib_tip_threshold: number;
+  rib_dev_threshold: number;
+  rib_max_dev_threshold?: number;
+  rib_pv_threshold: number;
+  rib_sagitta_threshold: number;
+  rib_conf_threshold: number;
+  max_flatness_pv: number;
+  max_sagitta: number;
+  max_center_void: number;
+  min_continuity_cov?: number;
+  slat_max_gap_limit?: number;
+  slat_delta_limit?: number;
+  slat_valley_sens?: number;
+  [key: string]: any;
+}
+
+export interface TopInspectionConfig {
+  camera_id: string;
+  thresholds: TopInspectionThresholds;
+  updated_at?: string;
+  [key: string]: any;
+}
+
+/**
+ * Mengambil konfigurasi tuning top inspection terkini (Hot-Reload).
+ */
+export async function fetchTopInspectionConfig(): Promise<{ status: string; config: TopInspectionConfig }> {
+  const res = await fetch(`${API_BASE_URL}/config/top-inspection`);
+  if (!res.ok) throw new Error("Gagal mengambil konfigurasi inspeksi");
+  return await res.json();
+}
+
+/**
+ * Memperbarui parameter tuning top inspection (memicu Hot-Reload di OpenCV tanpa restart).
+ */
+export async function updateTopInspectionConfig(
+  thresholds: Partial<TopInspectionThresholds>
+): Promise<{ status: string; message: string; thresholds: TopInspectionThresholds; updated_at: string }> {
+  const res = await fetch(`${API_BASE_URL}/config/top-inspection`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ thresholds }),
+  });
+  if (!res.ok) throw new Error("Gagal memperbarui konfigurasi inspeksi");
+  return await res.json();
+}
+
