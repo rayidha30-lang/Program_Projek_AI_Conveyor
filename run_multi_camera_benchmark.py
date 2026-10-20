@@ -380,7 +380,16 @@ def _run_side_worker(
     # 1. Pastikan path impor modul side inspector dan Database terdaftar di proses anak
     if SIDE_SRC_DIR not in sys.path:
         sys.path.insert(0, SIDE_SRC_DIR)
-    db_dir = os.path.abspath(os.path.join(BASE_DIR, "..", "Database"))
+    # Deteksi lokasi db_bridge (BASE_DIR = Jetson deployment, ../Database = PC original)
+    _db_candidates = [
+        BASE_DIR,
+        os.path.abspath(os.path.join(BASE_DIR, "..", "Database")),
+        os.path.abspath(os.path.join(BASE_DIR, "..", "Program AI")),
+    ]
+    db_dir = next(
+        (d for d in _db_candidates if os.path.exists(os.path.join(d, "db_bridge.py"))),
+        _db_candidates[1]
+    )
     if db_dir not in sys.path:
         sys.path.insert(0, db_dir)
 
@@ -597,7 +606,16 @@ def _run_threaded_engine(args):
         sys.path.insert(0, TOP_SRC_DIR)
     if SIDE_SRC_DIR not in sys.path:
         sys.path.insert(0, SIDE_SRC_DIR)
-    db_dir = os.path.abspath(os.path.join(BASE_DIR, "..", "Database"))
+    # Deteksi lokasi db_bridge (BASE_DIR = Jetson deployment, ../Database = PC original)
+    _db_candidates = [
+        BASE_DIR,
+        os.path.abspath(os.path.join(BASE_DIR, "..", "Database")),
+        os.path.abspath(os.path.join(BASE_DIR, "..", "Program AI")),
+    ]
+    db_dir = next(
+        (d for d in _db_candidates if os.path.exists(os.path.join(d, "db_bridge.py"))),
+        _db_candidates[1]
+    )
     if db_dir not in sys.path:
         sys.path.insert(0, db_dir)
 
