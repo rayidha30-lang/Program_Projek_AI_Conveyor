@@ -38,15 +38,27 @@ if sys.platform.startswith("win"):
 
 # Path direktori utama
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TOP_SRC_DIR = os.path.join(BASE_DIR, "Jetson_Vision_Engine", "02_Top_Inspection_Slat_Rib", "src")
-SIDE_SRC_DIR = os.path.join(BASE_DIR, "Jetson_Vision_Engine", "01_Side_Inspection_Bolt_Pin", "src")
+
+# Deteksi lokasi pipeline (mendukung eksekusi dari root maupun dari dalam folder Jetson_Vision_Engine)
+if os.path.exists(os.path.join(BASE_DIR, "02_Top_Inspection_Slat_Rib", "src")):
+    TOP_SRC_DIR = os.path.join(BASE_DIR, "02_Top_Inspection_Slat_Rib", "src")
+    SIDE_SRC_DIR = os.path.join(BASE_DIR, "01_Side_Inspection_Bolt_Pin", "src")
+    VIDEO_DIR = os.path.join(BASE_DIR, "Video_Testing")
+elif os.path.exists(os.path.join(BASE_DIR, "Jetson_Vision_Engine", "02_Top_Inspection_Slat_Rib", "src")):
+    TOP_SRC_DIR = os.path.join(BASE_DIR, "Jetson_Vision_Engine", "02_Top_Inspection_Slat_Rib", "src")
+    SIDE_SRC_DIR = os.path.join(BASE_DIR, "Jetson_Vision_Engine", "01_Side_Inspection_Bolt_Pin", "src")
+    VIDEO_DIR = os.path.join(BASE_DIR, "Jetson_Vision_Engine", "Video_Testing")
+else:
+    TOP_SRC_DIR = os.path.join(BASE_DIR, "Vision_Engine_Core", "02_Top_Inspection_Slat_Rib", "src")
+    SIDE_SRC_DIR = os.path.join(BASE_DIR, "Vision_Engine_Core", "01_Side_Inspection_Bolt_Pin_Lekukan", "src")
+    VIDEO_DIR = os.path.join(BASE_DIR, "Video_Testing")
 
 # Video Default CAM-01 Top Inspection (Plat Slat & Bilah Rib)
 USER_TOP_VIDEO = r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib\New\Reverse\Kamera posisi 3 dimmer 2 - Reverse.mp4"
 CANDIDATE_TOP_VIDEOS = [
     USER_TOP_VIDEO,
-    os.path.join(BASE_DIR, "Jetson_Vision_Engine", "Video_Testing", "Deform Sedikit.mp4"),
-    os.path.join(BASE_DIR, "Jetson_Vision_Engine", "Video_Testing", "OK Semua.mp4"),
+    os.path.join(VIDEO_DIR, "Deform Sedikit.mp4"),
+    os.path.join(VIDEO_DIR, "OK Semua.mp4"),
 ]
 DEFAULT_TOP_VIDEO = next((v for v in CANDIDATE_TOP_VIDEOS if os.path.exists(v)), CANDIDATE_TOP_VIDEOS[0])
 
