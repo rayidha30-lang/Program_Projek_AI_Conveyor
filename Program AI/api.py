@@ -798,6 +798,46 @@ def update_top_inspection_config():
 
 
 # ==========================================================
+# 8. RETENTION & MAINTENANCE
+# ==========================================================
+@app.route("/api/maintenance/purge-expired", methods=["POST"])
+def trigger_purge_expired():
+    """Endpoint on-demand untuk membersihkan data kedaluwarsa (> 7 hari)."""
+    try:
+        data = request.get_json(silent=True) or {}
+        days = int(data.get("retention_days", 7))
+        stats = purge_expired_inspections(retention_days=days)
+        return jsonify({
+            "status": "success",
+            "message": f"Pembersihan data > {days} hari berhasil dieksekusi",
+            "stats": stats
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+def start_retention_daemon(retention_days=7, interval_seconds=21600):
+    """
+    Menjalankan background daemon thread untuk otomatis mem-purge data yang sudah > 7 hari
+    secara berkala (default tiap 6 jam) tanpa memblokir server Flask.
+    """
+    def _daemon_loop():
+        # Berikan jeda 5 detik saat awal booting Flask
+        time.sleep(5)
+        while True:
+            try:
+                print("🔄 [RETENTION DAEMON] Menjalankan pembersihan otomatis data kedaluwarsa (> 7 hari)...")
+                purge_expired_inspections(retention_days=retention_days)
+            except Exception as e:
+                print(f"⚠️ [RETENTION DAEMON ERROR] {e}")
+            time.sleep(interval_seconds)
+
+    t = threading.Thread(target=_daemon_loop, daemon=True, name="RetentionDaemon")
+    t.start()
+    print("🕒 [RETENTION DAEMON] Background daemon pembersihan data 7 hari aktif.")
+
+
+# ==========================================================
 # ENTRY POINT
 # ==========================================================
 if __name__ == "__main__":
@@ -805,4 +845,14 @@ if __name__ == "__main__":
     print("  REST API BACKEND - SLAT RIB CONVEYOR INSPECTION")
     print("  Server berjalan di http://localhost:5000")
     print("=" * 60)
+
+    # 1. Jalankan pembersihan saat startup
+    try:
+        purge_expired_inspections(retention_days=7)
+    except Exception as e:
+        print(f"⚠️ Gagal purge saat startup: {e}")
+
+    # 2. Aktifkan background daemon periodik
+    start_retention_daemon(retention_days=7, interval_seconds=21600)
+
     app.run(host="0.0.0.0", port=5000, debug=False)

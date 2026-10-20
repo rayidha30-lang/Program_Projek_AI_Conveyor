@@ -1,6 +1,6 @@
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Path default ke file database SQLite
 DB_PATH = r"c:\File Rayidha\Internship\Project\5. Project AI Slat Rib Conveyor\Database\AI_Slat_Rib_Conveyor.db"
@@ -290,6 +290,128 @@ def save_inspection_to_db(image_path, l_sir=None, l_sla=None, detections=None, s
     finally:
         if conn is not None:
             conn.close()
+
+
+
+def purge_expired_inspections(retention_days=7, custom_cutoff_str=None):
+    """
+    Menghapus data rekaman inspeksi dan file fisik citra yang telah berumur lebih dari `retention_days` hari.
+    Mencakup:
+    1. Pencarian path gambar (RawImagePath, AnnotatedPath) dari detail deteksi yang kedaluwarsa.
+    2. Penghapusan file fisik citra (.jpg) dan pembersihan folder kosong di disk (Database/captures/<DD-MM>).
+    3. Penghapusan baris relasional dari database SQLite (Inspections dan cascade detail).
+    
+    Returns:
+        dict: Statistik eksekusi {deleted_inspections, deleted_detections, deleted_files, deleted_dirs, cutoff}
+    """
+    stats = {
+        "deleted_inspections": 0,
+        "deleted_detections": 0,
+        "deleted_files": 0,
+        "deleted_dirs": 0,
+        "cutoff": None,
+        "errors": []
+    }
+
+    if custom_cutoff_str:
+        cutoff_dt = datetime.strptime(custom_cutoff_str, "%Y-%m-%d %H:%M:%S")
+    else:
+        # Cutoff: tepat pada pukul 00:00:00 (retention_days hari yang lalu dari hari ini)
+        today_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        cutoff_dt = today_midnight - timedelta(days=retention_days)
+
+    cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+    stats["cutoff"] = cutoff_str
+
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA foreign_keys = ON;")
+
+        # 1. Ambil semua path file gambar yang akan dihapus
+        query_files = """
+            SELECT d.RawImagePath, d.AnnotatedPath, i.InspectionID
+            FROM Inspection_Detections d
+            JOIN Inspections i ON d.InspectionID = i.InspectionID
+            WHERE i.InspectionTime < ?
+        """
+        cursor.execute(query_files, (cutoff_str,))
+        rows = cursor.fetchall()
+
+        files_to_remove = set()
+        dirs_to_check = set()
+        for raw_p, ann_p, _ in rows:
+            if raw_p and os.path.exists(raw_p):
+                files_to_remove.add(os.path.abspath(raw_p))
+                dirs_to_check.add(os.path.dirname(os.path.abspath(raw_p)))
+            if ann_p and os.path.exists(ann_p):
+                files_to_remove.add(os.path.abspath(ann_p))
+                dirs_to_check.add(os.path.dirname(os.path.abspath(ann_p)))
+
+        # 2. Hapus file fisik citra dari hard disk
+        for fpath in files_to_remove:
+            try:
+                os.remove(fpath)
+                stats["deleted_files"] += 1
+            except Exception as e:
+                stats["errors"].append(f"Gagal menghapus file {fpath}: {e}")
+
+        # Bersihkan direktori kosong (misal Database/captures/09-10/raw dan /09-10)
+        for dir_path in sorted(dirs_to_check, key=lambda p: len(p), reverse=True):
+            try:
+                if os.path.exists(dir_path) and not os.listdir(dir_path):
+                    os.rmdir(dir_path)
+                    stats["deleted_dirs"] += 1
+                    # Cek juga parent directory-nya
+                    parent_dir = os.path.dirname(dir_path)
+                    if os.path.exists(parent_dir) and not os.listdir(parent_dir):
+                        os.rmdir(parent_dir)
+                        stats["deleted_dirs"] += 1
+            except Exception:
+                pass
+
+        # 3. Hitung jumlah record yang akan dihapus
+        cursor.execute("SELECT COUNT(1) FROM Inspections WHERE InspectionTime < ?", (cutoff_str,))
+        stats["deleted_inspections"] = cursor.fetchone()[0]
+
+        cursor.execute("""
+            SELECT COUNT(1) FROM Inspection_Detections d
+            JOIN Inspections i ON d.InspectionID = i.InspectionID
+            WHERE i.InspectionTime < ?
+        """, (cutoff_str,))
+        stats["deleted_detections"] = cursor.fetchone()[0]
+
+        # 4. Hapus dari database (Maintenance_Logs, Inspection_Detections, Inspections)
+        cursor.execute("""
+            DELETE FROM Maintenance_Logs WHERE InspectionID IN (
+                SELECT InspectionID FROM Inspections WHERE InspectionTime < ?
+            )
+        """, (cutoff_str,))
+        cursor.execute("""
+            DELETE FROM Inspection_Detections WHERE InspectionID IN (
+                SELECT InspectionID FROM Inspections WHERE InspectionTime < ?
+            )
+        """, (cutoff_str,))
+        cursor.execute("DELETE FROM Inspections WHERE InspectionTime < ?", (cutoff_str,))
+
+        conn.commit()
+        print(f"🧹 [RETENTION PURGE] Berhasil membersihkan data sebelum {cutoff_str}:")
+        print(f"   - Inspections dihapus: {stats['deleted_inspections']}")
+        print(f"   - Detections dihapus: {stats['deleted_detections']}")
+        print(f"   - File gambar dihapus: {stats['deleted_files']}")
+        print(f"   - Folder kosong dibersihkan: {stats['deleted_dirs']}")
+
+    except Exception as e:
+        if conn is not None:
+            conn.rollback()
+        stats["errors"].append(str(e))
+        print(f"❌ [RETENTION PURGE] Gagal melakukan purge: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
+
+    return stats
 
 
 # ==========================================================
