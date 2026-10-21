@@ -1,0 +1,229 @@
+[
+  {
+    "id": "a20c1063a4a69933",
+    "type": "tab",
+    "label": "Try Node Red to Teams",
+    "disabled": false,
+    "info": "",
+    "env": []
+  },
+  {
+    "id": "d03fa28cb90b8578",
+    "type": "inject",
+    "z": "a20c1063a4a69933",
+    "d": true,
+    "name": "Test Inspection",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "",
+    "payloadType": "date",
+    "x": 260,
+    "y": 500,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "0647b136d9e8f1e5",
+    "type": "function",
+    "z": "a20c1063a4a69933",
+    "d": true,
+    "name": "Simulasi AI",
+    "func": "msg.payload = {\n    inspection_id: \"INS-20261002-001\",\n    timestamp: new Date().toISOString(),\n\n    overall_result: \"OK\",\n\n    cam01: {\n        slat: \"OK\",\n        rib: \"OK\",\n        pv_deviation: 34.4,\n        max_deviation: 27.8\n    },\n\n    cam02: {\n        bolt: \"OK\",\n        pin: \"OK\"\n    },\n\n    cam03: {\n        bolt: \"OK\",\n        pin: \"OK\"\n    }\n};\n\nreturn msg;",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 450,
+    "y": 500,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "6da519907b5e2a31",
+    "type": "debug",
+    "z": "a20c1063a4a69933",
+    "name": "debug 3",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "false",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 1240,
+    "y": 480,
+    "wires": []
+  },
+  {
+    "id": "a23d5c07579c12e5",
+    "type": "switch",
+    "z": "a20c1063a4a69933",
+    "name": "",
+    "property": "msg.payload.overall_result",
+    "propertyType": "msg",
+    "rules": [
+      {
+        "t": "eq",
+        "v": "NG",
+        "vt": "str"
+      }
+    ],
+    "checkall": "true",
+    "repair": false,
+    "outputs": 1,
+    "x": 670,
+    "y": 480,
+    "wires": [
+      [
+        "6cbfb39d1f35fd9e",
+        "d6d3f6f220541b74"
+      ]
+    ]
+  },
+  {
+    "id": "6cbfb39d1f35fd9e",
+    "type": "function",
+    "z": "a20c1063a4a69933",
+    "name": "BUILD TEAMS CARD",
+    "func": "const d = msg.payload || {};\nlet defects = Array.isArray(d.defects) ? d.defects : [];\n\n// Fallback jika payload simulasi/manual belum menyertakan array defects\nif (defects.length === 0) {\n    const c1 = d.cam01 || {};\n    const c2 = d.cam02 || {};\n    const c3 = d.cam03 || {};\n\n    if (String(c1.rib || \"\").toUpperCase().includes(\"NG\")) {\n        defects.push({\n            camera: \"CAM-01\",\n            component: \"Bilah Sirip (CAM-01)\",\n            component_short: \"Rib\",\n            defect_type: \"Rib Bengkok / Patah (Bending Deviation)\",\n            metrics: c1.max_deviation ? `Max Dev: ${c1.max_deviation}px` : \"Defleksi melebihi batas\",\n            severity: \"CRITICAL\"\n        });\n    }\n\n    if (String(c1.slat || \"\").toUpperCase().includes(\"NG\")) {\n        defects.push({\n            camera: \"CAM-01\",\n            component: \"Plat Konveyor (CAM-01)\",\n            component_short: \"Plat Slat\",\n            defect_type: \"Deformasi / Celah Sambungan Renggang (Void)\",\n            metrics: c1.pv_deviation ? `Flatness PV: ${c1.pv_deviation}px` : \"Celah / Kerataan melebihi ambang batas\",\n            severity: \"CRITICAL\"\n        });\n    }\n\n    if (String(c2.bolt || \"\").toUpperCase().includes(\"NG\")) {\n        defects.push({\n            camera: \"CAM-02\",\n            component: \"Baut Sisi Kanan (CAM-02)\",\n            component_short: \"Bolt RH\",\n            defect_type: \"Baut Kendur / Hilang (Bolt Abnormality)\",\n            metrics: String(c2.bolt),\n            severity: \"HIGH\"\n        });\n    }\n    if (String(c2.pin || \"\").toUpperCase().includes(\"NG\")) {\n        defects.push({\n            camera: \"CAM-02\",\n            component: \"Pin Sisi Kanan (CAM-02)\",\n            component_short: \"Pin RH\",\n            defect_type: \"Pin Rantai Miring / Tergeser (Misalignment)\",\n            metrics: String(c2.pin),\n            severity: \"HIGH\"\n        });\n    }\n\n    if (String(c3.bolt || \"\").toUpperCase().includes(\"NG\")) {\n        defects.push({\n            camera: \"CAM-03\",\n            component: \"Baut Sisi Kiri (CAM-03)\",\n            component_short: \"Bolt LH\",\n            defect_type: \"Baut Kendur / Hilang (Bolt Abnormality)\",\n            metrics: String(c3.bolt),\n            severity: \"HIGH\"\n        });\n    }\n    if (String(c3.pin || \"\").toUpperCase().includes(\"NG\")) {\n        defects.push({\n            camera: \"CAM-03\",\n            component: \"Pin Sisi Kiri (CAM-03)\",\n            component_short: \"Pin LH\",\n            defect_type: \"Pin Rantai Miring / Tergeser (Misalignment)\",\n            metrics: String(c3.pin),\n            severity: \"HIGH\"\n        });\n    }\n}\n\n// Fallback jika tetap kosong tetapi overall_result NG\nif (defects.length === 0) {\n    defects.push({\n        camera: \"SYSTEM\",\n        component: \"Inspeksi Visual Konveyor\",\n        component_short: \"Anomali\",\n        defect_type: \"Abnormalitas Terdeteksi Pada Jalur Konveyor\",\n        metrics: \"Status Sistem: NG\",\n        severity: \"MEDIUM\"\n    });\n}\n\nconst traceCode = String(d.inspection_id || \"-\");\nconst evidenceUrl = d.evidence_url || `http://localhost:5173/?trace=${encodeURIComponent(traceCode)}`;\nconst count = defects.length;\nconst isMulti = count > 1;\n\nlet headerTitle = \"\";\nlet subTitle = \"\";\n\nif (isMulti) {\n    const names = defects.map(x => x.component_short || x.component).join(\" + \");\n    headerTitle = `🚨 MULTI-ABNORMALITAS (${count} KOMPONEN NG)`;\n    subTitle = `Terdeteksi ${count} komponen mengalami kerusakan/anomali (${names}). Tindakan korektif segera diperlukan.`;\n} else {\n    headerTitle = `⚠️ ABNORMALITAS: ${defects[0].component.toUpperCase()}`;\n    subTitle = `Terdeteksi 1 komponen mengalami anomali spesifik dan memerlukan atensi teknisi lapangan.`;\n}\n\nconst cardBody = [\n    // Header Banner Merah (Attention)\n    {\n        type: \"Container\",\n        style: \"attention\",\n        bleed: true,\n        items: [\n            {\n                type: \"TextBlock\",\n                text: headerTitle,\n                weight: \"Bolder\",\n                size: \"Large\",\n                color: \"Light\",\n                wrap: true\n            },\n            {\n                type: \"TextBlock\",\n                text: subTitle,\n                size: \"Small\",\n                color: \"Light\",\n                wrap: true\n            }\n        ]\n    },\n    // Meta Information\n    {\n        type: \"FactSet\",\n        spacing: \"Medium\",\n        facts: [\n            {\n                title: \"ID Inspeksi\",\n                value: traceCode\n            },\n            {\n                title: \"Waktu Deteksi\",\n                value: String(d.timestamp || new Date().toLocaleString(\"id-ID\"))\n            },\n            {\n                title: \"Jumlah Cacat\",\n                value: `${count} Komponen Bermasalah`\n            }\n        ]\n    },\n    // Section Header\n    {\n        type: \"TextBlock\",\n        text: \"DAFTAR KOMPONEN ABNORMAL (NG):\",\n        weight: \"Bolder\",\n        size: \"Medium\",\n        spacing: \"Medium\"\n    }\n];\n\n// Masukkan HANYA komponen yang benar-benar NG ke dalam Card Body\ndefects.forEach((def, index) => {\n    let icon = \"⚠️\";\n    if (def.camera === \"CAM-01\") {\n        icon = (def.component_short && def.component_short.toLowerCase().includes(\"rib\")) ? \"📐\" : \"📏\";\n    } else if (def.camera === \"CAM-02\" || def.camera === \"CAM-03\") {\n        icon = (def.component_short && def.component_short.toLowerCase().includes(\"pin\")) ? \"📍\" : \"🔩\";\n    }\n\n    const itemElements = [\n        {\n            type: \"TextBlock\",\n            text: `**${index + 1}. ${def.component}**`,\n            weight: \"Bolder\",\n            size: \"Medium\",\n            color: \"Attention\",\n            wrap: true\n        },\n        {\n            type: \"TextBlock\",\n            text: `Masalah: **${def.defect_type}**`,\n            size: \"Default\",\n            spacing: \"None\",\n            wrap: true\n        }\n    ];\n\n    if (def.metrics) {\n        itemElements.push({\n            type: \"TextBlock\",\n            text: `📊 *Detail Parameter: ${def.metrics}*`,\n            size: \"Small\",\n            isSubtle: true,\n            spacing: \"None\",\n            wrap: true\n        });\n    }\n\n    cardBody.push({\n        type: \"Container\",\n        style: \"emphasis\",\n        spacing: \"Small\",\n        items: [\n            {\n                type: \"ColumnSet\",\n                columns: [\n                    {\n                        type: \"Column\",\n                        width: \"auto\",\n                        items: [\n                            {\n                                type: \"TextBlock\",\n                                text: icon,\n                                size: \"Medium\"\n                            }\n                        ]\n                    },\n                    {\n                        type: \"Column\",\n                        width: \"stretch\",\n                        items: itemElements\n                    }\n                ]\n            }\n        ]\n    });\n});\n\n// Footer Info & Direct Link\ncardBody.push(\n    {\n        type: \"TextBlock\",\n        text: `👉 [**🔍 KLIK DI SINI UNTUK BUKA DETAIL DI DASHBOARD**](${evidenceUrl})`,\n        weight: \"Bolder\",\n        color: \"Accent\",\n        spacing: \"Large\",\n        wrap: true\n    },\n    {\n        type: \"TextBlock\",\n        text: \"Sistem Inspeksi Otomatis AI • Conveyor Slat & Rib Metrology\",\n        isSubtle: true,\n        size: \"Small\",\n        spacing: \"Small\"\n    }\n);\n\nmsg.headers = {\n    \"Content-Type\": \"application/json\"\n};\n\nmsg.payload = {\n    type: \"message\",\n    attachments: [\n        {\n            contentType: \"application/vnd.microsoft.card.adaptive\",\n            content: {\n                \"$schema\": \"http://adaptivecards.io/schemas/adaptive-card.json\",\n                type: \"AdaptiveCard\",\n                version: \"1.2\",\n                body: cardBody,\n                actions: [\n                    {\n                        type: \"Action.OpenUrl\",\n                        title: \"🔍 Buka Detail Anomali di Web Dashboard\",\n                        url: evidenceUrl\n                    }\n                ]\n            }\n        }\n    ]\n};\n\nreturn msg;",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 860,
+    "y": 480,
+    "wires": [
+      [
+        "06a031a3e346a051"
+      ]
+    ]
+  },
+  {
+    "id": "06a031a3e346a051",
+    "type": "http request",
+    "z": "a20c1063a4a69933",
+    "name": "",
+    "method": "POST",
+    "ret": "txt",
+    "paytoqs": "ignore",
+    "url": "https://default47c7b16bd4824147b21a04936dd898.75.environment.api.powerplatform.com:443/powerautomate/automations/direct/cu/10/workflows/096a491a560340b8a8a345ff3cce5d50/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=2m4ahlc9ysUVEU6aOXED0A-e3wrQFR9p89wtShmNqk0",
+    "tls": "",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [],
+    "x": 1070,
+    "y": 480,
+    "wires": [
+      [
+        "6da519907b5e2a31"
+      ]
+    ]
+  },
+  {
+    "id": "a019288b443da6f6",
+    "type": "http in",
+    "z": "a20c1063a4a69933",
+    "name": "",
+    "url": "/ai-inspection",
+    "method": "post",
+    "upload": false,
+    "skipBodyParsing": false,
+    "swaggerDoc": "",
+    "x": 210,
+    "y": 400,
+    "wires": [
+      [
+        "5bc9b93f145d9d47",
+        "28992914fe73306a"
+      ]
+    ]
+  },
+  {
+    "id": "5bc9b93f145d9d47",
+    "type": "function",
+    "z": "a20c1063a4a69933",
+    "name": "Prepare Inspection",
+    "func": "const inspection = msg.payload;\n\nnode.warn(\"PAYLOAD DITERIMA:\");\nnode.warn(inspection);\n\n// Output 1 → HTTP Response\nconst responseMsg = {\n    ...msg,\n    payload: {\n        status: \"received\",\n        inspection_id: inspection.inspection_id || null,\n        overall_result: inspection.overall_result || null\n    }\n};\n\n// Output 2 → proses inspeksi → Switch → Teams\nconst processingMsg = {\n    ...msg,\n    payload: inspection\n};\n\n// Output 1 = response\n// Output 2 = processing\nreturn [responseMsg, processingMsg];",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 470,
+    "y": 400,
+    "wires": [
+      [
+        "7f8f553bd35b96ec"
+      ],
+      [
+        "a23d5c07579c12e5"
+      ]
+    ]
+  },
+  {
+    "id": "7f8f553bd35b96ec",
+    "type": "http response",
+    "z": "a20c1063a4a69933",
+    "name": "",
+    "statusCode": "",
+    "headers": {},
+    "x": 670,
+    "y": 320,
+    "wires": []
+  },
+  {
+    "id": "d6d3f6f220541b74",
+    "type": "debug",
+    "z": "a20c1063a4a69933",
+    "name": "DEBUG BEFORE TEAMS",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 830,
+    "y": 540,
+    "wires": []
+  },
+  {
+    "id": "28992914fe73306a",
+    "type": "debug",
+    "z": "a20c1063a4a69933",
+    "name": "debug 2",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "false",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 400,
+    "y": 440,
+    "wires": []
+  }
+]
