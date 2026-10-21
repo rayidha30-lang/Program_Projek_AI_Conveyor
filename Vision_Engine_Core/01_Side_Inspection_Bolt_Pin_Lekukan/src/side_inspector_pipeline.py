@@ -29,6 +29,36 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
 
+
+def _load_env_file():
+    """Membaca file .env jika ada (tanpa ketergantungan library eksternal)"""
+    candidate_paths = [
+        os.path.join(CURRENT_DIR, ".env"),
+        os.path.abspath(os.path.join(CURRENT_DIR, "..", ".env")),
+        os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", ".env")),
+        os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", "..", ".env")),
+        os.path.join(os.getcwd(), ".env"),
+    ]
+    for env_path in candidate_paths:
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+                break
+            except Exception:
+                pass
+
+
+_load_env_file()
+
 from bolt_pin_detector import BoltPinDetector
 from bracket_anomaly_detector import BracketAnomalyDetector
 
@@ -200,6 +230,7 @@ class SideConveyorInspector:
         self.last_slat_score = 0.0
         self.logged_slat_cycle = -1
         self.last_emit_frame = -999
+        self.last_slat_trigger_frame = -999
         self.has_seen_gap = False
         self.last_frame_time = None
         self.inter_frame_dt = 0.033
@@ -415,7 +446,7 @@ class SideConveyorInspector:
                 if debounce_ok:
                     current_f = self.stats["total_frames"]
                     # Proteksi interval: abaikan pemicuan kilap sesaat dari slat yang sama (misal refleksi bolt ulir)
-                    if (current_f - self.last_slat_trigger_frame) < self.min_slat_interval_frames:
+                    if 0 <= (current_f - self.last_slat_trigger_frame) < self.min_slat_interval_frames:
                         pass
                     else:
                         self.photocell_state = True
@@ -604,7 +635,7 @@ class SideConveyorInspector:
         emit_ann = display_frame
 
         current_f = self.stats["total_frames"]
-        transit_cooldown_ok = (current_f - self.last_emit_frame) >= self.min_slat_transit_frames
+        transit_cooldown_ok = (current_f - self.last_emit_frame) >= self.min_slat_transit_frames or (current_f < self.last_emit_frame)
 
         # Evaluasi apakah slat ini berstatus NG
         is_bolt_ng = (bolt_verdict == "NG")
@@ -722,11 +753,12 @@ def select_video_file(initial_dir=None, title="Pilih File Video Inspeksi"):
         root.attributes("-topmost", True)  # Pastikan dialog selalu berada di depan
 
         default_dir = initial_dir
-        if not default_dir or not os.path.exists(default_dir):
             candidate_dirs = [
-                r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib",
-                os.path.join(os.path.expanduser("~"), "Pictures"),
+                os.path.abspath(os.path.join(base_dir, "..", "Video_Testing")),
+                os.path.abspath(os.path.join(base_dir, "..", "..", "Video_Testing")),
+                os.path.abspath(os.path.join(base_dir, "..", "..", "..", "Video_Testing")),
                 os.path.join(os.path.expanduser("~"), "Videos"),
+                os.path.join(os.path.expanduser("~"), "Pictures"),
                 os.getcwd()
             ]
             for c_dir in candidate_dirs:
@@ -1003,17 +1035,29 @@ if __name__ == "__main__":
 
     video_input = args.video
     if not video_input:
-        default_video = r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib\Testing\Opsi Posisi 1 - Bolt & Pin.mp4"
-        if not os.path.exists(default_video):
-            default_video = r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib\Opsi Posisi 1 - Bolt & Pin.mp4"
+        # 1. Cek dari .env jika ada
+        env_side = os.environ.get("SIDE_CAMERA_SOURCE")
+        if env_side:
+            if env_side.isdigit() or env_side.startswith(("rtsp://", "http://", "https://", "nvarguscamerasrc")):
+                video_input = env_side
+            elif os.path.exists(env_side):
+                video_input = os.path.abspath(env_side)
 
-        if os.path.exists(default_video):
-            video_input = default_video
-        else:
+        # 2. Cek kandidat video bawaan
+        if not video_input:
+            default_candidates = [
+                os.path.abspath(os.path.join(base_dir, "..", "Video_Testing", "Deform Sedikit.mp4")),
+                os.path.abspath(os.path.join(base_dir, "..", "..", "Video_Testing", "Deform Sedikit.mp4")),
+                os.path.abspath(os.path.join(base_dir, "..", "..", "..", "Video_Testing", "Deform Sedikit.mp4")),
+            ]
+            video_input = next((v for v in default_candidates if os.path.exists(v)), None)
+
+        # 3. Fallback dialog file explorer
+        if not video_input:
             print("[*] Video default tidak ditemukan, membuka dialog pemilih file...")
             video_input = select_video_file(title="Pilih File Video untuk Inspeksi Samping")
 
-    if video_input and os.path.exists(video_input):
+    if video_input and (os.path.exists(video_input) or str(video_input).isdigit() or str(video_input).startswith(("rtsp://", "http://"))):
         run_side_inspector_demo(video_input, side=args.side, camera_id=args.cam, enable_db=args.db)
     else:
         print("[!] Tidak ada video yang dipilih. Program dihentikan.")

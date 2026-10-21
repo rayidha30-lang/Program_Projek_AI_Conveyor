@@ -95,9 +95,11 @@ class RibInspector:
                 parent_dir = os.path.dirname(cur_dir)
                 default_models = [
                     os.path.join(parent_dir, "models", "best_rib.pt"),
+                    os.path.join(parent_dir, "models", "best_rib_v5.pt"),
                     os.path.join(parent_dir, "models", "best.pt"),
-                    os.path.join(r"C:\Users\Victus\Downloads", "best_rib_v1.pt"),
-                    os.path.join(r"C:\Users\Victus\Downloads", "best.pt")
+                    os.path.abspath(os.path.join(parent_dir, "..", "Dataset Yolo", "best_v2.pt")),
+                    os.path.abspath(os.path.join(parent_dir, "..", "..", "Dataset Yolo", "best_v2.pt")),
+                    os.path.join(os.path.expanduser("~"), "Downloads", "best_rib_v1.pt"),
                 ]
                 for p in default_models:
                     if os.path.exists(p):

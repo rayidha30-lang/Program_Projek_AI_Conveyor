@@ -29,9 +29,12 @@ class PatchCoreFeatureExtractor:
     """
     Ekstraktor fitur spasial tingkat menengah (Layer 2 & Layer 3) ResNet-18.
     """
-    def __init__(self, input_size=(224, 224), device="cpu"):
+    def __init__(self, input_size=(224, 224), device=None):
         if not TORCH_AVAILABLE:
             raise RuntimeError("PyTorch & Torchvision wajib terinstall.")
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.input_h, self.input_w = input_size
         self.device = torch.device(device)
@@ -88,14 +91,17 @@ class BracketAnomalyDetector:
     """
     Detektor anomali lekukan plat menggunakan model PatchCore Memory Bank.
     """
-    def __init__(self, model_path, default_thresh=0.8393, device="cpu"):
+    def __init__(self, model_path, default_thresh=0.8650, device=None):
         """
         :param model_path: Path ke file memory bank .pkl
         :param default_thresh: Ambang batas skor anomali default
-        :param device: "cpu" atau "cuda"
+        :param device: "cpu" atau "cuda" (default: auto CUDA jika tersedia)
         """
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model PatchCore tidak ditemukan di: {model_path}")
+
+        if device is None:
+            device = "cuda" if (TORCH_AVAILABLE and torch.cuda.is_available()) else "cpu"
 
         print(f"[*] Memuat model PatchCore dari: {model_path}")
         with open(model_path, "rb") as f:

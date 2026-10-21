@@ -39,6 +39,32 @@ if sys.platform.startswith("win"):
 # Path direktori utama
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+def _load_env_file():
+    """Membaca file .env jika ada (tanpa ketergantungan library eksternal)"""
+    candidate_paths = [
+        os.path.join(BASE_DIR, ".env"),
+        os.path.abspath(os.path.join(BASE_DIR, "..", ".env")),
+        os.path.join(BASE_DIR, "Jetson_Vision_Engine", ".env"),
+    ]
+    for env_path in candidate_paths:
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+                break
+            except Exception:
+                pass
+
+_load_env_file()
+
 # Deteksi lokasi pipeline (mendukung eksekusi dari root maupun dari dalam folder Jetson_Vision_Engine)
 if os.path.exists(os.path.join(BASE_DIR, "02_Top_Inspection_Slat_Rib", "src")):
     TOP_SRC_DIR = os.path.join(BASE_DIR, "02_Top_Inspection_Slat_Rib", "src")
@@ -53,23 +79,81 @@ else:
     SIDE_SRC_DIR = os.path.join(BASE_DIR, "Vision_Engine_Core", "01_Side_Inspection_Bolt_Pin_Lekukan", "src")
     VIDEO_DIR = os.path.join(BASE_DIR, "Video_Testing")
 
+def is_stream_or_camera(src):
+    """Mengecek apakah input berupa index kamera (misal 0, 1) atau URL stream (RTSP, HTTP, GStreamer)."""
+    if src is None:
+        return False
+    s = str(src).strip()
+    if s.isdigit():
+        return True
+    if s.startswith(("rtsp://", "http://", "https://", "nvarguscamerasrc", "v4l2src")):
+        return True
+    return False
+
+
+def resolve_source_path(src, candidates=None):
+    """
+    Menemukan path media/video atau sumber kamera yang valid secara multi-platform.
+    Mendukung index webcam, URL RTSP/CSI, absolute path, dan relative path.
+    """
+    if not src:
+        if candidates:
+            for cand in candidates:
+                res = resolve_source_path(cand)
+                if res:
+                    return res
+        return ""
+
+    s = str(src).strip()
+    if is_stream_or_camera(s):
+        return s
+
+    # 1. Cek langsung jika path absolute atau relatif terhadap CWD
+    if os.path.exists(s):
+        return os.path.abspath(s)
+
+    # 2. Cek relatif terhadap BASE_DIR (Program / root)
+    rel_base = os.path.join(BASE_DIR, s)
+    if os.path.exists(rel_base):
+        return os.path.abspath(rel_base)
+
+    # 3. Cek relatif terhadap VIDEO_DIR (Video_Testing)
+    rel_video = os.path.join(VIDEO_DIR, s)
+    if os.path.exists(rel_video):
+        return os.path.abspath(rel_video)
+
+    # 4. Fallback ke kandidat berikutnya jika ada
+    if candidates:
+        for cand in candidates:
+            if cand != src:
+                res = resolve_source_path(cand)
+                if res:
+                    return res
+    return s
+
+
 # Video Default CAM-01 Top Inspection (Plat Slat & Bilah Rib)
-USER_TOP_VIDEO = r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib\New\Reverse\Kamera posisi 3 dimmer 2 - Reverse.mp4"
+ENV_TOP_VIDEO = os.environ.get("TOP_CAMERA_SOURCE")
 CANDIDATE_TOP_VIDEOS = [
-    USER_TOP_VIDEO,
+    ENV_TOP_VIDEO,
     os.path.join(VIDEO_DIR, "Deform Sedikit.mp4"),
     os.path.join(VIDEO_DIR, "OK Semua.mp4"),
+    os.path.join(BASE_DIR, "Jetson_Vision_Engine", "Video_Testing", "OK Semua.mp4"),
+    "0",
 ]
-DEFAULT_TOP_VIDEO = next((v for v in CANDIDATE_TOP_VIDEOS if os.path.exists(v)), CANDIDATE_TOP_VIDEOS[0])
+DEFAULT_TOP_VIDEO = resolve_source_path(ENV_TOP_VIDEO, CANDIDATE_TOP_VIDEOS)
 
-# Video Default Side Inspection (Baut, Pin & Bracket - CAM-02 RH / CAM-03 LH)et)
-USER_SIDE_VIDEO = r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib\Testing\Opsi Posisi 1 - Bolt & Pin.mp4"
+# Video Default Side Inspection (Baut, Pin & Bracket - CAM-02 RH / CAM-03 LH)
+ENV_SIDE_VIDEO = os.environ.get("SIDE_CAMERA_SOURCE")
 CANDIDATE_SIDE_VIDEOS = [
-    USER_SIDE_VIDEO,
+    ENV_SIDE_VIDEO,
+    os.path.join(VIDEO_DIR, "Deform Sedikit.mp4"),
     os.path.abspath(os.path.join(BASE_DIR, "..", "Documentation", "WhatsApp Video 2026-08-19 at 15.37.46.mp4")),
     os.path.abspath(os.path.join(BASE_DIR, "Documentation", "WhatsApp Video 2026-08-19 at 15.37.46.mp4")),
+    "1",
 ]
-DEFAULT_SIDE_VIDEO = next((v for v in CANDIDATE_SIDE_VIDEOS if os.path.exists(v)), CANDIDATE_SIDE_VIDEOS[0])
+DEFAULT_SIDE_VIDEO = resolve_source_path(ENV_SIDE_VIDEO, CANDIDATE_SIDE_VIDEOS)
+
 
 
 def configure_windows_process_performance():
@@ -1109,10 +1193,23 @@ Shortcut Keyboard Saat Berjalan:
   [O] / [F]   : Buka dialog file explorer untuk mengganti video secara langsung (on-the-fly)
         """
     )
+    env_mode = os.environ.get("BENCHMARK_MODE", "dual")
+    env_side_name = os.environ.get("SIDE_CAMERA_NAME", "RIGHT")
+    env_side_cam_id = os.environ.get("SIDE_CAMERA_ID", None)
+    env_rib_mode = os.environ.get("RIB_DETECTION_MODE", "HYBRID")
+    env_device = os.environ.get("INFERENCE_DEVICE", None)
+    try:
+        env_duration = int(os.environ.get("BENCHMARK_DURATION", "0"))
+    except ValueError:
+        env_duration = 0
+    env_csv = os.environ.get("RECORD_CSV", None)
+    env_db = os.environ.get("ENABLE_DB_LOGGING", "false").lower() in ("true", "1", "yes")
+    env_engine = os.environ.get("BENCHMARK_ENGINE", "threads")
+
     parser.add_argument(
         "--mode",
         choices=["dual", "headless", "top-only", "side-only"],
-        default="dual",
+        default=env_mode,
         help="Mode eksekusi: 'dual' (2 jendela OpenCV berdampingan), 'headless' (tanpa display, murni komputasi AI), atau pengujian kamera tunggal."
     )
     parser.add_argument(
@@ -1143,26 +1240,28 @@ Shortcut Keyboard Saat Berjalan:
         default=default_side_arg,
         help=f"Path video, index kamera, atau ketik 'browse' untuk Side Bolt/Pin (default: {os.path.basename(default_side_arg) if os.path.exists(str(default_side_arg)) else default_side_arg})"
     )
-    parser.add_argument("--side-name", type=str, default="RIGHT", choices=["RIGHT", "LEFT"], help="Sisi konveyor (RIGHT / LEFT)")
-    parser.add_argument("--side-cam-id", type=str, default=None, help="ID Kamera samping (default: CAM-02 untuk RIGHT, CAM-03 untuk LEFT)")
-    parser.add_argument("--rib-mode", type=str, default="HYBRID", choices=["HYBRID", "YOLO_ONLY", "DUAL_POLARITY_ONLY"], help="Mode deteksi sirip")
-    parser.add_argument("--device", type=str, default=None, help="Device komputasi: 'cuda' atau 'cpu' (default: auto)")
-    parser.add_argument("--duration", type=int, default=0, help="Durasi benchmark dalam detik (0 = berjalan terus sampai dihentikan)")
-    parser.add_argument("--record-csv", type=str, default=None, help="Path file CSV untuk mencatat log FPS berkala")
+    parser.add_argument("--side-name", type=str, default=env_side_name, choices=["RIGHT", "LEFT"], help="Sisi konveyor (RIGHT / LEFT)")
+    parser.add_argument("--side-cam-id", type=str, default=env_side_cam_id, help="ID Kamera samping (default: CAM-02 untuk RIGHT, CAM-03 untuk LEFT)")
+    parser.add_argument("--rib-mode", type=str, default=env_rib_mode, choices=["HYBRID", "YOLO_ONLY", "DUAL_POLARITY_ONLY"], help="Mode deteksi sirip")
+    parser.add_argument("--device", type=str, default=env_device, help="Device komputasi: 'cuda' atau 'cpu' (default: auto)")
+    parser.add_argument("--duration", type=int, default=env_duration, help="Durasi benchmark dalam detik (0 = berjalan terus sampai dihentikan)")
+    parser.add_argument("--record-csv", type=str, default=env_csv, help="Path file CSV untuk mencatat log FPS berkala")
     parser.add_argument(
         "--enable-db", "--db",
         action="store_true",
+        default=env_db,
         dest="enable_db",
         help="Aktifkan pencatatan SQLite database dan pengiriman card notification ke MS Teams saat terdeteksi abnormalitas (NG)"
     )
     parser.add_argument(
         "--engine",
         choices=["threads", "process"],
-        default="threads",
+        default=env_engine,
         help="Arsitektur runner: 'threads' (default: hemat RAM/VRAM untuk laptop 8GB & single GPU, zero IPC crash), atau 'process' (multiprocessing untuk Jetson Orin multi-core)."
     )
 
     args = parser.parse_args()
+
 
     # Auto-resolve device (CUDA jika tersedia, else CPU)
     if not args.device:
@@ -1210,10 +1309,19 @@ Shortcut Keyboard Saat Berjalan:
             print(f"[*] Pemilihan Side dibatalkan/default: {os.path.basename(str(args.side_source)) if os.path.exists(str(args.side_source)) else args.side_source}")
 
     # Validasi fallback path jika path manual tidak ditemukan
-    if not os.path.exists(str(args.top_source)) and not str(args.top_source).isdigit():
-        args.top_source = DEFAULT_TOP_VIDEO
-    if not os.path.exists(str(args.side_source)) and not str(args.side_source).isdigit():
-        args.side_source = DEFAULT_SIDE_VIDEO
+    if not is_stream_or_camera(args.top_source) and not os.path.exists(str(args.top_source)):
+        resolved_top = resolve_source_path(args.top_source)
+        if os.path.exists(resolved_top) or is_stream_or_camera(resolved_top):
+            args.top_source = resolved_top
+        else:
+            args.top_source = DEFAULT_TOP_VIDEO
+
+    if not is_stream_or_camera(args.side_source) and not os.path.exists(str(args.side_source)):
+        resolved_side = resolve_source_path(args.side_source)
+        if os.path.exists(resolved_side) or is_stream_or_camera(resolved_side):
+            args.side_source = resolved_side
+        else:
+            args.side_source = DEFAULT_SIDE_VIDEO
 
     print("=" * 86)
     print("🚀 MULTI-CAMERA INSPECTION BENCHMARK RUNNER")

@@ -1402,11 +1402,12 @@ def main():
     # Cari video pengujian di berbagai folder
     candidate_doc_dirs = [
         os.path.abspath(os.path.join(parent_dir, "..", "Video_Testing")),
-        r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib\05-10-2026",
-        r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib",
+        os.path.abspath(os.path.join(parent_dir, "..", "..", "Video_Testing")),
         os.path.abspath(os.path.join(parent_dir, "..", "..", "..", "Documentation")),
         os.path.abspath(os.path.join(parent_dir, "..", "..", "Documentation")),
-        r"c:\File Rayidha\Internship\Project\5. Project AI Slat Rib Conveyor\Documentation"
+        os.path.abspath(os.path.join(parent_dir, "Documentation")),
+        os.path.join(os.path.expanduser("~"), "Videos"),
+        os.path.join(os.path.expanduser("~"), "Pictures"),
     ]
     videos = []
     for d_dir in candidate_doc_dirs:

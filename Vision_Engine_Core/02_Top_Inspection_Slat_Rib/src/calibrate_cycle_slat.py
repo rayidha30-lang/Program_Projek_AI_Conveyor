@@ -534,8 +534,12 @@ def run_cycle_calibration(video_source=None, config_path=None):
 
     # Daftar pencarian video demo jika tidak dispesifikasikan
     search_dirs = [
-        r"C:\File Rayidha\Internship\Project\5. Project AI Slat Rib Conveyor\Documentation\Video Testing",
-        r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib"
+        os.path.abspath(os.path.join(base_dir, "..", "Video_Testing")),
+        os.path.abspath(os.path.join(base_dir, "..", "..", "Video_Testing")),
+        os.path.abspath(os.path.join(base_dir, "..", "Documentation", "Video Testing")),
+        os.path.abspath(os.path.join(base_dir, "..", "..", "Documentation", "Video Testing")),
+        os.path.join(os.path.expanduser("~"), "Videos"),
+        os.path.join(os.path.expanduser("~"), "Pictures"),
     ]
     playlist = []
     if video_source and os.path.exists(str(video_source)):

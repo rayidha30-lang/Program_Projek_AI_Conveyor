@@ -40,6 +40,36 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
 
+
+def _load_env_file():
+    """Membaca file .env jika ada (tanpa ketergantungan library eksternal)"""
+    candidate_paths = [
+        os.path.join(CURRENT_DIR, ".env"),
+        os.path.abspath(os.path.join(CURRENT_DIR, "..", ".env")),
+        os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", ".env")),
+        os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", "..", ".env")),
+        os.path.join(os.getcwd(), ".env"),
+    ]
+    for env_path in candidate_paths:
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+                break
+            except Exception:
+                pass
+
+
+_load_env_file()
+
 # Bootstrap Environment CUDA 12.6 Jetson Orin Nano secara otomatis
 try:
     import jetson_cuda_env  # noqa: F401
@@ -1026,31 +1056,42 @@ def main():
     print(f"  2. HybridRibInspector     -> hybrid_rib_inspector.py (Zona Deteksi Sirip - {pipeline.rib_inspector.device_info})")
     print("=" * 78)
 
-    # Direktori pencarian video otomatis jika source tidak dispesifikasi
-    search_dirs = [
-        r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib\New\Reverse",
-        r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib",
-        os.path.join(os.path.dirname(CURRENT_DIR), "Video_Testing"),
-        r"C:\Users\Victus\Downloads"
-    ]
-    sorted_videos = []
-    for sdir in search_dirs:
-        if os.path.exists(sdir):
-            for f in sorted(os.listdir(sdir)):
-                if f.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
-                    p = os.path.abspath(os.path.join(sdir, f))
-                    if p not in sorted_videos:
-                        sorted_videos.append(p)
-
+    # Cek sumber dari argumen atau dari .env
     current_source = args.source
-    if not current_source and sorted_videos:
-        current_source = sorted_videos[0]
+    if not current_source:
+        env_top = os.environ.get("TOP_CAMERA_SOURCE")
+        if env_top:
+            if env_top.isdigit() or env_top.startswith(("rtsp://", "http://", "https://", "nvarguscamerasrc")):
+                current_source = env_top
+            elif os.path.exists(env_top):
+                current_source = os.path.abspath(env_top)
 
-    if not current_source or not os.path.exists(current_source):
+    if not current_source:
+        # Direktori pencarian video otomatis jika source tidak dispesifikasi
+        search_dirs = [
+            os.path.join(os.path.dirname(CURRENT_DIR), "Video_Testing"),
+            os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", "Video_Testing")),
+            os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", "..", "Video_Testing")),
+            os.path.join(os.path.expanduser("~"), "Videos"),
+            os.path.join(os.path.expanduser("~"), "Pictures"),
+        ]
+        sorted_videos = []
+        for sdir in search_dirs:
+            if os.path.exists(sdir):
+                for f in sorted(os.listdir(sdir)):
+                    if f.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
+                        p = os.path.abspath(os.path.join(sdir, f))
+                        if p not in sorted_videos:
+                            sorted_videos.append(p)
+
+        if sorted_videos:
+            current_source = sorted_videos[0]
+
+    if not current_source or (not str(current_source).isdigit() and not str(current_source).startswith(("rtsp://", "http://")) and not os.path.exists(str(current_source))):
         print("\n[*] Tidak ada path video default, membuka File Dialog Explorer...")
         current_source = select_file_dialog(title="Pilih File Video untuk Inspeksi Terpadu")
 
-    if not current_source or not os.path.exists(current_source):
+    if not current_source:
         print("[ERROR] Tidak ada file video yang valid. Keluar.")
         return
 

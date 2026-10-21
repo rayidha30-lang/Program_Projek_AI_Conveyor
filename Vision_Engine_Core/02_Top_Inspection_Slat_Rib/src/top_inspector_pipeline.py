@@ -30,6 +30,36 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
 
+
+def _load_env_file():
+    """Membaca file .env jika ada (tanpa ketergantungan library eksternal)"""
+    candidate_paths = [
+        os.path.join(CURRENT_DIR, ".env"),
+        os.path.abspath(os.path.join(CURRENT_DIR, "..", ".env")),
+        os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", ".env")),
+        os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", "..", ".env")),
+        os.path.join(os.getcwd(), ".env"),
+    ]
+    for env_path in candidate_paths:
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+                break
+            except Exception:
+                pass
+
+
+_load_env_file()
+
 from rib_inspector import RibInspector
 from slat_gap_inspector import SlatGapInspector
 
@@ -378,9 +408,11 @@ def select_video_file(initial_dir=None, title="Pilih File Video Top Inspection")
         root.attributes("-topmost", True)
 
         default_dir = initial_dir
-        if not default_dir or not os.path.exists(default_dir):
             candidate_dirs = [
-                r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib",
+                os.path.abspath(os.path.join(CURRENT_DIR, "..", "Video_Testing")),
+                os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", "Video_Testing")),
+                os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", "..", "Video_Testing")),
+                os.path.join(os.path.expanduser("~"), "Videos"),
                 os.path.join(os.path.expanduser("~"), "Pictures"),
                 os.getcwd()
             ]
@@ -675,14 +707,30 @@ if __name__ == "__main__":
 
     video_input = args.video
     if not video_input:
-        default_video = r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib\Opsi Posisi 1 - Slat Rib.mp4"
-        if os.path.exists(default_video):
-            video_input = default_video
-        else:
+        # 1. Cek dari .env
+        env_top = os.environ.get("TOP_CAMERA_SOURCE")
+        if env_top:
+            if env_top.isdigit() or env_top.startswith(("rtsp://", "http://", "https://", "nvarguscamerasrc")):
+                video_input = env_top
+            elif os.path.exists(env_top):
+                video_input = os.path.abspath(env_top)
+
+        # 2. Cek kandidat video bawaan
+        if not video_input:
+            default_candidates = [
+                os.path.abspath(os.path.join(CURRENT_DIR, "..", "Video_Testing", "OK Semua.mp4")),
+                os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", "Video_Testing", "OK Semua.mp4")),
+                os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", "..", "Video_Testing", "OK Semua.mp4")),
+                os.path.abspath(os.path.join(CURRENT_DIR, "..", "Video_Testing", "Deform Sedikit.mp4")),
+            ]
+            video_input = next((v for v in default_candidates if os.path.exists(v)), None)
+
+        # 3. Fallback dialog file explorer
+        if not video_input:
             print("[*] Video default tidak ditemukan, membuka dialog pemilih file...")
             video_input = select_video_file(title="Pilih File Video untuk Top Inspection")
 
-    if video_input and os.path.exists(video_input):
+    if video_input and (os.path.exists(video_input) or str(video_input).isdigit() or str(video_input).startswith(("rtsp://", "http://"))):
         run_top_inspector_demo(video_input, camera_id=args.cam)
     else:
         print("[!] Tidak ada video yang dipilih. Program dihentikan.")

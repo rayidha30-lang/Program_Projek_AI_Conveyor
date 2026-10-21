@@ -57,8 +57,11 @@ for d in [OUTPUT_DIR, SNAPSHOT_DIR, DEFECTS_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # Daftar Video Default (Prioritaskan direktori Documentation/Video Testing)
-TEST_VIDEO_DIR = r"C:\File Rayidha\Internship\Project\5. Project AI Slat Rib Conveyor\Documentation\Video Testing"
-DOWNLOADS_DIR  = r"C:\Users\Victus\Downloads"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEST_VIDEO_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "Documentation", "Video Testing"))
+if not os.path.exists(TEST_VIDEO_DIR):
+    TEST_VIDEO_DIR = os.path.abspath(os.path.join(BASE_DIR, "Video_Testing"))
+DOWNLOADS_DIR  = os.path.join(os.path.expanduser("~"), "Downloads")
 
 DEFAULT_VIDEOS = []
 if os.path.exists(TEST_VIDEO_DIR):

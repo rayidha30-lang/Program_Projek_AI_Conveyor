@@ -28,8 +28,12 @@ cd /path/ke/folder/Program
 # 2. Beri izin eksekusi pada script setup
 chmod +x setup_jetson.sh
 
-# 3. Jalankan script setup
+# 3. Jalankan script setup instalasi dependensi
 ./setup_jetson.sh
+
+# 4. Generate & Konfigurasi file .env secara otomatis
+bash configure_jetson_env.sh --auto
+# atau jalankan mode wizard interaktif: bash configure_jetson_env.sh
 ```
 
 ---

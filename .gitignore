@@ -30,4 +30,7 @@ scratch/
 *_backup/
 **/02_Top_Inspection_Slat_Rib_backup/
 
-
+# Environment Variables & Local Configs
+.env
+*.env.local
+!.env.example
