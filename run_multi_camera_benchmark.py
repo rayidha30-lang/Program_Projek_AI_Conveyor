@@ -65,18 +65,18 @@ def _load_env_file():
 
 _load_env_file()
 
-# Deteksi lokasi pipeline (mendukung eksekusi dari root maupun dari dalam folder Jetson_Vision_Engine)
-if os.path.exists(os.path.join(BASE_DIR, "02_Top_Inspection_Slat_Rib", "src")):
-    TOP_SRC_DIR = os.path.join(BASE_DIR, "02_Top_Inspection_Slat_Rib", "src")
-    SIDE_SRC_DIR = os.path.join(BASE_DIR, "01_Side_Inspection_Bolt_Pin", "src")
+# Deteksi lokasi pipeline (utamakan Vision_Engine_Core di PC, lalu Jetson_Vision_Engine jika di-deploy mandiri)
+if os.path.exists(os.path.join(BASE_DIR, "Vision_Engine_Core", "02_Top_Inspection_Slat_Rib", "src")):
+    TOP_SRC_DIR = os.path.join(BASE_DIR, "Vision_Engine_Core", "02_Top_Inspection_Slat_Rib", "src")
+    SIDE_SRC_DIR = os.path.join(BASE_DIR, "Vision_Engine_Core", "01_Side_Inspection_Bolt_Pin_Lekukan", "src")
     VIDEO_DIR = os.path.join(BASE_DIR, "Video_Testing")
 elif os.path.exists(os.path.join(BASE_DIR, "Jetson_Vision_Engine", "02_Top_Inspection_Slat_Rib", "src")):
     TOP_SRC_DIR = os.path.join(BASE_DIR, "Jetson_Vision_Engine", "02_Top_Inspection_Slat_Rib", "src")
     SIDE_SRC_DIR = os.path.join(BASE_DIR, "Jetson_Vision_Engine", "01_Side_Inspection_Bolt_Pin", "src")
     VIDEO_DIR = os.path.join(BASE_DIR, "Jetson_Vision_Engine", "Video_Testing")
 else:
-    TOP_SRC_DIR = os.path.join(BASE_DIR, "Vision_Engine_Core", "02_Top_Inspection_Slat_Rib", "src")
-    SIDE_SRC_DIR = os.path.join(BASE_DIR, "Vision_Engine_Core", "01_Side_Inspection_Bolt_Pin_Lekukan", "src")
+    TOP_SRC_DIR = os.path.join(BASE_DIR, "02_Top_Inspection_Slat_Rib", "src")
+    SIDE_SRC_DIR = os.path.join(BASE_DIR, "01_Side_Inspection_Bolt_Pin", "src")
     VIDEO_DIR = os.path.join(BASE_DIR, "Video_Testing")
 
 def is_stream_or_camera(src):
@@ -414,8 +414,8 @@ def _run_top_worker(
                         fps_history.clear()
                         print(f"[*] [CAM-01 TOP] Video berhasil dialihkan ke: {os.path.basename(new_top)}")
 
-            # Rekam ke database SQLite dan kirim notifikasi ke MS Teams jika status NG dan DB Logging aktif
-            if inspect_res.get("status") == "NG":
+            # Rekam ke database SQLite dan kirim notifikasi ke MS Teams menggunakan Best-Shot Buffer jika DB aktif
+            if inspector and inspector.is_db_enabled():
                 inspector.record_if_ng(
                     frame_raw=frame,
                     frame_ann=hud if hud is not None else frame,
@@ -802,6 +802,37 @@ def _run_threaded_engine(args):
     top_lock = threading.Lock()
     side_lock = threading.Lock()
 
+    # Inisialisasi Dedicated CUDA Streams & cuDNN Benchmark untuk mencegah GPU serialization
+    top_stream = None
+    side_stream = None
+    try:
+        import torch
+        if torch.cuda.is_available() and args.device != "cpu":
+            torch.backends.cudnn.benchmark = True
+            top_stream = torch.cuda.Stream()
+            side_stream = torch.cuda.Stream()
+    except Exception:
+        pass
+
+    # Pre-Warmup pass untuk mengeliminasi latensi inisialisasi CUDA 5.8s pada frame 0
+    print("[*] Melakukan pre-warmup GPU AI Engine (mengeliminasi lonjakan latensi frame pertama)...")
+    try:
+        if top_inspector is not None and cap_top is not None and cap_top.isOpened():
+            ret_w, frame_w = cap_top.read()
+            if ret_w and frame_w is not None:
+                top_inspector.inspect(frame_w)
+                if not is_cam_top:
+                    cap_top.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        if side_inspector is not None and cap_side is not None and cap_side.isOpened():
+            ret_w, frame_w = cap_side.read()
+            if ret_w and frame_w is not None:
+                side_inspector.process_frame(frame_w)
+                if not is_cam_side:
+                    cap_side.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        print("[*] Pre-warmup selesai. GPU siap pada performa steady-state.")
+    except Exception as e_wm:
+        print(f"[WARN] Pre-warmup skipped: {e_wm}")
+
     top_state = {
         "display": None,
         "fps": 0.0,
@@ -842,7 +873,12 @@ def _run_threaded_engine(args):
                     time.sleep(0.01)
                     continue
 
-            inspect_res = top_inspector.inspect(frame)
+            if top_stream is not None:
+                with torch.cuda.stream(top_stream):
+                    with torch.inference_mode():
+                        inspect_res = top_inspector.inspect(frame)
+            else:
+                inspect_res = top_inspector.inspect(frame)
             t_end = time.time()
             lat = (t_end - t_start) * 1000.0
 
@@ -864,8 +900,8 @@ def _run_threaded_engine(args):
                     total_frames=total_f
                 )
 
-            # Rekam ke database SQLite dan kirim notifikasi MS Teams jika ada Top NG dan DB aktif
-            if top_inspector and top_inspector.is_db_enabled() and inspect_res.get("status") == "NG":
+            # Rekam ke database SQLite dan kirim notifikasi MS Teams menggunakan Best-Shot Buffer jika DB aktif
+            if top_inspector and top_inspector.is_db_enabled():
                 top_inspector.record_if_ng(
                     frame_raw=frame,
                     frame_ann=hud if hud is not None else frame,
@@ -906,7 +942,12 @@ def _run_threaded_engine(args):
                     time.sleep(0.01)
                     continue
 
-            display_frame, payload = side_inspector.process_frame(frame)
+            if side_stream is not None:
+                with torch.cuda.stream(side_stream):
+                    with torch.inference_mode():
+                        display_frame, payload = side_inspector.process_frame(frame)
+            else:
+                display_frame, payload = side_inspector.process_frame(frame)
             t_end = time.time()
             lat = (t_end - t_start) * 1000.0
 
@@ -929,14 +970,16 @@ def _run_threaded_engine(args):
                         side_payload=payload
                     )
 
-            # Gambar overlay banner benchmark di bagian bawah frame Side
-            if args.mode == "dual" and display_frame is not None:
+            # Gambar overlay banner benchmark di bagian bawah frame Side (DIBESARKAN)
+            if args.mode in ["dual", "side-only"] and display_frame is not None:
                 h_d, w_d = display_frame.shape[:2]
                 db_st = "ON" if (side_db_bridge and side_db_bridge.is_enabled()) else "OFF"
-                banner = f"FPS: {avg_f:4.1f} | Lat: {lat:4.1f}ms | DB:{db_st} | [D]:Toggle DB | [O/F]:Ganti | [Q]:Keluar"
-                cv2.rectangle(display_frame, (10, h_d - 40), (620, h_d - 10), (20, 20, 20), -1)
-                cv2.putText(display_frame, banner, (18, h_d - 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1, cv2.LINE_AA)
+                qc_txt = f"Slat #{side_inspector.slat_cycle_count} [OK:{side_inspector.slat_ok_count} NG:{side_inspector.slat_ng_count} (B:{side_inspector.bolt_ng_count} P:{side_inspector.pin_ng_count} C:{side_inspector.crack_ng_count})]"
+                banner = f"FPS: {avg_f:4.1f} | Lat: {lat:4.1f}ms | DB: {db_st} | {qc_txt} | [Q]: Keluar"
+                cv2.rectangle(display_frame, (10, h_d - 65), (w_d - 10, h_d - 10), (18, 18, 18), -1)
+                cv2.rectangle(display_frame, (10, h_d - 65), (w_d - 10, h_d - 10), (0, 220, 255), 2, cv2.LINE_AA)
+                cv2.putText(display_frame, banner, (25, h_d - 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.76, (0, 255, 255), 2, cv2.LINE_AA)
 
             with side_lock:
                 side_state["frames"] += 1
@@ -1094,7 +1137,10 @@ def _run_threaded_engine(args):
                     s_side = side_state["status"]
 
                 v_comb_fps = v_top_fps + v_side_fps
-                stat_summary = f"T:{s_top}|S:{s_side}"
+                if side_inspector is not None:
+                    stat_summary = f"T:{s_top}|S:{s_side}[OK:{side_inspector.slat_ok_count}/NG:{side_inspector.slat_ng_count}]"
+                else:
+                    stat_summary = f"T:{s_top}|S:{s_side}"
                 time_str = f"{int(elapsed):03d}s"
 
                 print(
@@ -1150,6 +1196,10 @@ def _run_threaded_engine(args):
         print(f"  • CAM-01 Top (Slat & Rib)   : {f_top} frames ({avg_top_fps:.1f} rata-rata FPS)")
     if args.mode in ["dual", "headless", "side-only"]:
         print(f"  • {args.side_cam_id} Side (Bolt & Pin)  : {f_side} frames ({avg_side_fps:.1f} rata-rata FPS)")
+    if side_inspector is not None:
+        print(f"  • {args.side_cam_id} QC Fisik Slat     : {side_inspector.slat_cycle_count} Total Slat Melintas | OK: {side_inspector.slat_ok_count} | NG: {side_inspector.slat_ng_count}")
+        if side_inspector.slat_ng_count > 0:
+            print(f"    - Rincian Defek Sisi      : Baut NG: {side_inspector.bolt_ng_count} | Pin NG: {side_inspector.pin_ng_count} | Crack/Lekukan NG: {side_inspector.crack_ng_count}")
     print(f"  • Throughput Gabungan       : {(avg_top_fps + avg_side_fps):.1f} frames/detik")
 
     target_fps = 20.0

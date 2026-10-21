@@ -147,7 +147,7 @@ class SideConveyorInspector:
         )
 
         # 2. Inisialisasi Detektor Lekukan (PatchCore) dengan akselerasi GPU CUDA
-        self.custom_patchcore_thresh = patchcore_thresh or 0.8650
+        self.custom_patchcore_thresh = patchcore_thresh or 0.8550
         self.bracket_detector = BracketAnomalyDetector(
             patchcore_model_path,
             default_thresh=self.custom_patchcore_thresh,
@@ -182,7 +182,7 @@ class SideConveyorInspector:
         self.slat_settling_delay = 2           # Settling delay 2 frame setelah pemicuan photocell agar braket tepat di tengah poligon
         self.slat_settling_countdown = 0       # Countdown delay settling
         self.slat_audit_countdown = 0          # Countdown frame audit aktif saat plat di poligon
-        self.slat_audit_window = 4             # Window audit 4 frame optimal saat plat mengisi poligon (sweet spot)
+        self.slat_audit_window = 6             # Window audit 6 frame optimal (sweet spot tepat di tengah poligon, cegah bleed celah gelap)
         self.current_slat_scores = []          # Buffer skor anomali slat aktif
         self.current_slat_samples = []         # Buffer snapshot audit (score, status, raw_frame, ann_frame, bracket_info)
         self.slat_evaluated = False            # Latch vonis selesai untuk slat aktif
@@ -205,12 +205,30 @@ class SideConveyorInspector:
         self.last_ng_frame = -999
         self.latched_ng_info = None
 
+        # Counter Statistik QC Fisik Slat & Defect Breakdown
+        self.slat_ok_count = 0
+        self.slat_ng_count = 0
+        self.bolt_ng_count = 0
+        self.pin_ng_count = 0
+        self.crack_ng_count = 0
+
+        # State vonis & history per slat
+        self.current_slat_bolt_history = []
+        self.current_slat_pin_history = []
+        self.last_final_verdict = "STANDBY"
+        self.last_final_reason = ""
+        self.last_evaluated_slat_id = 0
+        self.verdict_banner_hold_frames = 0
+
         # Statistik Sesi
         self.stats = {
             "total_frames": 0,
             "total_slats": 0,
             "ok_count": 0,
             "ng_count": 0,
+            "bolt_ng": 0,
+            "pin_ng": 0,
+            "crack_ng": 0,
             "invalid_count": 0
         }
 
@@ -238,13 +256,103 @@ class SideConveyorInspector:
         self.last_audit_frame = -999
         self.last_ng_frame = -999
         self.latched_ng_info = None
+
+        # Reset Counter QC Fisik
+        self.slat_ok_count = 0
+        self.slat_ng_count = 0
+        self.bolt_ng_count = 0
+        self.pin_ng_count = 0
+        self.crack_ng_count = 0
+        self.current_slat_bolt_history = []
+        self.current_slat_pin_history = []
+        self.last_final_verdict = "STANDBY"
+        self.last_final_reason = ""
+        self.last_evaluated_slat_id = 0
+        self.verdict_banner_hold_frames = 0
+
         self.stats = {
             "total_frames": 0,
             "total_slats": 0,
             "ok_count": 0,
             "ng_count": 0,
+            "bolt_ng": 0,
+            "pin_ng": 0,
+            "crack_ng": 0,
             "invalid_count": 0
         }
+
+    def _finalize_slat_verdict(self):
+        """
+        Menyelesaikan evaluasi 1 siklus slat fisik secara menyeluruh.
+        Menghitung akumulasi hasil Baut, Pin, dan Crack/Lekukan ke counter QC sesi,
+        serta memicu logging terminal agar pengguna mengetahui kapan status OK/NG terjadi.
+        """
+        if self.slat_evaluated or not self.current_slat_scores or self.slat_cycle_count == 0:
+            return
+
+        self.slat_evaluated = True
+        self.last_evaluated_slat_id = self.slat_cycle_count
+
+        # 1. Vonis Crack / Lekukan (Multi-Sample Persistence Consensus)
+        # Menggunakan skor representatif median dari 3 sampel sweet-spot terbaik (abaikan outlier celah kosong >= 0.905)
+        valid_scores = [sc for sc in self.current_slat_scores if sc < 0.905]
+        if valid_scores:
+            sorted_scores = sorted(valid_scores)
+            best_3 = sorted_scores[:min(3, len(sorted_scores))]
+            rep_score = float(np.median(best_3))
+        elif self.current_slat_scores:
+            rep_score = min(self.current_slat_scores)
+        else:
+            rep_score = 0.0
+
+        self.last_slat_score = rep_score
+        # Retak fisik asli (seperti pada frame 1545-1550) bertahan di multi-frame (>= 2 sampel audit).
+        # Lonjakan sesaat 1 frame akibat transisi celah otomatis disaring sebagai false alarm.
+        high_score_count = sum(1 for sc in valid_scores if sc >= self.custom_patchcore_thresh)
+        crack_status = "NG" if (rep_score >= self.custom_patchcore_thresh and high_score_count >= 2) else "OK"
+        self.last_slat_verdict = crack_status
+
+        # 2. Vonis Baut & Pin selama siklus slat ini
+        bolt_status = "NG" if "NG" in self.current_slat_bolt_history else ("OK" if "OK" in self.current_slat_bolt_history else "EMPTY")
+        pin_status = "NG" if "NG" in self.current_slat_pin_history else ("OK" if "OK" in self.current_slat_pin_history else "EMPTY")
+
+        # 3. Overall Slat Result
+        is_bolt_ng = (bolt_status == "NG")
+        is_pin_ng = (pin_status == "NG")
+        is_crack_ng = (crack_status == "NG")
+        is_ng = (is_bolt_ng or is_pin_ng or is_crack_ng)
+
+        slat_verdict = "NG" if is_ng else "OK"
+        self.last_final_verdict = slat_verdict
+        self.verdict_banner_hold_frames = 35  # Tampilkan banner pop-up hasil selama ~35 frame (~1.2 detik)
+
+        # 4. Update Akumulator Statistik Fisik (1 Slat = 1 Hitungan Pasti)
+        reasons = []
+        if is_bolt_ng:
+            self.bolt_ng_count += 1
+            reasons.append("BOLT NG")
+        if is_pin_ng:
+            self.pin_ng_count += 1
+            reasons.append("PIN NG")
+        if is_crack_ng:
+            self.crack_ng_count += 1
+            reasons.append(f"CRACK NG ({rep_score:.3f})")
+
+        if is_ng:
+            self.slat_ng_count += 1
+            self.last_final_reason = " + ".join(reasons)
+            print(f"\n[{self.camera_id} SIDE] ❌ SLAT #{self.slat_cycle_count} -> [NG : {self.last_final_reason}] | Skor Crack: {rep_score:.4f} | Total: {self.slat_cycle_count} (OK: {self.slat_ok_count}, NG: {self.slat_ng_count})")
+        else:
+            self.slat_ok_count += 1
+            self.last_final_reason = "SEMUA OK"
+            print(f"\n[{self.camera_id} SIDE] ✅ SLAT #{self.slat_cycle_count} -> [OK] | Skor Crack: {rep_score:.4f} | Total: {self.slat_cycle_count} (OK: {self.slat_ok_count}, NG: {self.slat_ng_count})")
+
+        self.stats["total_slats"] = self.slat_cycle_count
+        self.stats["ok_count"] = self.slat_ok_count
+        self.stats["ng_count"] = self.slat_ng_count
+        self.stats["bolt_ng"] = self.bolt_ng_count
+        self.stats["pin_ng"] = self.pin_ng_count
+        self.stats["crack_ng"] = self.crack_ng_count
 
     def toggle_db(self):
         """Membalik status saklar database logging & Teams notification (ON <-> OFF)."""
@@ -366,8 +474,8 @@ class SideConveyorInspector:
 
         # 1. Gambar Batas Master ROI (Zona Kuning - YOLO)
         cv2.rectangle(display_frame, (rx1, ry1), (rx2, ry2), (0, 230, 255), 2)
-        cv2.putText(display_frame, f"MASTER ROI ({self.side})", (rx1 + 5, max(20, ry1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 230, 255), 2)
+        cv2.putText(display_frame, f"MASTER ROI ({self.side})", (rx1 + 8, max(28, ry1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 230, 255), 2, cv2.LINE_AA)
 
         # 2. Jalankan Deteksi Baut & Pin pada Master ROI via YOLO
         det_res = self.bolt_pin_detector.detect(frame, roi=(rx1, ry1, rx2, ry2))
@@ -392,6 +500,13 @@ class SideConveyorInspector:
             if pair["pin"] is not None and pair["pin"]["is_ng"]:
                 pin_verdict = "NG"
 
+        # Akumulasi histori kondisi fisik baut & pin selama plat aktif melintas di gerbang
+        if self.photocell_state:
+            if bolt_verdict in ["OK", "NG"]:
+                self.current_slat_bolt_history.append(bolt_verdict)
+            if pin_verdict in ["OK", "NG"]:
+                self.current_slat_pin_history.append(pin_verdict)
+
         # Visualisasi Baut & Pin
         for pair in pairs:
             b = pair["bolt"]
@@ -401,15 +516,15 @@ class SideConveyorInspector:
             b_color = (0, 0, 255) if b["is_ng"] else (255, 180, 0)
             cv2.rectangle(display_frame, (bx_1, by_1), (bx_2, by_2), b_color, 2)
             cv2.putText(display_frame, f"{b['class_name']} {b['confidence']:.2f}",
-                        (bx_1, max(15, by_1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, b_color, 2)
+                        (bx_1, max(22, by_1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.68, b_color, 2, cv2.LINE_AA)
 
             if p is not None:
                 px1, py1, px2, py2 = p["box"]
                 p_color = (0, 0, 255) if p["is_ng"] else (0, 255, 128)
                 cv2.rectangle(display_frame, (px1, py1), (px2, py2), p_color, 2)
                 cv2.putText(display_frame, f"{p['class_name']}",
-                            (px1, max(15, py1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, p_color, 1)
-                cv2.line(display_frame, b["centroid"], p["centroid"], (255, 255, 0), 1)
+                            (px1, max(22, py1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.62, p_color, 2, cv2.LINE_AA)
+                cv2.line(display_frame, b["centroid"], p["centroid"], (255, 255, 0), 2)
 
         # 3. Virtual Photocell / Optical Probe (Sensor Kehadiran Pelat Slat di Gerbang Masuk Poligon)
         # Menghitung koordinat adaptif sensor probe tepat di area masuk / leher poligon braket
@@ -464,6 +579,8 @@ class SideConveyorInspector:
                             self.slat_audit_countdown = self.slat_audit_window
                             self.current_slat_scores = []
                             self.current_slat_samples = []
+                            self.current_slat_bolt_history = []
+                            self.current_slat_pin_history = []
                             self.slat_evaluated = False
                             self.sweet_spot_sample = None
                             self.last_slat_verdict = "WAIT"
@@ -491,20 +608,7 @@ class SideConveyorInspector:
                     # FALLING EDGE TERKONFIRMASI: Pelat sah meninggalkan gerbang menuju gap antar slat
                     self.slat_settling_countdown = 0
                     self.slat_audit_countdown = 0
-                    if self.current_slat_scores and not self.slat_evaluated:
-                        # Evaluasi skor: kebal terhadap frame drop (Anti False-OK)
-                        if len(self.current_slat_scores) >= self.min_audit_samples_required:
-                            rep_score = min(self.current_slat_scores)
-                            self.last_slat_score = rep_score
-                            self.last_slat_verdict = "NG" if rep_score >= self.custom_patchcore_thresh else "OK"
-                        elif len(self.current_slat_scores) == 1:
-                            # Kompensasi frame drop / lag: tetap evaluasi sampel tunggal agar NG tidak terlewat
-                            rep_score = self.current_slat_scores[0]
-                            self.last_slat_score = rep_score
-                            self.last_slat_verdict = "NG" if rep_score >= self.custom_patchcore_thresh else "OK"
-                        else:
-                            self.last_slat_verdict = "WAIT"
-                        self.slat_evaluated = True
+                    self._finalize_slat_verdict()
             else:
                 self.consecutive_gap_frames = 0
 
@@ -516,13 +620,24 @@ class SideConveyorInspector:
         cv2.circle(display_frame, (px1, py), 4, beam_color, -1)
         cv2.circle(display_frame, (px2, py), 4, beam_color, -1)
         sensor_status_text = f"PHOTOCELL: {'ON [PLAT]' if is_plate_present else 'OFF [GAP]'} ({beam_val:.1f})"
-        cv2.putText(display_frame, sensor_status_text, (px1 - 20, max(15, py - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, beam_color, 1)
+        cv2.putText(display_frame, sensor_status_text, (px1 - 25, max(22, py - 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, beam_color, 2, cv2.LINE_AA)
 
         # 4. Pemicuan & Audit Inspeksi Lekukan Plat (PADA POLIGON DIAM MASKED)
         inspected_bracket_info = None
 
-        if is_plate_present and crop_poly is not None and crop_poly.size > 0:
+        # Evaluasi kecerahan dalam poligon untuk membedakan plat baja vs celah gelap konveyor
+        poly_brightness = 0.0
+        if crop_poly is not None and crop_poly.size > 0:
+            p_gray = cv2.cvtColor(crop_poly, cv2.COLOR_BGR2GRAY)
+            p_valid = p_gray[crop_mask > 0] if crop_mask is not None and crop_mask.size > 0 else p_gray[p_gray > 5]
+            if p_valid.size > 0:
+                poly_brightness = float(np.mean(p_valid))
+
+        # Celah gelap terdeteksi jika beam photocell jatuh di bawah thresh_low ATAU poligon diisi celah gelap (< 48.0)
+        is_gap_detected = (beam_val < self.photocell_thresh_low) or (poly_brightness < 48.0)
+
+        if is_plate_present and self.slat_cycle_count > 0 and not is_gap_detected and crop_poly is not None and crop_poly.size > 0:
             if self.slat_settling_countdown > 0:
                 self.slat_settling_countdown -= 1
                 lekukan_verdict = "WAIT"
@@ -555,9 +670,9 @@ class SideConveyorInspector:
                 for p_pt in pts_px:
                     cv2.circle(sample_ann_frame, (int(p_pt[0]), int(p_pt[1])), 5, (0, 255, 255), -1)
                     cv2.circle(sample_ann_frame, (int(p_pt[0]), int(p_pt[1])), 7, (0, 0, 0), 1)
-                cv2.rectangle(sample_ann_frame, (bx, max(0, by - 24)), (bx + 280, by), (20, 20, 20), -1)
+                cv2.rectangle(sample_ann_frame, (bx, max(0, by - 36)), (bx + 380, by), (20, 20, 20), -1)
                 cv2.putText(sample_ann_frame, f"BRACKET CRACK: {raw_status} [{raw_score:.3f}]",
-                            (bx + 5, max(16, by - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, sample_color, 2)
+                            (bx + 8, max(24, by - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.72, sample_color, 2, cv2.LINE_AA)
 
                 self.current_slat_samples.append({
                     "score": raw_score,
@@ -575,24 +690,21 @@ class SideConveyorInspector:
                 lek_color = (0, 0, 255) if raw_status == "NG" else (0, 255, 0)
                 label_text = f"BRACKET CRACK: {raw_status} [{raw_score:.3f}] (AUDIT)"
             else:
-                # Slat masih melintas setelah window audit selesai -> Tampilkan hasil slat ini
-                if self.current_slat_scores and not self.slat_evaluated:
-                    rep_score = min(self.current_slat_scores)
-                    self.last_slat_score = rep_score
-                    self.last_slat_verdict = "NG" if rep_score >= self.custom_patchcore_thresh else "OK"
-                    self.slat_evaluated = True
-
+                # Slat masih melintas setelah window audit selesai -> Finalisasi vonis slat ini
+                self._finalize_slat_verdict()
                 lekukan_verdict = self.last_slat_verdict
                 lek_color = (0, 0, 255) if lekukan_verdict == "NG" else (0, 255, 0)
                 label_text = f"BRACKET CRACK: {lekukan_verdict} [{self.last_slat_score:.3f}]"
+        elif is_plate_present and is_gap_detected:
+            # Plat telah melewati poligon dan celah gelap terdeteksi -> Hentikan audit seketika
+            self.slat_audit_countdown = 0
+            self._finalize_slat_verdict()
+            lekukan_verdict = self.last_slat_verdict
+            lek_color = (0, 0, 255) if lekukan_verdict == "NG" else (0, 255, 0)
+            label_text = f"BRACKET CRACK: {lekukan_verdict} [{self.last_slat_score:.3f}]"
         else:
-            # Di luar gerbang (celah transisi antar slat) -> Tahan hasil slat terakhir
-            if self.current_slat_scores and not self.slat_evaluated:
-                rep_score = min(self.current_slat_scores)
-                self.last_slat_score = rep_score
-                self.last_slat_verdict = "NG" if rep_score >= self.custom_patchcore_thresh else "OK"
-                self.slat_evaluated = True
-
+            # Di luar gerbang (celah transisi antar slat) -> Finalisasi jika ada yang tertahan
+            self._finalize_slat_verdict()
             recent_audit = (self.last_bracket_info is not None and 
                             (self.stats["total_frames"] - self.last_audit_frame) < 25)
             if recent_audit and self.last_slat_verdict != "WAIT":
@@ -612,10 +724,11 @@ class SideConveyorInspector:
             cv2.circle(display_frame, (int(p[0]), int(p[1])), 5, (0, 255, 255), -1)
             cv2.circle(display_frame, (int(p[0]), int(p[1])), 7, (0, 0, 0), 1)
 
-        # Badge Label di atas Poligon
-        cv2.rectangle(display_frame, (bx, max(0, by - 24)), (bx + 280, by), (20, 20, 20), -1)
-        cv2.putText(display_frame, label_text, (bx + 5, max(16, by - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, lek_color, 2)
+        # Badge Label di atas Poligon (DIBESARKAN)
+        b_w = max(380, len(label_text) * 13 + 20)
+        cv2.rectangle(display_frame, (bx, max(0, by - 36)), (bx + b_w, by), (20, 20, 20), -1)
+        cv2.putText(display_frame, label_text, (bx + 8, max(24, by - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, lek_color, 2, cv2.LINE_AA)
 
         # 4. Tentukan Overall Verdict Sisi Ini
         # Prioritas visual live: NG > INVALID > OK > WAIT
@@ -654,24 +767,18 @@ class SideConveyorInspector:
             self.last_emit_frame = current_f
             should_emit = True
 
-            # Ambil sampel sweet-spot terbaik (frame di mana braket terpusat optimal pada poligon, bukan trailing-edge keluar)
-            sweet_idx = len(self.current_slat_samples) // 2
-            best_sample = self.current_slat_samples[sweet_idx]
-            for s in self.current_slat_samples:
-                if abs(s.get("score", 0.0) - self.last_slat_score) < 1e-4:
-                    best_sample = s
-                    break
+            # Ambil sampel sweet-spot terbaik (frame valid terdekat dengan rep_score / sweet-spot, BUKAN celah kosong > 0.905)
+            valid_samples = [s for s in self.current_slat_samples if s.get("score", 1.0) < 0.905]
+            if valid_samples:
+                best_sample = min(valid_samples, key=lambda s: abs(s.get("score", 0.0) - self.last_slat_score))
+            else:
+                best_sample = self.current_slat_samples[0]
             emit_raw = best_sample.get("raw_frame", frame)
             emit_ann = best_sample.get("ann_frame", display_frame)
 
-        # Update Statistik jika ada inspeksi aktif
-        if overall_side in ["OK", "NG", "INVALID"]:
-            if overall_side == "OK":
-                self.stats["ok_count"] += 1
-            elif overall_side == "NG":
-                self.stats["ng_count"] += 1
-            else:
-                self.stats["invalid_count"] += 1
+        # Kurangi durasi hold banner hasil pop-up
+        if self.verdict_banner_hold_frames > 0:
+            self.verdict_banner_hold_frames -= 1
 
         # 5. Format Payload Sesuai Standar PRD
         payload = {
@@ -687,7 +794,18 @@ class SideConveyorInspector:
                 {"name": "PIN", "result": pin_verdict},
                 {"name": "LEKUKAN", "result": lekukan_verdict}
             ],
-            "bracket_details": inspected_bracket_info or self.last_bracket_info
+            "bracket_details": inspected_bracket_info or self.last_bracket_info,
+            "qc_stats": {
+                "total_slats": self.slat_cycle_count,
+                "ok_count": self.slat_ok_count,
+                "ng_count": self.slat_ng_count,
+                "bolt_ng": self.bolt_ng_count,
+                "pin_ng": self.pin_ng_count,
+                "crack_ng": self.crack_ng_count,
+                "last_slat_id": self.last_evaluated_slat_id,
+                "last_verdict": self.last_final_verdict,
+                "last_reason": self.last_final_reason
+            }
         }
 
         # 6. Gambar HUD Panel Atas
@@ -700,7 +818,7 @@ class SideConveyorInspector:
                 pip_w, pip_h = 160, 160
                 pip_resized = cv2.resize(ov, (pip_w, pip_h))
                 px1 = max(0, w_frame - pip_w - 20)
-                py1 = 85
+                py1 = 95
                 px2 = px1 + pip_w
                 py2 = py1 + pip_h
                 display_frame[py1:py2, px1:px2] = pip_resized
@@ -713,30 +831,68 @@ class SideConveyorInspector:
         return display_frame, payload
 
     def _draw_hud(self, img, payload):
-        """Menggambar banner status HUD di bagian atas layar."""
+        """Menggambar banner status HUD & QC Counter komprehensif di bagian atas layar."""
         h, w = img.shape[:2]
-        hud_h = 75
+        hud_h = 115  # Dinaikkan dari 85 ke 115 agar proporsional dan teks jauh lebih besar
         if h >= hud_h and w > 0:
             sub = img[0:hud_h, 0:w]
-            dark = np.full_like(sub, 25)
-            cv2.addWeighted(dark, 0.85, sub, 0.15, 0, sub)
+            dark = np.full_like(sub, 22)
+            cv2.addWeighted(dark, 0.88, sub, 0.12, 0, sub)
+            cv2.line(img, (0, hud_h), (w, hud_h), (55, 55, 55), 2)
 
-        res = payload["overall_result"]
-        res_color = (0, 255, 0) if res == "OK" else ((0, 0, 255) if res == "NG" else (0, 200, 255))
+        # 1. Judul & Identitas Kamera (DIBESARKAN)
+        cv2.putText(img, f"SIDE CONVEYOR INSPECTION [{self.camera_id} - {self.side}]",
+                    (15, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
 
-        # Judul & Status Utama
-        cv2.putText(img, f"CONVEYOR SIDE INSPECTION [{self.camera_id} - {self.side}]",
-                    (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-        cv2.putText(img, f"STATUS: {res}", (15, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, res_color, 2)
+        # 2. Status Badge Utama (Pop-up Indikator Kapan OK dan Kapan NG Terdeteksi - DIBESARKAN)
+        badge_y1 = 46
+        badge_y2 = 100
+        if self.verdict_banner_hold_frames > 0:
+            is_ng = (self.last_final_verdict == "NG")
+            badge_col = (0, 0, 255) if is_ng else (0, 210, 0)
+            badge_txt = f"SLAT #{self.last_evaluated_slat_id} [{self.last_final_verdict}]: {self.last_final_reason}"
+            t_w = max(340, len(badge_txt) * 14 + 30)
+            cv2.rectangle(img, (12, badge_y1), (12 + t_w, badge_y2), badge_col, -1)
+            cv2.putText(img, badge_txt, (22, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.82, (255, 255, 255), 2, cv2.LINE_AA)
+        elif self.photocell_state:
+            cv2.rectangle(img, (12, badge_y1), (380, badge_y2), (0, 140, 255), -1)
+            cv2.putText(img, f"SLAT #{self.slat_cycle_count}: [AUDITING...]", (22, 84),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.80, (255, 255, 255), 2, cv2.LINE_AA)
+        else:
+            cv2.rectangle(img, (12, badge_y1), (350, badge_y2), (45, 45, 45), -1)
+            cv2.putText(img, "STATUS: [STANDBY GAP]", (22, 84),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 180, 180), 2, cv2.LINE_AA)
 
-        # Rincian Komponen
-        c_x = int(w * 0.45)
-        for c in payload["components"]:
-            c_col = (0, 255, 0) if c["result"] == "OK" else ((0, 0, 255) if c["result"] == "NG" else (180, 180, 180))
-            txt = f"{c['name']}: {c['result']}"
-            cv2.putText(img, txt, (c_x, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.65, c_col, 2)
-            c_x += 160
+        # 3. Rincian Komponen Aktif (Center Zone - DIBESARKAN)
+        c_x = max(420, int(w * 0.35))
+        for c in payload.get("components", []):
+            res_val = c.get("result", "EMPTY")
+            c_col = (0, 240, 0) if res_val == "OK" else ((0, 0, 255) if res_val == "NG" else (170, 170, 170))
+            name_txt = c.get("name", "")
+            if name_txt == "LEKUKAN" and self.last_bracket_info:
+                txt = f"CRACK: {res_val} [{self.last_bracket_info.get('score', 0.0):.3f}]"
+            else:
+                txt = f"{name_txt}: {res_val}"
+            cv2.putText(img, txt, (c_x, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.72, c_col, 2, cv2.LINE_AA)
+            c_x += 220
+
+        # 4. Box Statistik QC Penghitung Hasil Deteksi (Kanan Layar - DIBESARKAN)
+        box_w = 440
+        box_x = max(c_x + 10, w - box_w - 20)
+        # Baris 1: Total Slat, Total OK, Total NG
+        cv2.putText(img, f"TOTAL: {self.slat_cycle_count}", (box_x, 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.80, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, f"OK: {self.slat_ok_count}", (box_x + 155, 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(img, f"NG: {self.slat_ng_count}", (box_x + 295, 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 255), 2, cv2.LINE_AA)
+        # Baris 2: Breakdown Jenis NG
+        detail_txt = f"NG -> Baut:{self.bolt_ng_count} | Pin:{self.pin_ng_count} | Crack:{self.crack_ng_count}"
+        cv2.putText(img, detail_txt, (box_x, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 220, 255), 2, cv2.LINE_AA)
+        rate = (self.slat_ok_count / self.slat_cycle_count * 100.0) if self.slat_cycle_count > 0 else 100.0
+        cv2.putText(img, f"PASS RATE: {rate:.1f}%", (box_x, 98),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (200, 200, 200), 2, cv2.LINE_AA)
 
 
 def select_video_file(initial_dir=None, title="Pilih File Video Inspeksi"):
@@ -753,6 +909,7 @@ def select_video_file(initial_dir=None, title="Pilih File Video Inspeksi"):
         root.attributes("-topmost", True)  # Pastikan dialog selalu berada di depan
 
         default_dir = initial_dir
+        if not default_dir or not os.path.exists(default_dir):
             candidate_dirs = [
                 os.path.abspath(os.path.join(base_dir, "..", "Video_Testing")),
                 os.path.abspath(os.path.join(base_dir, "..", "..", "Video_Testing")),

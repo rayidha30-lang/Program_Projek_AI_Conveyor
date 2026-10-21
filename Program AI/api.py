@@ -358,6 +358,8 @@ def get_inspections():
                 "maintenanceNote": note or "",
                 "pvFlatness": float(pv) if pv is not None else None,
                 "maxDeviation": float(dev) if dev is not None else None,
+                "pvFlatnessMm": round(float(pv) * 0.82, 1) if pv is not None else None,
+                "maxDeviationMm": round(float(dev) * 0.82, 1) if dev is not None else None,
                 "rawImagePath": raw_path,
                 "annotatedPath": ann_path,
                 "rawImageUrl": f"/api/image?path={raw_path}" if raw_path else None,
@@ -403,7 +405,9 @@ def get_evidence():
                 d.StatusDetail,
                 d.Confidence,
                 d.RawImagePath,
-                d.AnnotatedPath
+                d.AnnotatedPath,
+                d.PVFlatness,
+                d.MaxDeviation
             FROM Inspections i
             INNER JOIN Inspection_Detections d ON i.InspectionID = d.InspectionID
             WHERE d.Result = 'NG'
@@ -430,6 +434,8 @@ def get_evidence():
             conf = r[12]
             raw_path = r[13]
             ann_path = r[14]
+            pv = r[15] if len(r) > 15 else None
+            dev = r[16] if len(r) > 16 else None
 
             time_str = insp_time.strftime("%H:%M:%S WIB") if insp_time else ""
             date_str = insp_time.strftime("%Y-%m-%d") if insp_time else ""
@@ -474,6 +480,10 @@ def get_evidence():
                 "statusLifecycle": status_life,
                 "picName": pic or "",
                 "maintenanceNote": note or "",
+                "pvFlatness": float(pv) if pv is not None else None,
+                "maxDeviation": float(dev) if dev is not None else None,
+                "pvFlatnessMm": round(float(pv) * 0.82, 1) if pv is not None else None,
+                "maxDeviationMm": round(float(dev) * 0.82, 1) if dev is not None else None,
                 "rawImagePath": raw_to_serve,
                 "annotatedPath": img_to_serve,
                 "imageUrl": f"http://localhost:5000/api/image?path={img_to_serve}" if img_to_serve else None

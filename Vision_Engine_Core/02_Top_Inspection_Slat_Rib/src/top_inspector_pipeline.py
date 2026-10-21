@@ -299,8 +299,8 @@ class TopConveyorInspector:
 
         # Indikator jika mode simulasi bending aktif
         if self.simulate_bending:
-            cv2.rectangle(display_frame, (15, 82), (480, 110), (0, 0, 180), -1)
-            cv2.putText(display_frame, "[!] TEST MODE: BENDING DEFECT SIMULATOR (+22px)", (20, 102),
+            cv2.rectangle(display_frame, (15, 82), (540, 110), (0, 0, 180), -1)
+            cv2.putText(display_frame, "[!] TEST MODE: BENDING DEFECT SIMULATOR (+18.0mm / +22px)", (20, 102),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
 
         # 6. Gambar Mini PIP Live Graphs di Pojok Kanan Atas
@@ -408,6 +408,7 @@ def select_video_file(initial_dir=None, title="Pilih File Video Top Inspection")
         root.attributes("-topmost", True)
 
         default_dir = initial_dir
+        if not default_dir or not os.path.exists(default_dir):
             candidate_dirs = [
                 os.path.abspath(os.path.join(CURRENT_DIR, "..", "Video_Testing")),
                 os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", "Video_Testing")),

@@ -131,6 +131,7 @@ class HoughStitchingInspector:
         self.min_continuity_cov = 0.25    # Rasio kontinuitas celah minimum (25% dari bentang metal 500 px)
         self.max_center_void = 1450       # px: Batas luas celah terbuka (void gap) akibat plat meleyot
         self.tracked_y_seam = 70.0        # px: Pelacakan kontinu horizon celah plat
+        self.scale_factor_mm_per_px = 0.82  # Faktor skala fisik konveyor (Ground Truth: 820mm / 1000px = 0.82 mm/px)
 
         # Mini Trigger Zone Baut Rantai Samping (Anchor Pemicu Celah Slat)
         self.use_bolt_trigger = False
@@ -451,7 +452,7 @@ class HoughStitchingInspector:
         xs = np.arange(240, 680)
         w_span = len(xs)
 
-        band = 26
+        band = 18 if (self.slat_active and abs(self.tracked_y_seam - 70.0) < 30) else 26
         y_lo = max(0, y_seam - band)
         y_hi = min(h, y_seam + band)
         sub_edges = edges[y_lo:y_hi, 240:680]
@@ -472,6 +473,19 @@ class HoughStitchingInspector:
 
         min_cost1 = np.min(cost1, axis=0)
         best_pts1 = np.argmin(cost1, axis=0).astype(np.float32)
+
+        # Sub-pixel Parabolic Refinement Tahap 1 (O(1) Vectorized - Presisi < 0.1 mm)
+        if cost1.shape[0] >= 3:
+            idx_int1 = np.clip(best_pts1.astype(np.int32), 1, cost1.shape[0] - 2)
+            cols1 = np.arange(cost1.shape[1])
+            c_prev1 = cost1[idx_int1 - 1, cols1]
+            c_curr1 = cost1[idx_int1, cols1]
+            c_next1 = cost1[idx_int1 + 1, cols1]
+            denom1 = 2.0 * (c_prev1 - 2.0 * c_curr1 + c_next1)
+            sub_shift1 = np.where(np.abs(denom1) > 1e-4, (c_prev1 - c_next1) / denom1, 0.0)
+            sub_shift1 = np.clip(sub_shift1, -0.5, 0.5)
+            best_pts1 = best_pts1 + sub_shift1
+
         valid_mask1 = (min_cost1 < 1e5) & (np.abs(best_pts1 - nom) <= 12.0)
 
         raw_ys = np.where(valid_mask1, y_lo + best_pts1, np.nan)
@@ -521,6 +535,19 @@ class HoughStitchingInspector:
 
                 min_cost3 = np.min(cost3, axis=0)
                 best_pts3 = np.argmin(cost3, axis=0).astype(np.float32)
+
+                # Sub-pixel Parabolic Refinement Tahap 3 (O(1) Vectorized - Presisi < 0.1 mm)
+                if cost3.shape[0] >= 3:
+                    idx_int3 = np.clip(best_pts3.astype(np.int32), 1, cost3.shape[0] - 2)
+                    cols3 = np.arange(cost3.shape[1])
+                    c_prev3 = cost3[idx_int3 - 1, cols3]
+                    c_curr3 = cost3[idx_int3, cols3]
+                    c_next3 = cost3[idx_int3 + 1, cols3]
+                    denom3 = 2.0 * (c_prev3 - 2.0 * c_curr3 + c_next3)
+                    sub_shift3 = np.where(np.abs(denom3) > 1e-4, (c_prev3 - c_next3) / denom3, 0.0)
+                    sub_shift3 = np.clip(sub_shift3, -0.5, 0.5)
+                    best_pts3 = best_pts3 + sub_shift3
+
                 valid_mask3 = (min_cost3 < 1e5) & (np.abs(best_pts3 - nom_x) <= 6.5)
 
                 raw_ys = np.where(valid_mask3, y_lo + best_pts3, np.nan)
@@ -993,8 +1020,9 @@ class HoughStitchingInspector:
             cv2.circle(annotated, (int(xs[mid_idx]), int(ys[mid_idx])), 6, (0, 255, 255), -1)
 
             # Pill Badge Metrologi di Atas Kontur
-            lbl_metro = f"METROLOGI: Flatness PV={pv:.1f}px | Sagitta={sagitta:.1f}px | Cov={cov*100:.0f}%"
-            pill_w = 400
+            scale = getattr(self, "scale_factor_mm_per_px", 0.82)
+            lbl_metro = f"METROLOGI: PV={pv*scale:.1f}mm ({pv:.1f}px) | Sag={sagitta*scale:.1f}mm ({sagitta:.1f}px) | Cov={cov*100:.0f}%"
+            pill_w = 490
             pill_h = 24
             pill_x1 = max(10, min(self.canonical_w - pill_w - 10, int(xs[mid_idx]) - (pill_w // 2)))
             pill_y1 = max(6, min(self.canonical_h - pill_h - 6, y_seam - 32))
@@ -1004,7 +1032,7 @@ class HoughStitchingInspector:
             cv2.rectangle(annotated, (pill_x1, pill_y1), (pill_x2, pill_y2), (18, 18, 22), -1)
             cv2.rectangle(annotated, (pill_x1, pill_y1), (pill_x2, pill_y2), c_seam, 2)
             cv2.putText(annotated, lbl_metro, (pill_x1 + 10, pill_y1 + 17),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.41, (255, 255, 255), 1, cv2.LINE_AA)
 
         # 4. Gambar Batas Bentang Metal Konveyor (x=180 dan x=820)
         cv2.line(annotated, (180, 0), (180, self.canonical_h - 1), (80, 80, 100), 1, cv2.LINE_4)
@@ -1054,9 +1082,12 @@ class HoughStitchingInspector:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 220, 255), 1, cv2.LINE_AA)
 
         # Bar 1: Flatness (Peak-to-Valley Deviation)
+        scale = getattr(self, "scale_factor_mm_per_px", 0.82)
+        pv_mm = pv * scale
+        max_pv_mm = self.max_flatness_pv * scale
         pv_col = (0, 220, 0) if pv <= self.max_flatness_pv else (0, 40, 255)
-        cv2.putText(hud, f"Flatness PV : {pv:4.1f} px  (Maks: {self.max_flatness_pv:.1f} px)", (222, 54),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (240, 240, 240), 1, cv2.LINE_AA)
+        cv2.putText(hud, f"Flatness PV : {pv_mm:4.1f} mm ({pv:.1f} px) [Maks: {max_pv_mm:.1f} mm ({self.max_flatness_pv:.1f} px)]", (222, 54),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.41, (240, 240, 240), 1, cv2.LINE_AA)
         
         # Gauge bar Flatness
         gx1, gy1, gx2, gy2 = 475, 42, 675, 56
@@ -1071,8 +1102,10 @@ class HoughStitchingInspector:
 
         # Bar 2: Kelengkungan Parabola (Sagitta)
         sag_col = (0, 220, 0) if sagitta <= self.max_sagitta else (0, 40, 255)
-        cv2.putText(hud, f"Sagitta Curv: {sagitta:4.1f} px  (Maks: {self.max_sagitta:.1f} px)", (222, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (240, 240, 240), 1, cv2.LINE_AA)
+        sag_mm = sagitta * scale
+        max_sag_mm = self.max_sagitta * scale
+        cv2.putText(hud, f"Sagitta Curv: {sag_mm:4.1f} mm ({sagitta:.1f} px) [Maks: {max_sag_mm:.1f} mm ({self.max_sagitta:.1f} px)]", (222, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.41, (240, 240, 240), 1, cv2.LINE_AA)
         
         # Gauge bar Sagitta
         sy1, sy2 = 68, 82
@@ -1086,8 +1119,10 @@ class HoughStitchingInspector:
 
         # Baris 3: Kontinuitas & Deviasi Maksimum
         cov_col = (0, 220, 0) if cov >= self.min_continuity_cov else (0, 165, 255)
-        cv2.putText(hud, f"Kontinuitas Celah: {cov*100:.1f}% (Min {self.min_continuity_cov*100:.0f}%) | Max Deviasi: {max_dev:.1f} px | Celah: {l_seam:.0f} px",
-                    (222, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.41, (190, 215, 235), 1, cv2.LINE_AA)
+        max_dev_mm = max_dev * scale
+        l_seam_mm = l_seam * scale
+        cv2.putText(hud, f"Kontinuitas Celah: {cov*100:.1f}% (Min {self.min_continuity_cov*100:.0f}%) | Max Dev: {max_dev_mm:.1f} mm ({max_dev:.1f} px) | Celah: {l_seam_mm:.0f} mm ({l_seam:.0f} px)",
+                    (222, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (190, 215, 235), 1, cv2.LINE_AA)
 
         # Baris 4: Deskripsi Diagnosa
         if status == "HOLD" or not results.get("is_conveyor_moving", True):

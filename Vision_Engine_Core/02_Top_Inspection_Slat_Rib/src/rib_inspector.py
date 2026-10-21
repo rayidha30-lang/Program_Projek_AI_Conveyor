@@ -440,7 +440,7 @@ class RibInspector:
         col = (0, 0, 255) if is_ng else (0, 255, 0)
         mode_label = "TWO-END ANCHOR"
         cv2.putText(graph, f"PROFIL KELURUSAN SIRIP ({mode_label})", (8, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (220, 220, 220), 1)
-        cv2.putText(graph, f"PV: {pv:.1f} px (Max: {self.pv_threshold:.1f} px)", (8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1)
+        cv2.putText(graph, f"PV: {pv*0.82:.1f} mm ({pv:.1f} px) [Maks: {self.pv_threshold*0.82:.1f} mm ({self.pv_threshold:.1f} px)]", (8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.36, col, 1)
 
         pad_x, pad_y = 15, 42
         pw, ph = w - 2 * pad_x, h - pad_y - 12

@@ -338,6 +338,7 @@ class CombinedTopInspector:
                 max_sag_slat = float(th.get("max_sagitta", max_sag_slat))
                 max_void_slat = int(th.get("max_center_void", max_void_slat))
                 min_cov_slat = float(th.get("min_continuity_cov", min_cov_slat))
+                self.scale_factor_mm_per_px = float(th.get("scale_factor_mm_per_px", 0.82))
 
                 rib_pv = float(th.get("rib_pv_threshold", rib_pv))
                 rib_sag = float(th.get("rib_sagitta_threshold", rib_sag))
@@ -368,6 +369,9 @@ class CombinedTopInspector:
         self.slat_inspector.max_sagitta = max_sag_slat
         self.slat_inspector.max_center_void = max_void_slat
         self.slat_inspector.min_continuity_cov = min_cov_slat
+        if not hasattr(self, "scale_factor_mm_per_px"):
+            self.scale_factor_mm_per_px = 0.82
+        self.slat_inspector.scale_factor_mm_per_px = self.scale_factor_mm_per_px
 
         # Inisialisasi Engine Sirip (HybridRibInspector dengan akselerasi CUDA / CPU)
         self.rib_inspector = HybridRibInspector(
@@ -380,15 +384,21 @@ class CombinedTopInspector:
             tip_thresh=rib_tip,
             device=device
         )
+        self.rib_inspector.scale_factor_mm_per_px = self.scale_factor_mm_per_px
 
         # State Early-Catch & Peak-Hold Latch (Proteksi Oklusi Plat Sebelum Sirip)
         self.slat_history_samples = []
         self.latched_slat_data = None
         self.latched_hold_frames = 0
 
-        # Single-Capture Per-Object Latch (Anti Multi-Capture Spam)
+        # Single-Capture Per-Object Latch & Best-Shot Peak Buffer
         self.logged_slat_id = None
         self.logged_rib_id = None
+        self._best_top_candidate = None
+        self._current_slat_cycle_id = None
+        self._current_rib_cycle_id = None
+        self._last_emitted_slat_id = None
+        self._last_emitted_rib_id = None
 
         # Cache batas vertikal gerbang plat slat
         self.slat_y_min = None
@@ -406,6 +416,11 @@ class CombinedTopInspector:
         self.latched_hold_frames = 0
         self.logged_slat_id = None
         self.logged_rib_id = None
+        self._best_top_candidate = None
+        self._current_slat_cycle_id = None
+        self._current_rib_cycle_id = None
+        self._last_emitted_slat_id = None
+        self._last_emitted_rib_id = None
         if self.db_bridge is not None and hasattr(self.db_bridge, "reset_entity_cache"):
             self.db_bridge.reset_entity_cache()
 
@@ -421,11 +436,150 @@ class CombinedTopInspector:
             return self.db_bridge.is_enabled()
         return False
 
+    def render_annotated_fullres(self, frame_raw, inspect_res, slat_no=None, rib_no=None):
+        """
+        Merender anotasi metrologi langsung pada citra resolusi penuh frame asli (misal 1080p).
+        Digunakan khusus untuk capture bukti NG sehingga gambar tajam saat dibuka di Web Dashboard & Teams.
+        """
+        if frame_raw is None:
+            return None
+        ann = frame_raw.copy()
+        h_f, w_f = ann.shape[:2]
+
+        slat_res = inspect_res.get("slat_res", {}) if inspect_res else {}
+        rib_res = inspect_res.get("rib_res", {}) if inspect_res else {}
+        scale = getattr(self, "scale_factor_mm_per_px", 0.82)
+
+        # 1. Gambar Polygon Gerbang Slat jika ada
+        if self.slat_polygon is not None and len(self.slat_polygon) >= 3:
+            pts_px = []
+            for p in self.slat_polygon:
+                px = int(p[0] * w_f if p[0] <= 1.0 else p[0])
+                py = int(p[1] * h_f if p[1] <= 1.0 else p[1])
+                pts_px.append([px, py])
+            pts_arr = np.array(pts_px, dtype=np.int32).reshape((-1, 1, 2))
+            is_slat_ng = bool(slat_res.get("is_ng", False))
+            poly_col = (0, 0, 255) if is_slat_ng else (0, 220, 0)
+            cv2.polylines(ann, [pts_arr], True, poly_col, 3, cv2.LINE_AA)
+            cv2.putText(ann, f"GERBANG SLAT #{slat_no if slat_no is not None else ''}",
+                        (pts_px[0][0], max(26, pts_px[0][1] - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, poly_col, 2, cv2.LINE_AA)
+
+        # 2. Proyeksikan Garis Celah Slat Terstitching ke Koordinat Asli Kamera
+        xs = slat_res.get("xs_contour")
+        ys = slat_res.get("ys_contour")
+        if xs is not None and ys is not None and len(xs) > 10 and "polygon_px" in slat_res:
+            try:
+                src_pts = slat_res["polygon_px"].astype(np.float32)
+                dst_pts = np.array([
+                    [0, 0],
+                    [self.slat_inspector.canonical_w - 1, 0],
+                    [self.slat_inspector.canonical_w - 1, self.slat_inspector.canonical_h - 1],
+                    [0, self.slat_inspector.canonical_h - 1]
+                ], dtype=np.float32)
+                M_inv = cv2.getPerspectiveTransform(dst_pts, src_pts)
+
+                unwarp_pts = np.column_stack([xs, ys]).reshape(-1, 1, 2).astype(np.float32)
+                cam_pts = cv2.perspectiveTransform(unwarp_pts, M_inv).reshape(-1, 2)
+                cam_pts[:, 0] = np.clip(cam_pts[:, 0], 0, w_f - 1)
+                cam_pts[:, 1] = np.clip(cam_pts[:, 1], 0, h_f - 1)
+                cam_pts_int = cam_pts.astype(np.int32)
+
+                seam_col = (0, 0, 255) if slat_res.get("is_ng", False) else (0, 255, 0)
+                cv2.polylines(ann, [cam_pts_int], False, seam_col, 4, cv2.LINE_AA)
+            except Exception:
+                pass
+
+        # 3. Gambar Bounding Box Sirip & Garis Puncak Sirip
+        active_box = rib_res.get("active_box")
+        if active_box:
+            bx1, by1, bx2, by2 = active_box
+            is_rib_ng = bool(rib_res.get("is_ng", False))
+            b_col = (0, 0, 255) if is_rib_ng else (255, 170, 0)
+            cv2.rectangle(ann, (bx1, by1), (bx2, by2), b_col, 3, cv2.LINE_AA)
+            cv2.putText(
+                ann,
+                f"SIRIP #{rib_no if rib_no is not None else ''} [{'NG' if is_rib_ng else 'OK'}]",
+                (bx1, max(25, by1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                b_col,
+                2,
+                cv2.LINE_AA
+            )
+
+        xs_r = rib_res.get("xs_contour")
+        ys_r = rib_res.get("ys_contour")
+        if xs_r is not None and ys_r is not None and len(xs_r) > 10:
+            is_rib_ng = bool(rib_res.get("is_ng", False))
+            r_col = (0, 0, 255) if is_rib_ng else (0, 255, 0)
+            pts_r = np.column_stack([xs_r, ys_r]).astype(np.int32)
+            cv2.polylines(ann, [pts_r], False, r_col, 4, cv2.LINE_AA)
+
+        # 4. Top HUD Banner Anotasi Metrologi (80 px tinggi di puncak frame)
+        banner_h = 80
+        overlay = ann.copy()
+        cv2.rectangle(overlay, (0, 0), (w_f, banner_h), (18, 18, 24), -1)
+        cv2.addWeighted(overlay, 0.88, ann, 0.12, 0, ann)
+        cv2.line(ann, (0, banner_h), (w_f, banner_h), (0, 0, 255), 2)
+
+        s_pv = float(slat_res.get("pv_flatness", 0.0) or 0.0)
+        s_sag = float(slat_res.get("sagitta", 0.0) or 0.0)
+        s_void = int(slat_res.get("center_void", 0) or 0)
+        r_dev = float(rib_res.get("max_dev", rib_res.get("dev", 0.0)) or 0.0)
+        r_sag = float(rib_res.get("sagitta", 0.0) or 0.0)
+
+        s_stat = slat_res.get("status", "WAIT")
+        r_stat = rib_res.get("status", "WAIT")
+
+        title = f"[AI METROLOGY EVIDENCE] TOP CAM-01 | SLAT #{slat_no if slat_no is not None else '-'}: [{s_stat}] | RIB #{rib_no if rib_no is not None else '-'}: [{r_stat}]"
+        cv2.putText(ann, title, (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 230, 255), 2, cv2.LINE_AA)
+
+        metrics_txt = (
+            f"PLAT: PV={s_pv*scale:.1f}mm ({s_pv:.1f}px) | Sag={s_sag*scale:.1f}mm ({s_sag:.1f}px) | Void={s_void}px  ||  "
+            f"RIB: Dev={r_dev*scale:.1f}mm ({r_dev:.1f}px) | Sag={r_sag*scale:.1f}mm ({r_sag:.1f}px)"
+        )
+        cv2.putText(ann, metrics_txt, (20, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (240, 240, 240), 1, cv2.LINE_AA)
+
+        return ann
+
+    def flush_best_shot_if_needed(self):
+        """
+        Memancarkan kandidat Best-Shot ke db_bridge jika siklus selesai dan terdapat NG terkonfirmasi.
+        Menjamin frame yang tersimpan adalah frame dengan keparahan puncak (Peak Abnormality).
+        """
+        if self._best_top_candidate is None:
+            return False
+        cand = self._best_top_candidate
+        self._best_top_candidate = None
+
+        slat_no = cand["slat_no"]
+        rib_no = cand["rib_no"]
+
+        # Cek deduplikasi agar 1 siklus NG tidak pernah di-emit ganda
+        if slat_no is not None and slat_no == self._last_emitted_slat_id and rib_no == self._last_emitted_rib_id:
+            return False
+
+        self._last_emitted_slat_id = slat_no
+        self._last_emitted_rib_id = rib_no
+
+        if self.db_bridge is not None and self.db_bridge.is_enabled():
+            return self.db_bridge.emit_top_inspection(
+                frame_raw=cand["frame_raw"],
+                frame_ann=cand["frame_ann"],
+                slat_result=cand["slat_res"],
+                rib_result=cand["rib_res"],
+                slat_number=slat_no,
+                rib_number=rib_no
+            )
+        return False
+
     def record_if_ng(self, frame_raw, frame_ann, inspect_res, slat_no=None, rib_no=None):
         """
-        Merekam frame ke SQLite & folder captures jika status NG dan saklar aktif.
-        Menerapkan Single-Capture Per-Object Latch:
-        Setiap nomor slat atau rib NG fisik HANYA dicatat tepat 1 kali.
+        Merekam frame ke SQLite & folder captures menggunakan mekanisme Best-Shot Peak Buffer.
+        Alih-alih langsung menyimpan frame awal yang terpotong saat baru masuk, sistem mengumpulkan
+        kandidat selama objek melintas dan menyimpan frame dengan deviasi keparahan tertinggi (Peak Abnormality)
+        langsung pada resolusi penuh kamera asli (1080p).
         """
         if self.db_bridge is None or not self.db_bridge.is_enabled():
             return False
@@ -436,38 +590,72 @@ class CombinedTopInspector:
         is_slat_ng = bool(slat_res.get("is_ng", False))
         is_rib_ng = bool(rib_res.get("is_ng", False))
 
-        if not is_slat_ng and not is_rib_ng:
-            return False
+        # Filter eliminasi false alarm: Abaikan vonis NG jika kontur garis sirip belum membentang penuh (tip-to-tip < 850px)
+        rib_xs = rib_res.get("xs_contour")
+        rib_span = float(rib_xs[-1] - rib_xs[0]) if (rib_xs is not None and len(rib_xs) > 10) else 0.0
+        if is_rib_ng and rib_span < 850.0:
+            is_rib_ng = False
 
         curr_slat_no = slat_no if slat_no is not None else getattr(self.slat_inspector, "slat_count", 0)
         curr_rib_no = rib_no if rib_no is not None else getattr(self.rib_inspector, "rib_count", 0)
 
-        need_emit = False
+        # 1. Jika siklus berganti (slat baru atau rib baru melintas), emit kandidat siklus sebelumnya
+        if self._current_slat_cycle_id is not None and curr_slat_no != self._current_slat_cycle_id:
+            self.flush_best_shot_if_needed()
+            self._current_slat_cycle_id = curr_slat_no
+            self._current_rib_cycle_id = curr_rib_no
+        elif self._current_slat_cycle_id is None:
+            self._current_slat_cycle_id = curr_slat_no
+            self._current_rib_cycle_id = curr_rib_no
 
-        # 1. Kasus Plat Slat NG
-        if is_slat_ng and curr_slat_no != self.logged_slat_id:
-            need_emit = True
-            self.logged_slat_id = curr_slat_no
-
-        # 2. Kasus Bilah Rib NG
-        if is_rib_ng and curr_rib_no != self.logged_rib_id:
-            need_emit = True
-            self.logged_rib_id = curr_rib_no
-
-        if not need_emit:
+        if not is_slat_ng and not is_rib_ng:
             return False
 
-        return self.db_bridge.emit_top_inspection(
-            frame_raw=frame_raw,
-            frame_ann=frame_ann,
-            slat_result=slat_res,
-            rib_result=rib_res,
-            slat_number=curr_slat_no,
-            rib_number=curr_rib_no
-        )
+        # 2. Hitung severity score (tingkat keparahan cacat) pada frame saat ini
+        slat_score = 0.0
+        if is_slat_ng:
+            s_pv = float(slat_res.get("pv_flatness", 0.0) or 0.0)
+            s_sag = float(slat_res.get("sagitta", 0.0) or 0.0)
+            s_void = float(slat_res.get("center_void", 0) or 0) / 40.0
+            slat_score = max(s_pv, s_sag, s_void)
+
+        rib_score = 0.0
+        if is_rib_ng:
+            r_dev = float(rib_res.get("max_dev", rib_res.get("dev", 0.0)) or 0.0)
+            r_sag = float(rib_res.get("sagitta", 0.0) or 0.0)
+            rib_score = max(r_dev, r_sag)
+
+        total_severity = max(slat_score, rib_score)
+
+        # 3. Update kandidat Best-Shot jika frame ini memiliki keparahan lebih tinggi
+        need_update = False
+        if self._best_top_candidate is None:
+            need_update = True
+        elif total_severity > self._best_top_candidate["severity"]:
+            need_update = True
+
+        if need_update:
+            # Render anotasi 1080p full-res hanya saat frame terbaik terdeteksi (Zero FPS impact)
+            full_ann = self.render_annotated_fullres(frame_raw, inspect_res, curr_slat_no, curr_rib_no)
+            self._best_top_candidate = {
+                "severity": total_severity,
+                "frame_raw": frame_raw.copy() if frame_raw is not None else None,
+                "frame_ann": full_ann if full_ann is not None else frame_ann,
+                "slat_res": dict(slat_res),
+                "rib_res": dict(rib_res),
+                "slat_no": curr_slat_no,
+                "rib_no": curr_rib_no
+            }
+            return True
+
+        return False
 
     def close(self):
         """Pembersihan resource saat ditutup."""
+        try:
+            self.flush_best_shot_if_needed()
+        except Exception:
+            pass
         if hasattr(self, "db_bridge") and self.db_bridge is not None:
             self.db_bridge.close()
 
@@ -796,10 +984,10 @@ class CombinedTopInspector:
             else:
                 poly_color = (0, 30, 255)     # Merah (NG)
 
-            # Gambar Polygon Gerbang Inspeksi Slat
-            cv2.polylines(main_resized, [poly_s], isClosed=True, color=poly_color, thickness=2, lineType=cv2.LINE_AA)
-            cv2.putText(main_resized, "GERBANG INSPEKSI SLAT", (poly_s[0][0], max(20, poly_s[0][1] - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, poly_color, 2, cv2.LINE_AA)
+            # Gambar Polygon Gerbang Inspeksi Slat (DIBESARKAN)
+            cv2.polylines(main_resized, [poly_s], isClosed=True, color=poly_color, thickness=3, lineType=cv2.LINE_AA)
+            cv2.putText(main_resized, "GERBANG INSPEKSI SLAT", (poly_s[0][0], max(26, poly_s[0][1] - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, poly_color, 2, cv2.LINE_AA)
 
             # Gambar Mini Trigger Zone pada rantai samping
             trigger_box = slat_res.get("trigger_box")
@@ -821,8 +1009,8 @@ class CombinedTopInspector:
                     trig_thick = 1
                     trig_lbl = "TRIGGER OFF"
                 cv2.rectangle(main_resized, (tx1, ty1), (tx2, ty2), trig_col, trig_thick)
-                cv2.putText(main_resized, trig_lbl, (tx1, max(14, ty1 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.40, trig_col, 1, cv2.LINE_AA)
+                cv2.putText(main_resized, trig_lbl, (tx1, max(18, ty1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.58, trig_col, 2, cv2.LINE_AA)
 
             # PROYEKSI GARIS HOUGH STITCHING CELAH PLAT TEPAT KE CELAH FISIK (M_inv)
             # Menjamin garis celah duduk tepat di sambungan plat, bukan di langit-langit konveyor!
@@ -865,8 +1053,8 @@ class CombinedTopInspector:
                 bx1, by1, bx2, by2 = box
                 rx1, ry1, rx2, ry2 = int(bx1 * sx), int(by1 * sy), int(bx2 * sx), int(by2 * sy)
                 cv2.rectangle(main_resized, (rx1, ry1), (rx2, ry2), (255, 170, 0), 2, cv2.LINE_AA)
-                cv2.putText(main_resized, f"SIRIP AKTIF ({bx2-bx1}x{by2-by1} px)", (rx1, max(18, ry1 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 170, 0), 2, cv2.LINE_AA)
+                cv2.putText(main_resized, f"SIRIP AKTIF ({bx2-bx1}x{by2-by1} px)", (rx1, max(24, ry1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 170, 0), 2, cv2.LINE_AA)
 
             # Gambar Garis Puncak Sirip (Ridge Tracking) menempel di bibir bilah fisik
             xs_r = rib_res.get("xs_contour")
@@ -936,36 +1124,36 @@ class CombinedTopInspector:
         stat_x = 55 if len(overall_status) == 2 else (35 if len(overall_status) == 4 else 45)
         cv2.putText(hud, overall_status, (stat_x, 56), cv2.FONT_HERSHEY_DUPLEX, 1.35, (255, 255, 255), 3, cv2.LINE_AA)
 
-        # Header Status Terpadu
-        cv2.putText(hud, "CAM-03 TOP INSPECTION PIPELINE (SLAT & RIB INTEGRATED)",
-                    (200, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
+        # Header Status Terpadu (DIBESARKAN)
+        cv2.putText(hud, "CAM-01 TOP INSPECTION PIPELINE (SLAT & RIB INTEGRATED)",
+                    (195, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2, cv2.LINE_AA)
 
         # Badge Status Database Logging (ON / OFF)
         db_on = self.is_db_enabled()
         db_bg = (0, 140, 0) if db_on else (40, 40, 50)
         db_txt = "DB: ON [REC]" if db_on else "DB: OFF [DRY-RUN]"
         db_color = (255, 255, 255) if db_on else (180, 180, 180)
-        cv2.rectangle(hud, (770, 12), (980, 40), db_bg, -1)
-        cv2.rectangle(hud, (770, 12), (980, 40), (0, 255, 0) if db_on else (90, 90, 100), 1, cv2.LINE_AA)
-        cv2.putText(hud, db_txt, (782, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.40, db_color, 1, cv2.LINE_AA)
+        cv2.rectangle(hud, (760, 10), (985, 42), db_bg, -1)
+        cv2.rectangle(hud, (760, 10), (985, 42), (0, 255, 0) if db_on else (90, 90, 100), 1, cv2.LINE_AA)
+        cv2.putText(hud, db_txt, (772, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.52, db_color, 2, cv2.LINE_AA)
 
         slat_tag = slat_res.get("display_status", "WAIT") if slat_res else "WAIT"
         rib_tag = "RIB: " + ("HADIR (" + rib_res.get("status", "WAIT") + ")" if rib_res.get("is_rib_present", False) else "PLAT DATAR")
         dev_tag = getattr(self.rib_inspector, "device_badge", "CUDA" if getattr(self.rib_inspector, "device", "cpu") != "cpu" else "CPU")
         cv2.putText(hud, f"STATUS: [SLAT: {slat_tag}] | [{rib_tag}]  |  FPS: {fps:4.1f}  |  Runtime: {inspect_result.get('elapsed_ms', 0):.1f} ms  |  [{dev_tag}]",
-                    (200, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 220, 255), 1, cv2.LINE_AA)
+                    (195, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 220, 255), 1, cv2.LINE_AA)
         cv2.putText(hud, f"Plat: {slat_res.get('eval_mode', '-')} | Sirip: {rib_res.get('message', '-')}",
-                    (200, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 230, 255), 1, cv2.LINE_AA)
+                    (195, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 230, 255), 1, cv2.LINE_AA)
 
         cv2.line(hud, (15, 88), (985, 88), (50, 50, 60), 1)
 
         # ----------------------------------------------------------------------
-        # KARTU METROLOGI KIRI: PLAT SLAT (HOUGH STITCHING SENSORS 2025)
+        # KARTU METROLOGI KIRI: PLAT SLAT (DIBESARKAN)
         # ----------------------------------------------------------------------
-        cv2.rectangle(hud, (20, 96), (480, 182), (28, 28, 36), -1)
-        cv2.rectangle(hud, (20, 96), (480, 182), (60, 60, 75), 1)
-        cv2.putText(hud, "METROLOGI PLAT SLAT (HOUGH STITCHING)", (32, 116),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 200, 100), 1, cv2.LINE_AA)
+        cv2.rectangle(hud, (15, 96), (485, 184), (28, 28, 36), -1)
+        cv2.rectangle(hud, (15, 96), (485, 184), (60, 60, 75), 1)
+        cv2.putText(hud, "METROLOGI PLAT SLAT (HOUGH STITCHING)", (25, 118),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 200, 100), 2, cv2.LINE_AA)
 
         s_pv = slat_res.get("pv_flatness", 0.0) if slat_res else 0.0
         s_sag = slat_res.get("sagitta", 0.0) if slat_res else 0.0
@@ -974,20 +1162,26 @@ class CombinedTopInspector:
         pv_c = (0, 255, 0) if s_pv <= self.slat_inspector.max_flatness_pv else (0, 0, 255)
         sag_c = (0, 255, 0) if s_sag <= self.slat_inspector.max_sagitta else (0, 0, 255)
 
-        cv2.putText(hud, f"Flatness PV : {s_pv:4.1f} px (Maks: {self.slat_inspector.max_flatness_pv:.1f}px)",
-                    (32, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.40, pv_c, 1, cv2.LINE_AA)
-        cv2.putText(hud, f"Sagitta Curv: {s_sag:4.1f} px (Maks: {self.slat_inspector.max_sagitta:.1f}px)",
-                    (32, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.40, sag_c, 1, cv2.LINE_AA)
-        cv2.putText(hud, f"QC PLAT SLAT: #{self.slat_inspector.slat_count:02d} | OK: {self.slat_inspector.ok_count} | NG: {self.slat_inspector.ng_count} | Status: [{s_stat}]",
-                    (32, 174), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 240, 180), 1, cv2.LINE_AA)
+        scale = getattr(self, "scale_factor_mm_per_px", 0.82)
+        s_pv_mm = s_pv * scale
+        max_pv_mm = self.slat_inspector.max_flatness_pv * scale
+        s_sag_mm = s_sag * scale
+        max_sag_mm = self.slat_inspector.max_sagitta * scale
+
+        cv2.putText(hud, f"Flatness PV : {s_pv_mm:4.1f} mm ({s_pv:.1f} px) [Maks: {max_pv_mm:.1f} mm]",
+                    (25, 139), cv2.FONT_HERSHEY_SIMPLEX, 0.46, pv_c, 1, cv2.LINE_AA)
+        cv2.putText(hud, f"Sagitta Curv: {s_sag_mm:4.1f} mm ({s_sag:.1f} px) [Maks: {max_sag_mm:.1f} mm]",
+                    (25, 158), cv2.FONT_HERSHEY_SIMPLEX, 0.46, sag_c, 1, cv2.LINE_AA)
+        cv2.putText(hud, f"QC PLAT SLAT: #{self.slat_inspector.slat_count:02d} | OK: {self.slat_inspector.ok_count} | NG: {self.slat_inspector.ng_count} | [{s_stat}]",
+                    (25, 178), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 240, 180), 2, cv2.LINE_AA)
 
         # ----------------------------------------------------------------------
-        # KARTU METROLOGI KANAN: BILAH SIRIP (HYBRID RIB INSPECTOR)
+        # KARTU METROLOGI KANAN: BILAH SIRIP (DIBESARKAN)
         # ----------------------------------------------------------------------
-        cv2.rectangle(hud, (500, 96), (980, 182), (28, 28, 36), -1)
-        cv2.rectangle(hud, (500, 96), (980, 182), (60, 60, 75), 1)
-        cv2.putText(hud, f"METROLOGI BILAH SIRIP (HYBRID: {self.rib_inspector.mode})", (512, 116),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.rectangle(hud, (495, 96), (985, 184), (28, 28, 36), -1)
+        cv2.rectangle(hud, (495, 96), (985, 184), (60, 60, 75), 1)
+        cv2.putText(hud, f"METROLOGI BILAH SIRIP (HYBRID: {self.rib_inspector.mode})", (505, 118),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.54, (0, 255, 255), 2, cv2.LINE_AA)
 
         r_pv = rib_res.get("pv_flatness", 0.0) if rib_res else 0.0
         r_sag = rib_res.get("sagitta", 0.0) if rib_res else 0.0
@@ -997,31 +1191,35 @@ class CombinedTopInspector:
 
         rpv_c = (0, 255, 0) if r_pv <= self.rib_inspector.pv_thresh else (0, 0, 255)
         rsag_c = (0, 255, 0) if r_sag <= self.rib_inspector.sagitta_thresh else (0, 0, 255)
+        r_pv_mm = r_pv * scale
+        r_sag_mm = r_sag * scale
+        r_dev_mm = r_dev * scale
+        dev_lim_mm = self.rib_inspector.dev_thresh * scale
+        r_tip_mm = r_tip * scale
+        tip_lim_mm = self.rib_inspector.tip_thresh * scale
 
-        cv2.putText(hud, f"Flatness PV : {r_pv:4.1f} px | Sagitta: {r_sag:4.1f} px",
-                    (512, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.40, rpv_c, 1, cv2.LINE_AA)
+        cv2.putText(hud, f"Flatness PV : {r_pv_mm:4.1f} mm | Sagitta: {r_sag_mm:.1f} mm",
+                    (505, 139), cv2.FONT_HERSHEY_SIMPLEX, 0.46, rpv_c, 1, cv2.LINE_AA)
         rdev_c = (0, 255, 0) if r_dev <= self.rib_inspector.dev_thresh else (0, 0, 255)
         rtip_c = (0, 255, 0) if r_tip <= self.rib_inspector.tip_thresh else (0, 0, 255)
-        cv2.putText(hud, f"Dev Badan : {r_dev:4.1f}px (Maks: {self.rib_inspector.dev_thresh:.1f}px)",
-                    (512, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.38, rdev_c, 1, cv2.LINE_AA)
-        cv2.putText(hud, f"Dev Tip   : {r_tip:4.1f}px (Maks: {self.rib_inspector.tip_thresh:.1f}px)",
-                    (755, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.38, rtip_c, 1, cv2.LINE_AA)
-        cv2.putText(hud, f"QC SIRIP RIB: #{self.rib_inspector.rib_count:02d} | OK: {self.rib_inspector.ok_count} | NG: {self.rib_inspector.ng_count} | Status: [{r_stat}]",
-                    (512, 174), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 240, 180), 1, cv2.LINE_AA)
+        cv2.putText(hud, f"Dev Badan: {r_dev_mm:4.1f}mm [Maks: {dev_lim_mm:.1f}mm] | Tip: {r_tip_mm:4.1f}mm",
+                    (505, 158), cv2.FONT_HERSHEY_SIMPLEX, 0.44, rdev_c, 1, cv2.LINE_AA)
+        cv2.putText(hud, f"QC SIRIP RIB: #{self.rib_inspector.rib_count:02d} | OK: {self.rib_inspector.ok_count} | NG: {self.rib_inspector.ng_count} | [{r_stat}]",
+                    (505, 178), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 240, 180), 2, cv2.LINE_AA)
 
         # ----------------------------------------------------------------------
-        # FOOTER PANDUAN KONTROL & PINTASAN KEYBOARD
+        # FOOTER PANDUAN KONTROL & PINTASAN KEYBOARD (DIBESARKAN)
         # ----------------------------------------------------------------------
-        cv2.rectangle(hud, (20, 192), (980, 288), (22, 22, 28), -1)
-        cv2.rectangle(hud, (20, 192), (980, 288), (45, 45, 55), 1)
-        cv2.putText(hud, "PANDUAN KONTROL & PINTASAN KEYBOARD (HOTKEYS):", (32, 212),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (150, 180, 220), 1, cv2.LINE_AA)
-        cv2.putText(hud, "[SPACE] : Pause/Play     [N] : +1 Frame Maju     [P] : -1 Frame Mundur     [R] : Reset Counter QC", (32, 234),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (210, 210, 210), 1, cv2.LINE_AA)
-        cv2.putText(hud, "[O]/[F]: Media    [V]: Ganti Video    [T]: Turbo    [D]: Toggle DB Log    [Q]: Keluar", (32, 254),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (210, 210, 210), 1, cv2.LINE_AA)
-        cv2.putText(hud, f"File Aktif: {inspect_result.get('filename', '-')} | Frame Posisi: {frame_idx}/{total_frames}", (32, 276),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (140, 200, 140), 1, cv2.LINE_AA)
+        cv2.rectangle(hud, (15, 192), (985, 292), (22, 22, 28), -1)
+        cv2.rectangle(hud, (15, 192), (985, 292), (45, 45, 55), 1)
+        cv2.putText(hud, "PANDUAN KONTROL & PINTASAN KEYBOARD (HOTKEYS):", (25, 214),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (150, 180, 220), 2, cv2.LINE_AA)
+        cv2.putText(hud, "[SPACE]: Pause/Play   [N]: +1 Maju   [P]: -1 Mundur   [R]: Reset Counter", (25, 238),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(hud, "[O]/[F]: Media   [V]: Ganti Video   [T]: Turbo   [D]: DB Log   [Q]: Keluar", (25, 260),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(hud, f"File: {inspect_result.get('filename', '-')} | Posisi: {frame_idx}/{total_frames}", (25, 282),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (140, 210, 140), 1, cv2.LINE_AA)
 
         # Selesai: kembalikan buffer terpadu yang sudah terisi penuh (zero-copy)
         return self._screen_buf
