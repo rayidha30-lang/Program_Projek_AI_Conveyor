@@ -1,6 +1,12 @@
 import sqlite3
 import os
+import sys
 from datetime import datetime, timedelta
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 # Path default ke file database SQLite
 DB_PATH = r"c:\File Rayidha\Internship\Project\5. Project AI Slat Rib Conveyor\Database\AI_Slat_Rib_Conveyor.db"
@@ -316,9 +322,11 @@ def purge_expired_inspections(retention_days=7, custom_cutoff_str=None):
     if custom_cutoff_str:
         cutoff_dt = datetime.strptime(custom_cutoff_str, "%Y-%m-%d %H:%M:%S")
     else:
-        # Cutoff: tepat pada pukul 00:00:00 (retention_days hari yang lalu dari hari ini)
+        # Menyimpan tepat `retention_days` hari terakhir (termasuk hari ini sebagai hari ke-1).
+        # Contoh jika hari ini tgl 20 dan retention 7 hari: data tgl 14 s/d 20 disimpan (7 hari),
+        # sehingga cutoff adalah tgl 14 pukul 00:00:00 (semua rekaman tgl 13 dan sebelumnya dihapus).
         today_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        cutoff_dt = today_midnight - timedelta(days=retention_days)
+        cutoff_dt = today_midnight - timedelta(days=max(1, retention_days - 1))
 
     cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
     stats["cutoff"] = cutoff_str
@@ -396,7 +404,7 @@ def purge_expired_inspections(retention_days=7, custom_cutoff_str=None):
         cursor.execute("DELETE FROM Inspections WHERE InspectionTime < ?", (cutoff_str,))
 
         conn.commit()
-        print(f"🧹 [RETENTION PURGE] Berhasil membersihkan data sebelum {cutoff_str}:")
+        print(f"[RETENTION PURGE] Berhasil membersihkan data sebelum {cutoff_str}:")
         print(f"   - Inspections dihapus: {stats['deleted_inspections']}")
         print(f"   - Detections dihapus: {stats['deleted_detections']}")
         print(f"   - File gambar dihapus: {stats['deleted_files']}")
@@ -406,7 +414,7 @@ def purge_expired_inspections(retention_days=7, custom_cutoff_str=None):
         if conn is not None:
             conn.rollback()
         stats["errors"].append(str(e))
-        print(f"❌ [RETENTION PURGE] Gagal melakukan purge: {e}")
+        print(f"[RETENTION PURGE ERROR] Gagal melakukan purge: {e}")
     finally:
         if conn is not None:
             conn.close()
