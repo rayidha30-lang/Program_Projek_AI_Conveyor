@@ -17,6 +17,7 @@ import { Button } from "@/components/ui/button";
 import {
   fetchTopInspectionConfig,
   updateTopInspectionConfig,
+  SCALE_FACTOR_MM_PER_PX,
   type TopInspectionThresholds,
 } from "@/lib/api";
 
@@ -126,6 +127,9 @@ export default function TuningSettings({ theme = "dark" }: TuningSettingsProps) 
             </span>
             <span className="rounded-md bg-emerald-500/10 px-2 py-0.5 font-mono text-[10px] font-bold text-emerald-400 border border-emerald-500/20">
               Zero Downtime
+            </span>
+            <span className="rounded-md bg-sky-500/10 px-2 py-0.5 font-mono text-[10px] font-bold text-sky-400 border border-sky-500/20">
+              Skala Metrologi: 0.82 mm/px
             </span>
             <span className="text-[11px] text-muted-foreground hidden sm:inline">
               • Parameter langsung diterapkan ke kamera secara seketika tanpa restart
@@ -572,6 +576,7 @@ interface ParameterCardProps {
   notice: string;
   diagram: React.ReactNode;
   displayTransform?: (v: number) => string;
+  scaleFactor?: number;
 }
 
 function ParameterCard({
@@ -589,9 +594,20 @@ function ParameterCard({
   notice,
   diagram,
   displayTransform,
+  scaleFactor = SCALE_FACTOR_MM_PER_PX,
 }: ParameterCardProps) {
   const isModified = value !== defaultValue;
   const isRib = category === "rib";
+
+  const formatValue = (v: number) => {
+    if (displayTransform) return displayTransform(v);
+    if (unit === "px") {
+      const mm = v * (scaleFactor || 0.82);
+      const pxStr = Number.isInteger(v) ? `${v} px` : `${v.toFixed(1)} px`;
+      return `${mm.toFixed(1)} mm (${pxStr})`;
+    }
+    return `${v} ${unit}`;
+  };
 
   return (
     <div
@@ -661,7 +677,7 @@ function ParameterCard({
                 : "bg-sky-50 text-sky-800 border-sky-200"
             }`}
           >
-            {displayTransform ? displayTransform(value) : `${value} ${unit}`}
+            {formatValue(value)}
           </div>
         </div>
 
@@ -692,11 +708,11 @@ function ParameterCard({
       {/* Kontrol Slider & Input */}
       <div className="mt-4 pt-3 border-t border-border/40">
         <div className="flex items-center justify-between text-[10px] text-muted-foreground mb-1.5">
-          <span>Min: {displayTransform ? displayTransform(min) : `${min} ${unit}`}</span>
+          <span>Min: {formatValue(min)}</span>
           <span className="font-semibold text-foreground">
-            Default: {displayTransform ? displayTransform(defaultValue) : `${defaultValue} ${unit}`}
+            Default: {formatValue(defaultValue)}
           </span>
-          <span>Maks: {displayTransform ? displayTransform(max) : `${max} ${unit}`}</span>
+          <span>Maks: {formatValue(max)}</span>
         </div>
         <div className="flex items-center gap-3">
           <input

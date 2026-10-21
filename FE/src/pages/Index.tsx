@@ -42,6 +42,7 @@ import {
   getImageUrl,
   extractRecordDate,
   extractEvidenceDate,
+  formatPxAndMm,
   MONTH_NAMES_ID,
   MONTH_SHORT_ID,
   type RecordRow,
@@ -1739,7 +1740,14 @@ function RecordTable({
                       : ""
                   }`}
                 >
-                  {r.type}
+                  <div>{r.type}</div>
+                  {(r.pvFlatness != null || r.maxDeviation != null) && (
+                    <div className="text-[8.5px] font-mono text-muted-foreground font-normal">
+                      {r.pvFlatness != null && `PV: ${formatPxAndMm(r.pvFlatness)}`}
+                      {r.pvFlatness != null && r.maxDeviation != null && " • "}
+                      {r.maxDeviation != null && `Dev: ${formatPxAndMm(r.maxDeviation)}`}
+                    </div>
+                  )}
                 </td>
 
                 {/* AI Confidence */}
@@ -2385,6 +2393,12 @@ function Evidence({
                 ["Abnormality Type", selected.title.split(" #")[0] ?? ""],
                 ["AI Confidence", selected.confidence],
                 ["Capture Time", selected.captureTime || selected.time],
+                ...(selected.pvFlatness !== undefined && selected.pvFlatness !== null
+                  ? [["Metrologi Flatness PV", formatPxAndMm(selected.pvFlatness)]]
+                  : []),
+                ...(selected.maxDeviation !== undefined && selected.maxDeviation !== null
+                  ? [["Max Deviasi Defleksi", formatPxAndMm(selected.maxDeviation)]]
+                  : []),
               ].map(([k, v]) => (
                 <div key={k}>
                   <dt className="text-muted-foreground">{k}</dt>

@@ -1,6 +1,18 @@
 const API_HOST = typeof window !== "undefined" ? window.location.hostname : "localhost";
 export const API_BASE_URL = `http://${API_HOST}:5000/api`;
 
+export const SCALE_FACTOR_MM_PER_PX = 0.82;
+
+/**
+ * Format nilai piksel dan milimeter secara seragam: mm di depan, px di dalam kurung (1 desimal).
+ * Contoh: 14.0 px -> "11.5 mm (14.0 px)"
+ */
+export function formatPxAndMm(pxVal?: number | null, scale = SCALE_FACTOR_MM_PER_PX): string {
+  if (pxVal === undefined || pxVal === null || isNaN(pxVal)) return "-";
+  const mmVal = pxVal * scale;
+  return `${mmVal.toFixed(1)} mm (${pxVal.toFixed(1)} px)`;
+}
+
 export type Severity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "NONE";
 
 export type AbnormalComponentSummary = {
@@ -31,6 +43,8 @@ export type RecordRow = {
   maintenanceNote?: string;
   pvFlatness?: number | null;
   maxDeviation?: number | null;
+  pvFlatnessMm?: number | null;
+  maxDeviationMm?: number | null;
   rawImagePath?: string | null;
   annotatedPath?: string | null;
 };
@@ -126,6 +140,10 @@ export type EvidenceItem = {
   statusLifecycle?: string;
   picName?: string;
   maintenanceNote?: string;
+  pvFlatness?: number | null;
+  maxDeviation?: number | null;
+  pvFlatnessMm?: number | null;
+  maxDeviationMm?: number | null;
   rawImagePath?: string | null;
   annotatedPath?: string | null;
   imageUrl?: string | null;
@@ -318,6 +336,7 @@ export interface TopInspectionThresholds {
   slat_max_gap_limit?: number;
   slat_delta_limit?: number;
   slat_valley_sens?: number;
+  scale_factor_mm_per_px?: number;
   [key: string]: any;
 }
 
