@@ -5,12 +5,20 @@ echo   Menjalankan Sistem Web Dashboard Slat Rib Conveyor
 echo =======================================================
 echo.
 
-echo [1/2] Menjalankan Backend REST API Server (Python Flask :5000)...
-start "Backend API - Conveyor Inspection" python "%~dp0Program AI\api.py"
+:: 1. Pastikan bekerja di folder root Program
+cd /d "%~dp0"
 
+:: 2. Menjalankan Backend REST API Server di window cmd terpisah (cmd /k agar jendela tetap terbuka)
+echo [1/2] Menjalankan Backend REST API Server (Python Flask :5000)...
+start "Backend API - Conveyor Inspection" cmd /k "cd /d "%~dp0Program AI" && python api.py"
+
+:: Beri jeda 2 detik agar server API siap
+timeout /t 2 /nobreak >nul
+
+:: 3. Menjalankan Frontend Web Dashboard menggunakan 'call'
 echo.
 echo [2/2] Menjalankan Frontend Web Dashboard (React Vite :5173)...
 cd /d "%~dp0FE"
-npm run dev -- --open
+call npm run dev -- --open
 
 pause

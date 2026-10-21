@@ -1,0 +1,39 @@
+# ==============================================================================
+# REQUIREMENTS - SISTEM INSPEKSI AI SLAT RIB CONVEYOR
+# Target Deployment: Ubuntu Linux (NVIDIA Jetson Orin Nano - JetPack 5.x / 6.x)
+# Arsitektur: aarch64 (ARM64)
+# ==============================================================================
+#
+# PENTING UNTUK PENGGUNA JETSON ORIN NANO:
+# 1. PyTorch & Torchvision di Jetson ARM64 TIDAK BOLEH diinstall sembarangan dari PyPI biasa,
+#    melainkan menggunakan wheel resmi NVIDIA JetPack agar akselerasi GPU CUDA aktif!
+#    Lihat petunjuk instalasi PyTorch di bawah atau jalankan: bash setup_jetson.sh
+# 2. Pinning numpy < 2.0.0 wajib untuk kompatibilitas ABI PyTorch Jetson & OpenCV.
+# ==============================================================================
+
+# --- Numerical, Vision & Processing Core ---
+numpy>=1.23.5,<2.0.0
+opencv-python>=4.8.0.76
+scipy>=1.10.0
+Pillow>=9.5.0
+
+# --- Deep Learning, YOLO & Anomaly Detection ---
+# CATATAN: Install PyTorch (torch & torchvision) terlebih dahulu menggunakan NVIDIA Jetson Wheel.
+# Setelah torch terpasang, instalasi ultralytics akan mendeteksi torch CUDA yang sudah ada.
+ultralytics>=8.1.0
+scikit-learn>=1.2.0
+matplotlib>=3.7.0
+
+# --- Backend REST API & Database Integration ---
+flask>=2.3.0
+flask-cors>=3.0.10
+pyodbc>=4.0.35
+
+# --- Utilities & Optimization ---
+tqdm>=4.65.0
+requests>=2.28.0
+PyYAML>=6.0
+pyserial>=3.5
+
+# --- Opsional: Model ONNX & TensorRT Export ---
+onnx>=1.14.0

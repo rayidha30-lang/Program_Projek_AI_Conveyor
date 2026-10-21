@@ -10,20 +10,20 @@ dist/
 build/
 *.tsbuildinfo
 
-# Graphify Knowledge Graph & AI Agent Artifacts (Tidak perlu di-push ke GitHub)
+# Graphify Knowledge Graph & AI Agent Artifacts
 graphify-out/
 **/graphify-out/
 .agents/
 .gemini/
 
-# File Video / Media Berat
+# File Video & Media Berat
 *.mp4
 *.avi
 *.mkv
 *.mov
 *.wmv
 
-# Archives & Compiled Engines
+# Archives, Backup & Scratch
 *.zip
 *.engine
 scratch/
@@ -34,3 +34,21 @@ scratch/
 .env
 *.env.local
 !.env.example
+
+# Dataset & Galeri Foto Eksperimen
+Dataset Yolo/
+Galeri_Metode_Deteksi_Slat/
+PatchCore/
+output_predictions/
+Jetson_Vision_Engine/
+Program AI/1. Inspeksi Bolt & Pin/
+Program AI/2. Inspeksi Plat & Slat Rib/
+Program AI/test_samples/
+Program AI/Temporary Penyimpanan/
+
+# Model Checkpoints & Serialization
+*.pkl
+
+# Log & Benchmark Results
+*.csv
+benchmark_results.csv
