@@ -173,7 +173,6 @@ class HybridRibInspector:
         self.sagitta_thresh = float(sagitta_thresh)
         self.dev_thresh = float(dev_thresh)
         self.tip_thresh = float(tip_thresh)
-        self.scale_factor_mm_per_px = 0.82  # Faktor skala fisik konveyor (Ground Truth: 820mm / 1000px = 0.82 mm/px)
 
         # 0. Konfigurasi Device Komputasi (CUDA / CPU)
         if device is None or str(device).lower() in ("auto", ""):
@@ -946,7 +945,7 @@ class HybridRibInspector:
             best_sc = -9999.0
             gy = np.polyval(guide_poly, x)
             is_tip = (x > x_limit_right - 100)
-            search_delta = 16 if is_tip else 12
+            search_delta = 14 if is_tip else 8
             for y in range(max(10, cur_y - search_delta), min(h_f - 10, cur_y + search_delta)):
                 if abs(y - gy) > 35.0:
                     continue
@@ -957,7 +956,7 @@ class HybridRibInspector:
                 if sc > best_sc:
                     best_sc = sc
                     best_y = y
-            if best_y is not None and best_sc >= 30.0 and gray[best_y, x] >= 30:
+            if best_y is not None and best_sc >= 32.0 and gray[best_y, x] >= 35:
                 max_step = 8 if is_tip else 5
                 if abs(best_y - cur_y) <= max_step:
                     cur_y = best_y
@@ -965,7 +964,7 @@ class HybridRibInspector:
                 consec_misses = 0
             else:
                 consec_misses += 1
-                if consec_misses >= 8:
+                if consec_misses >= 5:
                     break
 
         # 2. Telusuri ke arah kiri dari tengah
@@ -979,7 +978,7 @@ class HybridRibInspector:
             best_sc = -9999.0
             gy = np.polyval(guide_poly, x)
             is_tip = (x < x_limit_left + 100)
-            search_delta = 16 if is_tip else 12
+            search_delta = 14 if is_tip else 8
             for y in range(max(10, cur_y - search_delta), min(h_f - 10, cur_y + search_delta)):
                 if abs(y - gy) > 35.0:
                     continue
@@ -990,7 +989,7 @@ class HybridRibInspector:
                 if sc > best_sc:
                     best_sc = sc
                     best_y = y
-            if best_y is not None and best_sc >= 30.0 and gray[best_y, x] >= 30:
+            if best_y is not None and best_sc >= 32.0 and gray[best_y, x] >= 35:
                 max_step = 8 if is_tip else 5
                 if abs(best_y - cur_y) <= max_step:
                     cur_y = best_y
@@ -998,7 +997,7 @@ class HybridRibInspector:
                 consec_misses = 0
             else:
                 consec_misses += 1
-                if consec_misses >= 8:
+                if consec_misses >= 5:
                     break
 
         left_pts.reverse()
@@ -1122,18 +1121,8 @@ class HybridRibInspector:
         else:
             inner_dev = max_dev
 
-        # Regresi Polinomial Parabola Orde-2 Robust (Kebal terhadap celukan lokal ke tepi slat)
-        p2_initial = np.polyfit(r_xs, smooth_ys, deg=2)
-        fit_y_initial = np.polyval(p2_initial, r_xs)
-        curve_resids = np.abs(smooth_ys - fit_y_initial)
-        valid_curve_mask = (curve_resids <= 3.5)
-        if np.sum(valid_curve_mask) >= (len(r_xs) * 0.75):
-            poly2 = np.polyfit(r_xs[valid_curve_mask], smooth_ys[valid_curve_mask], deg=2)
-            # Bersihkan visual kontur dari celukan lokal agar tampilan halus menempel di bibir sirip
-            smooth_ys = np.where(curve_resids > 3.5, np.polyval(poly2, r_xs), smooth_ys)
-        else:
-            poly2 = p2_initial
-
+        # Regresi Polinomial Parabola Orde-2 (Kelengkungan Sagitta)
+        poly2 = np.polyfit(r_xs, smooth_ys, deg=2)
         w_span = float(r_xs[-1] - r_xs[0])
         sagitta = abs(float(poly2[0])) * ((w_span / 2.0) ** 2)
 
@@ -1141,15 +1130,9 @@ class HybridRibInspector:
         med_top_y = int(np.median(smooth_ys))
         self.active_rib_frames += 1
 
-        # SYARAT BENTANG FISIK PENUH (TIP-TO-TIP SPAN >= 850px):
-        # Bilah sirip nominal memiliki bentang ~1200px. Jika w_span < 850px, garis belum
-        # menelusuri sampai kedua ujung, sehingga perhitungan kelengkungan (Sagitta) TIDAK BOLEH
-        # memicu vonis NG palsu (False Alarm).
-        is_full_span = (w_span >= 850.0)
-
-        # PRIME ZONE EVALUATION: Hanya kumpulkan sampel metrologi jika berada di zona tengah konveyor DAN bentang penuh!
+        # PRIME ZONE EVALUATION: Hanya kumpulkan sampel metrologi jika berada di zona tengah konveyor!
         # Menghindari distorsi optik, bayangan jatuh, dan interferensi mekanis di zona keluar (Y < 330)
-        is_in_prime = (self.prime_min_y <= med_top_y <= self.prime_max_y) and is_full_span
+        is_in_prime = (self.prime_min_y <= med_top_y <= self.prime_max_y)
         if is_in_prime:
             self.prime_pv_samples.append(pv)
             self.prime_sagitta_samples.append(sagitta)
@@ -1164,32 +1147,23 @@ class HybridRibInspector:
             eval_tdev = float(np.median(self.prime_tip_dev_samples))
         else:
             eval_pv = pv
-            eval_sag = sagitta if is_full_span else 0.0
+            eval_sag = sagitta
             eval_idev = inner_dev
             eval_tdev = tip_dev
 
         # Evaluasi Multi-Variate Terkalibrasi:
-        # Cacat kelengkungan badan HANYA sah jika bentang garis sudah penuh (>= 850px)
-        if not is_full_span and len(self.prime_pv_samples) < 3:
-            curv_defect = False
-            dev_defect = False
-            tip_defect = False
-            flat_defect = False
-            transit_is_ok = True
-        else:
-            curv_defect = (eval_sag > self.sagitta_thresh and eval_pv > self.pv_thresh) or (eval_sag > 14.5)
-            dev_defect = (eval_idev > self.dev_thresh and eval_pv > self.pv_thresh) or (eval_idev > 12.0)
-            tip_defect = (eval_tdev > self.tip_thresh)
-            flat_defect = (eval_pv > 18.0)
-            transit_is_ok = not (curv_defect or dev_defect or tip_defect or flat_defect)
+        # Cacat kelengkungan badan harus terkonfirmasi oleh Sagitta tinggi DAN PV tinggi (atau Sagitta sangat ekstrim > 14.5 px)
+        curv_defect = (eval_sag > self.sagitta_thresh and eval_pv > self.pv_thresh) or (eval_sag > 14.5)
+        dev_defect = (eval_idev > self.dev_thresh and eval_pv > self.pv_thresh) or (eval_idev > 12.0)
+        tip_defect = (eval_tdev > self.tip_thresh)
+        flat_defect = (eval_pv > 18.0)
+        transit_is_ok = not (curv_defect or dev_defect or tip_defect or flat_defect)
 
         # Registrasi Objek & Pembaruan Status Transit Konsensus
-        # Jangan putuskan vonis definitif sampai bentang garis penuh tercapai atau telah mengumpulkan sampel prime zone!
-        if self.active_rib_frames < self.min_transit_frames or (not is_full_span and len(self.prime_pv_samples) < 3):
+        if self.active_rib_frames < self.min_transit_frames:
             status = "WAIT"
-            eval_msg = f"PELACAKAN SIRIP ({w_span:.0f}px/850px) | Menunggu bentang penuh tip-to-tip..."
         else:
-            if self.current_rib_status is None:
+            if self.active_rib_frames == self.min_transit_frames:
                 self.rib_count += 1
                 if transit_is_ok:
                     self.current_rib_status = "OK"
@@ -1287,10 +1261,9 @@ class HybridRibInspector:
             box = res.get("active_box")
             if box:
                 bx1, by1, bx2, by2 = box
-                scale = getattr(self, "scale_factor_mm_per_px", 0.82)
                 cv2.rectangle(vis, (bx1, by1), (bx2, by2), (255, 170, 0), 2, cv2.LINE_AA)
-                cv2.putText(vis, f"SIRIP AKTIF ({(bx2-bx1)*scale:.0f}x{(by2-by1)*scale:.0f} mm / {bx2-bx1}x{by2-by1} px)", (bx1, max(22, by1 - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 170, 0), 2, cv2.LINE_AA)
+                cv2.putText(vis, f"SIRIP AKTIF ({bx2-bx1}x{by2-by1} px)", (bx1, max(22, by1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 170, 0), 2, cv2.LINE_AA)
 
             # Gambar Kurva Punggung Atas (Top Ridge Curve) menempel di bilah fisik
             xs = res.get("xs_contour")
@@ -1358,17 +1331,16 @@ class HybridRibInspector:
         dev_col = (0, 255, 255) if dev_val <= self.dev_thresh else (0, 0, 255)
         tip_col = (0, 255, 255) if tip_val <= self.tip_thresh else (0, 0, 255)
 
-        scale = getattr(self, "scale_factor_mm_per_px", 0.82)
-        cv2.putText(hud, f"Flatness PV   : {pv*scale:4.1f} mm ({pv:.1f} px) [Maks: {self.pv_thresh*scale:.1f} mm ({self.pv_thresh:.1f} px)]", (25, 96),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, pv_col, 1, cv2.LINE_AA)
-        cv2.putText(hud, f"Sagitta Curv  : {sag*scale:4.1f} mm ({sag:.1f} px) [Maks: {self.sagitta_thresh*scale:.1f} mm ({self.sagitta_thresh:.1f} px)]", (25, 118),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, sag_col, 1, cv2.LINE_AA)
-        cv2.putText(hud, f"Deviasi Badan : {dev_val*scale:4.1f} mm ({dev_val:.1f} px) [Maks: {self.dev_thresh*scale:.1f} mm ({self.dev_thresh:.1f} px)]", (25, 140),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, dev_col, 1, cv2.LINE_AA)
-        cv2.putText(hud, f"Deviasi Ujung : {tip_val*scale:4.1f} mm ({tip_val:.1f} px) [Maks: {self.tip_thresh*scale:.1f} mm ({self.tip_thresh:.1f} px)]", (25, 162),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, tip_col, 1, cv2.LINE_AA)
-        cv2.putText(hud, f"Tinggi Bilah  : {rib_h*scale:4.0f} mm ({rib_h} px) [Nom: 49 - 164 mm ({60} - {200} px)]", (25, 184),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 220, 200), 1, cv2.LINE_AA)
+        cv2.putText(hud, f"Flatness PV   : {pv:4.1f} px  (Maks: {self.pv_thresh:.1f} px)", (25, 96),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, pv_col, 1, cv2.LINE_AA)
+        cv2.putText(hud, f"Sagitta Curv  : {sag:4.1f} px  (Maks: {self.sagitta_thresh:.1f} px)", (25, 118),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, sag_col, 1, cv2.LINE_AA)
+        cv2.putText(hud, f"Deviasi Badan : {dev_val:4.1f} px  (Maks: {self.dev_thresh:.1f} px)", (25, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, dev_col, 1, cv2.LINE_AA)
+        cv2.putText(hud, f"Deviasi Ujung : {tip_val:4.1f} px  (Maks: {self.tip_thresh:.1f} px)", (25, 162),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, tip_col, 1, cv2.LINE_AA)
+        cv2.putText(hud, f"Tinggi Bilah  : {rib_h:4d} px  (Nom : 60 - 200 px)", (25, 184),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 220, 200), 1, cv2.LINE_AA)
         cv2.putText(hud, f"Validasi Sensor: {res.get('detection_reason', '')}", (25, 206),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.41, (220, 220, 120), 1, cv2.LINE_AA)
         cv2.putText(hud, f"Statistik QC   : Total Rib #{self.rib_count} | OK: {self.ok_count} | NG: {self.ng_count}", (25, 230),

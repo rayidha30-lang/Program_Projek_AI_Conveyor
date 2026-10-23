@@ -635,7 +635,7 @@ class InspectionDBBridge:
             except Exception:
                 pass
 
-        scale_k = 0.82
+        scale_k = 0.515
         print(f"\n[DB SAVED] Berhasil mencatat NG ke SQLite | ID: {trace_code} | Severity: {overall_severity}")
         if is_rib_ng:
             print(f"  -> RIB BENDING (Dev: {max_dev_val * scale_k:.1f}mm [{max_dev_val:.1f}px])")

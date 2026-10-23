@@ -1,7 +1,7 @@
 const API_HOST = typeof window !== "undefined" ? window.location.hostname : "localhost";
 export const API_BASE_URL = `http://${API_HOST}:5000/api`;
 
-export const SCALE_FACTOR_MM_PER_PX = 0.82;
+export const SCALE_FACTOR_MM_PER_PX = 0.515;
 
 /**
  * Format nilai piksel dan milimeter secara seragam: mm di depan, px di dalam kurung (1 desimal).

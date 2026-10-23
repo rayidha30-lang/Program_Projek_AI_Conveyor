@@ -48,34 +48,33 @@ class PatchCoreFeatureExtractor:
         self.model.layer2.register_forward_hook(lambda m, i, o: self._features.__setitem__("layer2", o.detach()))
         self.model.layer3.register_forward_hook(lambda m, i, o: self._features.__setitem__("layer3", o.detach()))
 
-        self.mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(3, 1, 1)
-        self.std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(3, 1, 1)
+        self.transform = T.Compose([
+            T.ToPILImage(),
+            T.Resize((self.input_h, self.input_w)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
 
     def extract(self, bgr_image):
         """
-        Ekstraksi patch embeddings dari crop citra BGR langsung pada GPU Tensor.
-        Output: torch.Tensor shape (N_patches, Feature_Dim) pada GPU device
+        Ekstraksi patch embeddings dari crop citra BGR.
+        Output: numpy array shape (N_patches, Feature_Dim)
         """
         if bgr_image is None or bgr_image.size == 0:
             return None
 
-        # Zero-copy OpenCV Resize & Direct Float Tensor (3x lebih cepat dari PIL)
         rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-        rgb_resized = cv2.resize(rgb, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
-        rgb_tensor = torch.from_numpy(rgb_resized).to(self.device).permute(2, 0, 1).float().div_(255.0)
-        x = rgb_tensor.sub_(self.mean).div_(self.std).unsqueeze(0)
-
         with torch.inference_mode():
+            x = self.transform(rgb).unsqueeze(0).to(self.device)
             self._features.clear()
             self.model(x)
 
             f2 = self._features["layer2"]  # (1, 128, H2, W2)
             f3 = self._features["layer3"]  # (1, 256, H3, W3)
-            h_feat, w_feat = f3.shape[-2:]
 
             # Interpolasi Layer 2 ke ukuran Layer 3 (sesuai spesifikasi training PatchCore)
             f2_down = nn.functional.interpolate(
-                f2, size=(h_feat, w_feat), mode="bilinear", align_corners=False
+                f2, size=f3.shape[-2:], mode="bilinear", align_corners=False
             )
             f2_flat = f2_down.squeeze(0).permute(1, 2, 0).reshape(-1, f2.shape[1])
             f3_flat = f3.squeeze(0).permute(1, 2, 0).reshape(-1, f3.shape[1])
@@ -84,12 +83,13 @@ class PatchCoreFeatureExtractor:
             emb = torch.cat([f2_flat, f3_flat], dim=1)
             emb = nn.functional.normalize(emb, p=2, dim=1)
 
-            return emb, (h_feat, w_feat)
+            h_feat, w_feat = f3.shape[-2:]
+            return emb.cpu().numpy().astype(np.float32), (h_feat, w_feat)
 
 
 class BracketAnomalyDetector:
     """
-    Detektor anomali lekukan plat menggunakan model PatchCore Memory Bank dengan akselerasi GPU murni.
+    Detektor anomali lekukan plat menggunakan model PatchCore Memory Bank.
     """
     def __init__(self, model_path, default_thresh=0.8650, device=None):
         """
@@ -103,7 +103,6 @@ class BracketAnomalyDetector:
         if device is None:
             device = "cuda" if (TORCH_AVAILABLE and torch.cuda.is_available()) else "cpu"
 
-        self.device = torch.device(device)
         print(f"[*] Memuat model PatchCore dari: {model_path}")
         with open(model_path, "rb") as f:
             data = pickle.load(f)
@@ -116,15 +115,16 @@ class BracketAnomalyDetector:
         print(f"    - Memory Bank Patches : {len(self.memory_bank)}")
         print(f"    - Calibrated Threshold: {self.calibrated_threshold:.4f}")
 
-        # Simpan Memory Bank di PyTorch GPU Tensor untuk akselerasi jarak 180x lebih cepat dari CPU scikit-learn
-        self.memory_bank_torch = torch.from_numpy(self.memory_bank).to(self.device).float()
+        # Inisialisasi Nearest Neighbors Search (1-NN)
+        self.nn_searcher = NearestNeighbors(n_neighbors=1, algorithm="auto", metric="minkowski", p=2)
+        self.nn_searcher.fit(self.memory_bank)
 
         # Inisialisasi Feature Extractor
         self.extractor = PatchCoreFeatureExtractor(input_size=(224, 224), device=device)
 
     def inspect_crop(self, crop_bgr, custom_thresh=None):
         """
-        Audit kondisi fisik lekukan plat dari gambar crop menggunakan GPU torch.cdist.
+        Audit kondisi fisik lekukan plat dari gambar crop.
         :param crop_bgr: Crop citra area lekukan (np.ndarray BGR)
         :param custom_thresh: Override threshold (opsional)
         :return: dict berisi status, score, heatmap, dan overlay
@@ -145,34 +145,36 @@ class BracketAnomalyDetector:
             if res is None:
                 return {"status": "INVALID", "score": 0.0, "threshold": thresh, "heatmap": None, "overlay": crop_bgr}
 
-            embeddings_torch, (h_feat, w_feat) = res
+            embeddings, (h_feat, w_feat) = res
 
-            # Akselerasi GPU 1-NN via torch.cdist (0.7 ms vs 130 ms CPU scikit-learn)
-            with torch.inference_mode():
-                dists_torch = torch.cdist(embeddings_torch, self.memory_bank_torch).min(dim=1).values
-                n_top = max(1, int(dists_torch.shape[0] * 0.03))
-                top_vals, _ = torch.topk(dists_torch, n_top)
-                anomaly_score = float(top_vals.mean().item())
+            # Hitung jarak terdekat setiap patch ke Memory Bank (1-NN)
+            distances, _ = self.nn_searcher.kneighbors(embeddings)
+            dists_flat = distances[:, 0].astype(np.float32)
+
+            # Skor Anomali Global = Rata-rata dari top 3% patch jarak terbesar (sesuai standar PatchCore)
+            n_top = max(1, int(len(dists_flat) * 0.03))
+            top_dists = np.sort(dists_flat)[-n_top:]
+            anomaly_score = float(np.mean(top_dists))
+
+            # Bangun Heatmap Anomali
+            h_orig, w_orig = crop_bgr.shape[:2]
+            dist_grid = dists_flat.reshape(h_feat, w_feat)
+            dist_resized = cv2.resize(dist_grid, (w_orig, h_orig), interpolation=cv2.INTER_CUBIC)
+            
+            # Normalisasi visualisasi heatmap
+            norm_map = np.clip((dist_resized - 0.2) / (thresh * 1.3 - 0.2 + 1e-6), 0.0, 1.0)
+            heatmap_color = cv2.applyColorMap((norm_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
+
+            # Blend dengan citra asli
+            overlay = cv2.addWeighted(crop_bgr, 0.65, heatmap_color, 0.35, 0)
 
             # Status Keputusan
-            status = "NG" if anomaly_score >= thresh else "OK"
-
-            # Lazy Heatmap generation: hanya dihitung jika status NG (menghemat 20ms CPU per frame normal)
-            overlay = crop_bgr
-            heatmap_color = None
-            if status == "NG":
-                h_orig, w_orig = crop_bgr.shape[:2]
-                dists_flat = dists_torch.cpu().numpy()
-                dist_grid = dists_flat.reshape(h_feat, w_feat)
-                dist_resized = cv2.resize(dist_grid, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
-                norm_map = np.clip((dist_resized - 0.2) / (thresh * 1.3 - 0.2 + 1e-6), 0.0, 1.0)
-                heatmap_color = cv2.applyColorMap((norm_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
-                overlay = cv2.addWeighted(crop_bgr, 0.65, heatmap_color, 0.35, 0)
+            status = "NG" if anomaly_score > thresh else "OK"
 
             return {
                 "status": status,
                 "score": anomaly_score,
-                "threshold": float(thresh),
+                "threshold": thresh,
                 "heatmap": heatmap_color,
                 "overlay": overlay
             }

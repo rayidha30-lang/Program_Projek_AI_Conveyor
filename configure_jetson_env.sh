@@ -250,7 +250,8 @@ NOTIFICATION_COOLDOWN_SEC=3.0
 # ------------------------------------------------------------------------------
 # 6. PARAMETER KALIBRASI FISIK KONVEYOR
 # ------------------------------------------------------------------------------
-SCALE_FACTOR_MM_PER_PX=0.82
+SCALE_FACTOR_MM_PER_PX=0.515
+SCALE_FACTOR_Y_MM_PER_PX=0.442
 TARGET_MIN_FPS=20.0
 EOF
 

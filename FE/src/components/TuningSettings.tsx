@@ -129,7 +129,7 @@ export default function TuningSettings({ theme = "dark" }: TuningSettingsProps) 
               Zero Downtime
             </span>
             <span className="rounded-md bg-sky-500/10 px-2 py-0.5 font-mono text-[10px] font-bold text-sky-400 border border-sky-500/20">
-              Skala Metrologi: 0.82 mm/px
+              Skala Metrologi: 0.515 mm/px
             </span>
             <span className="text-[11px] text-muted-foreground hidden sm:inline">
               • Parameter langsung diterapkan ke kamera secara seketika tanpa restart
@@ -602,7 +602,7 @@ function ParameterCard({
   const formatValue = (v: number) => {
     if (displayTransform) return displayTransform(v);
     if (unit === "px") {
-      const mm = v * (scaleFactor || 0.82);
+      const mm = v * (scaleFactor || 0.515);
       const pxStr = Number.isInteger(v) ? `${v} px` : `${v.toFixed(1)} px`;
       return `${mm.toFixed(1)} mm (${pxStr})`;
     }

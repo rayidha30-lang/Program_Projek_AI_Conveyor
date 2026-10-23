@@ -250,7 +250,8 @@ class SlatGapInspector:
 
         col = (0, 0, 255) if is_ng else (0, 255, 0)
         cv2.putText(graph, "PROFIL CELAH & DEFLEKSI PLAT", (8, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1)
-        cv2.putText(graph, f"Curv: {curvature*0.82:.1f}mm ({curvature:.1f}px) | Gap: {max_gap*0.82:.1f}mm ({max_gap:.1f}px)", 
+        scale = getattr(self, "scale_factor_mm_per_px", 0.515)
+        cv2.putText(graph, f"Curv: {curvature*scale:.1f}mm ({curvature:.1f}px) | Gap: {max_gap*scale:.1f}mm ({max_gap:.1f}px)", 
                     (8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1)
 
         pad_x, pad_y = 15, 42

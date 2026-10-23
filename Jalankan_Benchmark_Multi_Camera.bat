@@ -17,8 +17,12 @@ echo  [7] Mode Side Inspection Saja (CAM-02: Baut + Pin + Bracket)
 echo  [8] Pengujian 60 Detik + Rekam Hasil ke CSV (benchmark_report.csv)
 echo  [9] Uji Langsung Notifikasi Dynamic Card ke Node-RED / MS Teams
 echo  [10] Ekspor Seluruh Model YOLO ke TensorRT FP16 (.engine)
+echo  [11] Mode Live 2 Webcam USB (Deteksi Plat Rib ^& Baut Pin Langsung via Webcam)
+echo  [12] Mode Pengaturan Bebas (Pilih Webcam / File Video dengan Dialog Visual)
+echo  [13] Pilih File Video CAM-01 Top Saja (CAM-02 Default)
+echo  [14] Pilih File Video CAM-02 Side Saja (CAM-01 Default)
 echo.
-set /p opt="Pilihan Anda (1-10, Enter untuk Default 1): "
+set /p opt="Pilihan Anda (1-14, Enter untuk Default 1): "
 
 if "%opt%"=="2" (
     echo.
@@ -74,6 +78,22 @@ if "%opt%"=="2" (
     echo.
     echo [*] Menjalankan Ekspor Model ke TensorRT FP16 (.engine)...
     python export_tensorrt.py
+) else if "%opt%"=="11" (
+    echo.
+    echo [*] Menjalankan Mode Live 2 Webcam USB (Deteksi Plat Rib ^& Baut Pin)...
+    python run_multi_camera_benchmark.py --mode dual --webcam
+) else if "%opt%"=="12" (
+    echo.
+    echo [*] Membuka Dialog Visual Pengaturan Sumber Kamera (Webcam / File Video)...
+    python run_multi_camera_benchmark.py --mode dual --select-webcam
+) else if "%opt%"=="13" (
+    echo.
+    echo [*] Membuka File Dialog untuk Memilih Video CAM-01 Top Saja...
+    python run_multi_camera_benchmark.py --mode dual --select-top
+) else if "%opt%"=="14" (
+    echo.
+    echo [*] Membuka File Dialog untuk Memilih Video CAM-02 Side Saja...
+    python run_multi_camera_benchmark.py --mode dual --select-side
 ) else (
     echo.
     echo [*] Menjalankan Mode Dual-Window (Kiri: CAM-01 Top, Kanan: CAM-02 Side)...

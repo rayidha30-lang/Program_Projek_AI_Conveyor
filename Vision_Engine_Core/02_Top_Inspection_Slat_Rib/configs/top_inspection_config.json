@@ -52,9 +52,19 @@
     "bracket_tilt_deg": 0.9,
     "max_flatness_pv": 16.5,
     "max_sagitta": 8.6,
-    "max_center_void": 1450
+    "max_center_void": 1450,
+    "scale_factor_mm_per_px": 0.515,
+    "scale_factor_y_mm_per_px": 0.442
   },
-  "updated_at": "2026-10-02 15:19:58",
+  "physical_dimensions": {
+    "slat_width_flat_mm": 820.0,
+    "slat_total_width_mm": 930.0,
+    "rib_length_mm": 750.0,
+    "rib_height_mm": 50.0,
+    "scale_factor_mm_per_px": 0.515,
+    "scale_factor_y_mm_per_px": 0.442
+  },
+  "updated_at": "2026-10-22 11:10:00",
   "calibration_profile": {
     "calibrated_at": "2026-10-02 15:19:58",
     "total_slats_in_loop": 16,

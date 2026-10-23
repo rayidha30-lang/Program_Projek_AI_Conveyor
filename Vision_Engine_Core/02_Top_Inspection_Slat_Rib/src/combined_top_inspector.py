@@ -337,8 +337,8 @@ class CombinedTopInspector:
                 max_pv_slat = float(th.get("max_flatness_pv", max_pv_slat))
                 max_sag_slat = float(th.get("max_sagitta", max_sag_slat))
                 max_void_slat = int(th.get("max_center_void", max_void_slat))
-                min_cov_slat = float(th.get("min_continuity_cov", min_cov_slat))
-                self.scale_factor_mm_per_px = float(th.get("scale_factor_mm_per_px", 0.82))
+                self.scale_factor_mm_per_px = float(th.get("scale_factor_mm_per_px", 0.515))
+                self.scale_factor_y_mm_per_px = float(th.get("scale_factor_y_mm_per_px", 0.442))
 
                 rib_pv = float(th.get("rib_pv_threshold", rib_pv))
                 rib_sag = float(th.get("rib_sagitta_threshold", rib_sag))
@@ -370,7 +370,8 @@ class CombinedTopInspector:
         self.slat_inspector.max_center_void = max_void_slat
         self.slat_inspector.min_continuity_cov = min_cov_slat
         if not hasattr(self, "scale_factor_mm_per_px"):
-            self.scale_factor_mm_per_px = 0.82
+            self.scale_factor_mm_per_px = 0.515
+        self.scale_factor_y_mm_per_px = getattr(self, "scale_factor_y_mm_per_px", 0.442)
         self.slat_inspector.scale_factor_mm_per_px = self.scale_factor_mm_per_px
 
         # Inisialisasi Engine Sirip (HybridRibInspector dengan akselerasi CUDA / CPU)
@@ -385,6 +386,7 @@ class CombinedTopInspector:
             device=device
         )
         self.rib_inspector.scale_factor_mm_per_px = self.scale_factor_mm_per_px
+        self.rib_inspector.scale_factor_y_mm_per_px = self.scale_factor_y_mm_per_px
 
         # State Early-Catch & Peak-Hold Latch (Proteksi Oklusi Plat Sebelum Sirip)
         self.slat_history_samples = []
@@ -448,7 +450,7 @@ class CombinedTopInspector:
 
         slat_res = inspect_res.get("slat_res", {}) if inspect_res else {}
         rib_res = inspect_res.get("rib_res", {}) if inspect_res else {}
-        scale = getattr(self, "scale_factor_mm_per_px", 0.82)
+        scale = getattr(self, "scale_factor_mm_per_px", 0.515)
 
         # 1. Gambar Polygon Gerbang Slat jika ada
         if self.slat_polygon is not None and len(self.slat_polygon) >= 3:
@@ -1052,9 +1054,16 @@ class CombinedTopInspector:
             if is_rib_present and box:
                 bx1, by1, bx2, by2 = box
                 rx1, ry1, rx2, ry2 = int(bx1 * sx), int(by1 * sy), int(bx2 * sx), int(by2 * sy)
+                w_px = bx2 - bx1
+                h_px = by2 - by1
+                scale_x = getattr(self, "scale_factor_mm_per_px", 0.515)
+                scale_y = getattr(self, "scale_factor_y_mm_per_px", 0.442)
+                w_mm = int(round(w_px * scale_x))
+                h_mm = int(round(h_px * scale_y))
+                rib_tag = f"SIRIP AKTIF ({w_mm}x{h_mm} mm | {w_px}x{h_px} px)"
                 cv2.rectangle(main_resized, (rx1, ry1), (rx2, ry2), (255, 170, 0), 2, cv2.LINE_AA)
-                cv2.putText(main_resized, f"SIRIP AKTIF ({bx2-bx1}x{by2-by1} px)", (rx1, max(24, ry1 - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 170, 0), 2, cv2.LINE_AA)
+                cv2.putText(main_resized, rib_tag, (rx1, max(24, ry1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 170, 0), 2, cv2.LINE_AA)
 
             # Gambar Garis Puncak Sirip (Ridge Tracking) menempel di bibir bilah fisik
             xs_r = rib_res.get("xs_contour")
@@ -1162,7 +1171,7 @@ class CombinedTopInspector:
         pv_c = (0, 255, 0) if s_pv <= self.slat_inspector.max_flatness_pv else (0, 0, 255)
         sag_c = (0, 255, 0) if s_sag <= self.slat_inspector.max_sagitta else (0, 0, 255)
 
-        scale = getattr(self, "scale_factor_mm_per_px", 0.82)
+        scale = getattr(self, "scale_factor_mm_per_px", 0.515)
         s_pv_mm = s_pv * scale
         max_pv_mm = self.slat_inspector.max_flatness_pv * scale
         s_sag_mm = s_sag * scale

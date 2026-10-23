@@ -30,8 +30,8 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 
-# Faktor skala kalibrasi fisik conveyor (Ground Truth: Plat Slat 820mm / 1000px = 0.82 mm/px)
-SCALE_FACTOR_MM_PER_PX = 0.82
+# Faktor skala kalibrasi fisik conveyor (Ground Truth: Rib 750mm / 1457px & Plat Slat 820mm / 1592px = 0.515 mm/px)
+SCALE_FACTOR_MM_PER_PX = 0.515
 
 
 class NodeRedTeamsNotifier:

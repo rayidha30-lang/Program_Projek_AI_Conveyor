@@ -131,7 +131,7 @@ class HoughStitchingInspector:
         self.min_continuity_cov = 0.25    # Rasio kontinuitas celah minimum (25% dari bentang metal 500 px)
         self.max_center_void = 1450       # px: Batas luas celah terbuka (void gap) akibat plat meleyot
         self.tracked_y_seam = 70.0        # px: Pelacakan kontinu horizon celah plat
-        self.scale_factor_mm_per_px = 0.82  # Faktor skala fisik konveyor (Ground Truth: 820mm / 1000px = 0.82 mm/px)
+        self.scale_factor_mm_per_px = 0.515  # Faktor skala fisik konveyor (Ground Truth: Plat Slat 820mm / 1592px = 0.515 mm/px)
 
         # Mini Trigger Zone Baut Rantai Samping (Anchor Pemicu Celah Slat)
         self.use_bolt_trigger = False
@@ -1020,7 +1020,7 @@ class HoughStitchingInspector:
             cv2.circle(annotated, (int(xs[mid_idx]), int(ys[mid_idx])), 6, (0, 255, 255), -1)
 
             # Pill Badge Metrologi di Atas Kontur
-            scale = getattr(self, "scale_factor_mm_per_px", 0.82)
+            scale = getattr(self, "scale_factor_mm_per_px", 0.515)
             lbl_metro = f"METROLOGI: PV={pv*scale:.1f}mm ({pv:.1f}px) | Sag={sagitta*scale:.1f}mm ({sagitta:.1f}px) | Cov={cov*100:.0f}%"
             pill_w = 490
             pill_h = 24
@@ -1082,7 +1082,7 @@ class HoughStitchingInspector:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 220, 255), 1, cv2.LINE_AA)
 
         # Bar 1: Flatness (Peak-to-Valley Deviation)
-        scale = getattr(self, "scale_factor_mm_per_px", 0.82)
+        scale = getattr(self, "scale_factor_mm_per_px", 0.515)
         pv_mm = pv * scale
         max_pv_mm = self.max_flatness_pv * scale
         pv_col = (0, 220, 0) if pv <= self.max_flatness_pv else (0, 40, 255)
