@@ -82,6 +82,11 @@ def select_file_dialog(initial_dir=None, title="Pilih File Video / Foto Inspeksi
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
+        try:
+            root.lift()
+            root.focus_force()
+        except Exception:
+            pass
 
         file_path = filedialog.askopenfilename(
             title=title,
@@ -224,34 +229,59 @@ class HybridRibInspector:
             cur_dir = os.path.dirname(os.path.abspath(__file__))
             parent_dir = os.path.dirname(cur_dir)
 
+            # Siapkan seluruh kandidat model rib resmi (.engine, .pt, .onnx)
+            engine_candidates = [
+                os.path.join(parent_dir, "models", "best_rib_v5.engine"),
+                os.path.join(parent_dir, "models", "best_rib_v4.engine"),
+                os.path.join(parent_dir, "models", "best_rib.engine"),
+                os.path.join(cur_dir, "best_rib_v5.engine"),
+                os.path.join(cur_dir, "best_rib_v4.engine"),
+                os.path.join(cur_dir, "best_rib.engine"),
+            ]
+            pt_candidates = [
+                os.path.join(parent_dir, "models", "best_rib_v5.pt"),
+                os.path.join(parent_dir, "models", "best_rib_v4.pt"),
+                os.path.join(parent_dir, "models", "best_rib_v3.pt"),
+                os.path.join(parent_dir, "models", "best_rib_v2.pt"),
+                os.path.join(parent_dir, "models", "best_rib.pt"),
+                os.path.join(cur_dir, "best_rib_v5.pt"),
+                os.path.join(cur_dir, "best_rib_v4.pt"),
+                os.path.join(cur_dir, "best_rib_v3.pt"),
+                os.path.join(cur_dir, "best_rib_v2.pt"),
+                os.path.join(cur_dir, "best_rib_v1.pt"),
+                os.path.join(parent_dir, "best_rib_v5.pt"),
+                os.path.join(parent_dir, "best_rib_v4.pt"),
+                os.path.join(parent_dir, "best_rib_v3.pt"),
+                os.path.join(parent_dir, "best_rib_v2.pt"),
+                os.path.join(parent_dir, "best_rib_v1.pt")
+            ]
+            onnx_candidates = [
+                os.path.join(parent_dir, "models", "best_rib_v5.onnx"),
+                os.path.join(parent_dir, "models", "best_rib_v4.onnx"),
+                os.path.join(parent_dir, "models", "best_rib.onnx"),
+                os.path.join(cur_dir, "best_rib_v5.onnx"),
+                os.path.join(cur_dir, "best_rib_v4.onnx"),
+                os.path.join(cur_dir, "best_rib.onnx"),
+                os.path.abspath(os.path.join(cur_dir, "..", "..", "..", "02_Top_Inspection_Slat_Rib", "models", "best_rib_v4.onnx")),
+                os.path.abspath(os.path.join(cur_dir, "..", "..", "..", "02_Top_Inspection_Slat_Rib", "models", "best_rib.onnx")),
+            ]
+            candidates = (engine_candidates + pt_candidates + onnx_candidates) if self.device != "cpu" else (pt_candidates + onnx_candidates)
+
             if model_path is None:
-                # Prioritaskan bobot TensorRT Engine (.engine) jika GPU aktif
-                engine_candidates = [
-                    os.path.join(parent_dir, "models", "best_rib_v5.engine"),
-                    os.path.join(parent_dir, "models", "best_rib_v4.engine"),
-                    os.path.join(parent_dir, "models", "best_rib.engine"),
-                    os.path.join(cur_dir, "best_rib_v5.engine"),
-                    os.path.join(cur_dir, "best_rib_v4.engine"),
-                    os.path.join(cur_dir, "best_rib.engine"),
-                ]
-                pt_candidates = [
-                    os.path.join(parent_dir, "models", "best_rib_v5.pt"),
-                    os.path.join(parent_dir, "models", "best_rib_v4.pt"),
-                    os.path.join(parent_dir, "models", "best_rib_v3.pt"),
-                    os.path.join(parent_dir, "models", "best_rib_v2.pt"),
-                    os.path.join(parent_dir, "models", "best_rib.pt"),
-                    os.path.join(cur_dir, "best_rib_v5.pt"),
-                    os.path.join(cur_dir, "best_rib_v4.pt"),
-                    os.path.join(cur_dir, "best_rib_v3.pt"),
-                    os.path.join(cur_dir, "best_rib_v2.pt"),
-                    os.path.join(cur_dir, "best_rib_v1.pt"),
-                    os.path.join(parent_dir, "best_rib_v5.pt"),
-                    os.path.join(parent_dir, "best_rib_v4.pt"),
-                    os.path.join(parent_dir, "best_rib_v3.pt"),
-                    os.path.join(parent_dir, "best_rib_v2.pt"),
-                    os.path.join(parent_dir, "best_rib_v1.pt")
-                ]
-                candidates = (engine_candidates + pt_candidates) if self.device != "cpu" else pt_candidates
+                env_top = os.environ.get("MODEL_TOP_PATH")
+                if env_top:
+                    cand_env = [
+                        env_top,
+                        os.path.join(cur_dir, env_top),
+                        os.path.join(parent_dir, env_top),
+                        os.path.abspath(os.path.join(cur_dir, "..", "..", "..", env_top))
+                    ]
+                    for ce in cand_env:
+                        if os.path.exists(ce):
+                            model_path = ce
+                            break
+
+            if model_path is None:
                 for c in candidates:
                     if os.path.exists(c):
                         model_path = c
@@ -272,7 +302,32 @@ class HybridRibInspector:
                         self.yolo_model.to(self.device)
                         self.use_half = True
                     self.class_names = self.yolo_model.names if hasattr(self.yolo_model, 'names') else {0: 'rib'}
-                    print(f"[HybridRibInspector] Model YOLO dimuat: {os.path.basename(model_path)} (Device: {self.device_info}, FP16: {self.use_half}, Kelas: {self.class_names})")
+
+                    # Validasi kelas model: pastikan bukan model Bolt/Pin yang salah konfigurasi
+                    is_rib_model = any("rib" in str(v).lower() or "sirip" in str(v).lower() for v in self.class_names.values())
+                    if not is_rib_model:
+                        print(f"[HybridRibInspector] ⚠️ PERINGATAN: Model '{os.path.basename(model_path)}' memiliki kelas {self.class_names} dan BUKAN model deteksi Rib/Sirip!")
+                        print(f"[HybridRibInspector] 🔄 Otomatis beralih ke bobot model Rib resmi...")
+                        fallback_rib = None
+                        for cand in candidates:
+                            if "rib" in os.path.basename(cand).lower() and os.path.exists(cand):
+                                fallback_rib = cand
+                                break
+                        if fallback_rib:
+                            try:
+                                self.yolo_model = YOLO(fallback_rib)
+                                if self.device != "cpu" and HAS_TORCH and torch.cuda.is_available():
+                                    self.yolo_model.to(self.device)
+                                    self.use_half = True
+                                self.model_path = fallback_rib
+                                self.class_names = self.yolo_model.names if hasattr(self.yolo_model, 'names') else {0: 'rib'}
+                                print(f"[HybridRibInspector] ✅ Berhasil beralih ke Model Rib: {os.path.basename(fallback_rib)} (Kelas: {self.class_names})")
+                            except Exception as fb_err:
+                                print(f"[HybridRibInspector] Gagal memuat fallback model rib: {fb_err}")
+                        else:
+                            print(f"[HybridRibInspector] ⚠️ Tidak menemukan file model rib resmi di folder kandidat.")
+
+                    print(f"[HybridRibInspector] Model YOLO dimuat: {os.path.basename(self.model_path)} (Device: {self.device_info}, FP16: {self.use_half}, Kelas: {self.class_names})")
                 except Exception as e:
                     print(f"[HybridRibInspector WARNING] Gagal memuat YOLO ({e}). Fallback ke DUAL_POLARITY_ONLY.")
                     self.yolo_model = None
@@ -513,9 +568,9 @@ class HybridRibInspector:
                 "agnostic_nms": True,
                 "verbose": False
             }
-            # Jangan override imgsz & half jika model adalah TensorRT .engine
-            is_trt = self.model_path and str(self.model_path).endswith(".engine")
-            if not is_trt:
+            # Jangan override imgsz & half jika model adalah TensorRT .engine atau ONNX .onnx
+            is_trt_or_onnx = self.model_path and (str(self.model_path).endswith(".engine") or str(self.model_path).endswith(".onnx"))
+            if not is_trt_or_onnx:
                 predict_kwargs["imgsz"] = target_imgsz
                 if self.use_half and self.device != "cpu":
                     predict_kwargs["half"] = True

@@ -800,6 +800,11 @@ def select_video_file(initial_dir=None, title="Pilih File Video Inspeksi"):
         root = tk.Tk()
         root.withdraw()  # Sembunyikan window utama tkinter
         root.attributes("-topmost", True)  # Pastikan dialog selalu berada di depan
+        try:
+            root.lift()
+            root.focus_force()
+        except Exception:
+            pass
 
         default_dir = initial_dir
         if not default_dir or not os.path.exists(default_dir):
@@ -1019,7 +1024,7 @@ def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", e
 
             # Petunjuk shortcut di bagian bawah frame
             db_state = "ON" if inspector.is_db_enabled() else "OFF"
-            help_bar = f"[SPACE]: Pause | [D]: DB({db_state}) | [O/F]: Video | [N/P]: Step | [R]: Reset | [Q]: Keluar"
+            help_bar = f"[SPACE]: Pause | [D]: DB({db_state}) | [W]/[O]: Media | [N/P]: Step | [R]: Reset | [Q]: Keluar"
             banner_color = (0, 255, 255) if inspector.is_db_enabled() else (220, 220, 220)
             cv2.putText(display_frame, help_bar, (15, h_f - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.44, banner_color, 1)
 
@@ -1034,7 +1039,7 @@ def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", e
                 st = inspector.toggle_db()
                 status_str = "AKTIF (RECORDING & NOTIFIKASI TEAMS)" if st else "MATI (DRY-RUN BENCHMARK)"
                 print(f"\n[*] [{inspector.camera_id} SIDE] SAKLAR DATABASE & TEAMS: {status_str}\n")
-            elif key in [ord('o'), ord('O'), ord('f'), ord('F')]:
+            elif key in [ord('w'), ord('W'), ord('o'), ord('O'), ord('f'), ord('F')]:
                 # Buka dialog pemilih file video baru
                 cur_dir = os.path.dirname(video_path) if video_path and os.path.exists(os.path.dirname(video_path)) else None
                 new_video = select_video_file(initial_dir=cur_dir, title="Pilih File Video Baru untuk Diinspeksi")

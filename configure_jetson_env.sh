@@ -132,27 +132,49 @@ if [ "$AUTO_MODE" = false ]; then
     esac
 fi
 
-# 4. Deteksi Model AI (TensorRT .engine vs PyTorch .pt)
+# 4. Deteksi Model AI (TensorRT .engine, ONNX .onnx, vs PyTorch .pt)
 echo ""
 echo -e "${BOLD}[2/5] Memeriksa Ketersediaan Bobot Model AI...${NC}"
-TOP_MODEL="Dataset Yolo/best_v2.pt"
-SIDE_MODEL="Dataset Yolo/best_v1.pt"
 
-# Cek apakah ada TensorRT engine hasil konversi di Jetson
-if [ -f "Jetson_Vision_Engine/02_Top_Inspection_Slat_Rib/models/best_rib.engine" ]; then
-    TOP_MODEL="Jetson_Vision_Engine/02_Top_Inspection_Slat_Rib/models/best_rib.engine"
+# Prioritas pencarian model Top Inspection (Bilah Rib)
+TOP_MODEL="Vision_Engine_Core/02_Top_Inspection_Slat_Rib/models/best_rib_v5.pt"
+if [ -f "Vision_Engine_Core/02_Top_Inspection_Slat_Rib/models/best_rib_v5.engine" ]; then
+    TOP_MODEL="Vision_Engine_Core/02_Top_Inspection_Slat_Rib/models/best_rib_v5.engine"
+    echo -e "${GREEN}✅ Ditemukan TensorRT Top Model: $TOP_MODEL${NC}"
+elif [ -f "Vision_Engine_Core/02_Top_Inspection_Slat_Rib/models/best_rib.engine" ]; then
+    TOP_MODEL="Vision_Engine_Core/02_Top_Inspection_Slat_Rib/models/best_rib.engine"
     echo -e "${GREEN}✅ Ditemukan TensorRT Top Model: $TOP_MODEL${NC}"
 elif [ -f "02_Top_Inspection_Slat_Rib/models/best_rib.engine" ]; then
     TOP_MODEL="02_Top_Inspection_Slat_Rib/models/best_rib.engine"
     echo -e "${GREEN}✅ Ditemukan TensorRT Top Model: $TOP_MODEL${NC}"
+elif [ -f "Vision_Engine_Core/02_Top_Inspection_Slat_Rib/models/best_rib_v5.onnx" ]; then
+    TOP_MODEL="Vision_Engine_Core/02_Top_Inspection_Slat_Rib/models/best_rib_v5.onnx"
+    echo -e "${GREEN}✅ Ditemukan ONNX Top Model: $TOP_MODEL${NC}"
+elif [ -f "02_Top_Inspection_Slat_Rib/models/best_rib.onnx" ]; then
+    TOP_MODEL="02_Top_Inspection_Slat_Rib/models/best_rib.onnx"
+    echo -e "${GREEN}✅ Ditemukan ONNX Top Model: $TOP_MODEL${NC}"
+elif [ -f "Vision_Engine_Core/02_Top_Inspection_Slat_Rib/models/best_rib_v5.pt" ]; then
+    TOP_MODEL="Vision_Engine_Core/02_Top_Inspection_Slat_Rib/models/best_rib_v5.pt"
+    echo -e "${GREEN}✅ Ditemukan PyTorch Top Model: $TOP_MODEL${NC}"
 fi
 
-if [ -f "Jetson_Vision_Engine/01_Side_Inspection_Bolt_Pin/models/best_v2.engine" ]; then
-    SIDE_MODEL="Jetson_Vision_Engine/01_Side_Inspection_Bolt_Pin/models/best_v2.engine"
+# Prioritas pencarian model Side Inspection (Baut, Pin & Bracket)
+SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v2.pt"
+if [ -f "Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v2.engine" ]; then
+    SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v2.engine"
     echo -e "${GREEN}✅ Ditemukan TensorRT Side Model: $SIDE_MODEL${NC}"
 elif [ -f "01_Side_Inspection_Bolt_Pin/models/best_v2.engine" ]; then
     SIDE_MODEL="01_Side_Inspection_Bolt_Pin/models/best_v2.engine"
     echo -e "${GREEN}✅ Ditemukan TensorRT Side Model: $SIDE_MODEL${NC}"
+elif [ -f "Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v2.onnx" ]; then
+    SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v2.onnx"
+    echo -e "${GREEN}✅ Ditemukan ONNX Side Model: $SIDE_MODEL${NC}"
+elif [ -f "01_Side_Inspection_Bolt_Pin/models/best_v2.onnx" ]; then
+    SIDE_MODEL="01_Side_Inspection_Bolt_Pin/models/best_v2.onnx"
+    echo -e "${GREEN}✅ Ditemukan ONNX Side Model: $SIDE_MODEL${NC}"
+elif [ -f "Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v2.pt" ]; then
+    SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v2.pt"
+    echo -e "${GREEN}✅ Ditemukan PyTorch Side Model: $SIDE_MODEL${NC}"
 fi
 
 # 5. Rekomendasi Engine & Display Mode

@@ -277,6 +277,11 @@ def select_file_dialog(initial_dir=None, title="Pilih File Video"):
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
+        try:
+            root.lift()
+            root.focus_force()
+        except Exception:
+            pass
 
         # Tentukan direktori awal cerdas
         default_dir = initial_dir
@@ -329,6 +334,11 @@ def select_source_dialog(title="Pilih Sumber Kamera / Video", default_source=Non
         root = tk.Tk()
         root.title(title)
         root.attributes("-topmost", True)
+        try:
+            root.lift()
+            root.focus_force()
+        except Exception:
+            pass
         root.geometry("480x370")
         root.resizable(False, False)
 
@@ -490,6 +500,11 @@ def select_dual_camera_setup_dialog(default_top, default_side, side_cam_id="CAM-
         root = tk.Tk()
         root.title("Pengaturan Sumber Dual Kamera (CAM-01 Top & CAM-02 Side)")
         root.attributes("-topmost", True)
+        try:
+            root.lift()
+            root.focus_force()
+        except Exception:
+            pass
         root.geometry("540x510")
         root.resizable(False, False)
 
@@ -687,7 +702,7 @@ def _run_top_worker(
         status_buf.value = b"SRC_ERROR"
         return
 
-    win_name = "CAM-01 TOP (SLAT & RIB) | [D]: Toggle DB | [1/V]: Ganti Video | [Q]: Keluar"
+    win_name = "CAM-01 TOP (SLAT & RIB) | [D]: DB | [W]: Sumber / Cam | [1/V]: Video | [Q]: Keluar"
     if mode == "dual":
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win_name, 920, 518)
@@ -766,6 +781,25 @@ def _run_top_worker(
                 elif key in [ord("r"), ord("R")]:
                     inspector.reset_counters()
                     print("\n[*] [CAM-01 TOP] Counter QC & Cache Deduplikasi di-reset ke 0.\n")
+                elif key in [ord("w"), ord("W"), ord("c"), ord("C")]:
+                    print("\n[*] [CAM-01 TOP] Membuka Dialog Pemilihan Sumber (Webcam / File Video)...")
+                    new_src = select_source_dialog(
+                        title="[CAM-01 TOP] Pilih Sumber Video / Kamera Plat & Sirip",
+                        default_source=cap_src
+                    )
+                    cv2.waitKey(1)
+                    if new_src is not None and str(new_src) != str(cap_src):
+                        cap.release()
+                        new_cap, is_cam, cap_src = create_capture(new_src)
+                        if new_cap.isOpened():
+                            cap = new_cap
+                            frame_count = 0
+                            fps_history.clear()
+                            s_desc = f"Webcam #{cap_src}" if is_cam else os.path.basename(str(cap_src))
+                            print(f"[*] [CAM-01 TOP] Sumber input dialihkan ke: {s_desc}")
+                        else:
+                            print(f"[!] [CAM-01 TOP] Gagal membuka sumber baru: {new_src}, kembali ke sumber sebelumnya.")
+                            cap = cv2.VideoCapture(cap_src)
                 elif key in [ord("1"), ord("v"), ord("V"), ord("t"), ord("T"), ord("o"), ord("O"), ord("f"), ord("F")]:
                     print("\n[*] [CAM-01 TOP] Membuka File Dialog Explorer...")
                     init_d = os.path.dirname(cap_src) if os.path.exists(str(cap_src)) else os.path.join(BASE_DIR, "Jetson_Vision_Engine", "Video_Testing")
@@ -900,7 +934,7 @@ def _run_side_worker(
                 is_cam = False
                 print(f"[INFO SIDE WORKER] Webcam #{cam_idx} tidak terdeteksi. Beralih otomatis ke video testing: {os.path.basename(DEFAULT_SIDE_VIDEO)}")
 
-    win_name = f"{camera_id} SIDE [{camera_id} {side}] | [D]: Toggle DB | [2/O]: Ganti Video | [Q]: Keluar"
+    win_name = f"{camera_id} SIDE [{camera_id} {side}] | [D]: DB | [W]: Sumber / Cam | [2/S]: Video | [Q]: Keluar"
     if mode == "dual":
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win_name, 920, 518)
@@ -992,7 +1026,7 @@ def _run_side_worker(
                 # Tambahkan overlay benchmark banner di bagian bawah frame
                 h_d, w_d = display_frame.shape[:2]
                 db_state = "ON" if (db_bridge and db_bridge.is_enabled()) else "OFF"
-                banner = f"FPS: {avg_fps:4.1f} | Lat: {latency_ms:4.1f}ms | DB:{db_state} | [D]:Toggle DB | [2/O]:Ganti | [Q]:Keluar"
+                banner = f"FPS: {avg_fps:4.1f} | Lat: {latency_ms:4.1f}ms | DB:{db_state} | [D]:DB | [W]:Cam/File | [2]:Video | [Q]:Keluar"
                 cv2.rectangle(display_frame, (10, h_d - 40), (620, h_d - 10), (20, 20, 20), -1)
                 cv2.putText(display_frame, banner, (18, h_d - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1, cv2.LINE_AA)
@@ -1008,6 +1042,28 @@ def _run_side_worker(
                         st = db_bridge.toggle()
                         status_str = "AKTIF (RECORDING & NOTIFIKASI TEAMS)" if st else "MATI (DRY-RUN BENCHMARK)"
                         print(f"\n[*] [{camera_id} SIDE] SAKLAR DATABASE & TEAMS: {status_str}\n")
+                elif key in [ord("w"), ord("W"), ord("c"), ord("C")]:
+                    print(f"\n[*] [{camera_id} SIDE] Membuka Dialog Pemilihan Sumber (Webcam / File Video)...")
+                    curr_s = side_video_path if (not is_cam and side_video_path) else "0"
+                    new_src = select_source_dialog(
+                        title=f"[{camera_id} SIDE] Pilih Sumber Video / Kamera Baut & Pin",
+                        default_source=curr_s
+                    )
+                    cv2.waitKey(1)
+                    if new_src is not None and str(new_src) != str(curr_s):
+                        if cap is not None and cap.isOpened():
+                            cap.release()
+                        new_cap, is_cam, side_video_path = create_capture(new_src)
+                        if new_cap.isOpened():
+                            cap = new_cap
+                            frame_count = 0
+                            consecutive_cam_fails = 0
+                            fps_history.clear()
+                            s_desc = f"Webcam #{side_video_path}" if is_cam else os.path.basename(str(side_video_path))
+                            print(f"[*] [{camera_id} SIDE] Sumber input dialihkan ke: {s_desc}")
+                        else:
+                            print(f"[!] [{camera_id} SIDE] Gagal membuka sumber baru: {new_src}, kembali ke video sebelumnya.")
+                            cap = cv2.VideoCapture(curr_s)
                 elif key in [ord("2"), ord("o"), ord("O"), ord("f"), ord("F"), ord("s"), ord("S")]:
                     print(f"\n[*] [{camera_id} SIDE] Membuka File Dialog Explorer...")
                     candidate_side_dir = os.path.dirname(side_video_path) if side_video_path and os.path.exists(side_video_path) else os.path.abspath(os.path.join(BASE_DIR, "..", "Documentation"))

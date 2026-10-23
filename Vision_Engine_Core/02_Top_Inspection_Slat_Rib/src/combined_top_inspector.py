@@ -369,10 +369,31 @@ class CombinedTopInspector:
         self.slat_inspector.max_sagitta = max_sag_slat
         self.slat_inspector.max_center_void = max_void_slat
         self.slat_inspector.min_continuity_cov = min_cov_slat
+
+        # Override nilai scale_factor dari .env / sistem jika didefinisikan oleh user
+        env_scale_x = os.environ.get("SCALE_FACTOR_MM_PER_PX")
+        if env_scale_x:
+            try:
+                self.scale_factor_mm_per_px = float(env_scale_x)
+                print(f"[*] Skala Kalibrasi X dimuat dari .env: {self.scale_factor_mm_per_px} mm/px")
+            except ValueError:
+                pass
+        env_scale_y = os.environ.get("SCALE_FACTOR_Y_MM_PER_PX")
+        if env_scale_y:
+            try:
+                self.scale_factor_y_mm_per_px = float(env_scale_y)
+                print(f"[*] Skala Kalibrasi Y dimuat dari .env: {self.scale_factor_y_mm_per_px} mm/px")
+            except ValueError:
+                pass
+
         if not hasattr(self, "scale_factor_mm_per_px"):
             self.scale_factor_mm_per_px = 0.515
         self.scale_factor_y_mm_per_px = getattr(self, "scale_factor_y_mm_per_px", 0.442)
         self.slat_inspector.scale_factor_mm_per_px = self.scale_factor_mm_per_px
+
+        # Model bobot Sirip: periksa parameter arg, lalu .env MODEL_TOP_PATH
+        if rib_model_path is None:
+            rib_model_path = os.environ.get("MODEL_TOP_PATH")
 
         # Inisialisasi Engine Sirip (HybridRibInspector dengan akselerasi CUDA / CPU)
         self.rib_inspector = HybridRibInspector(
@@ -1225,7 +1246,7 @@ class CombinedTopInspector:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (150, 180, 220), 2, cv2.LINE_AA)
         cv2.putText(hud, "[SPACE]: Pause/Play   [N]: +1 Maju   [P]: -1 Mundur   [R]: Reset Counter", (25, 238),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 220, 220), 1, cv2.LINE_AA)
-        cv2.putText(hud, "[O]/[F]: Media   [V]: Ganti Video   [T]: Turbo   [D]: DB Log   [Q]: Keluar", (25, 260),
+        cv2.putText(hud, "[W]/[O]/[F]: Media   [V]: Ganti Video   [T]: Turbo   [D]: DB Log   [Q]: Keluar", (25, 260),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 220, 220), 1, cv2.LINE_AA)
         cv2.putText(hud, f"File: {inspect_result.get('filename', '-')} | Posisi: {frame_idx}/{total_frames}", (25, 282),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (140, 210, 140), 1, cv2.LINE_AA)
@@ -1477,7 +1498,7 @@ def main():
                 step_backward = True
         elif key in [ord('r'), ord('R')]:
             pipeline.reset_counters()
-        elif key in [ord('o'), ord('O'), ord('f'), ord('F')]:
+        elif key in [ord('w'), ord('W'), ord('o'), ord('O'), ord('f'), ord('F')]:
             # Buka dialog explorer
             print("\n[*] Membuka File Dialog Explorer...")
             new_file = select_file_dialog(

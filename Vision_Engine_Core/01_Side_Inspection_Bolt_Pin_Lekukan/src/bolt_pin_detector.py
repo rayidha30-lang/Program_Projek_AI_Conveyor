@@ -70,8 +70,9 @@ class BoltPinDetector:
             actual_model_to_load = engine_candidate
             print(f"[BoltPinDetector] 🚀 Menggunakan TensorRT Engine FP16: {os.path.basename(engine_candidate)}")
 
+        self.actual_model_to_load = actual_model_to_load
         self.model = YOLO(actual_model_to_load)
-        if self.device != "cpu" and HAS_TORCH and torch.cuda.is_available() and not actual_model_to_load.endswith(".engine"):
+        if self.device != "cpu" and HAS_TORCH and torch.cuda.is_available() and not actual_model_to_load.endswith((".engine", ".onnx")):
             try:
                 self.model.to(self.device)
                 if hasattr(self.model, "model") and self.model.model is not None:
@@ -84,6 +85,33 @@ class BoltPinDetector:
         self.max_pin_distance = max_pin_distance
         self.agnostic_nms = agnostic_nms
         self.class_names = self.model.names if hasattr(self.model, 'names') else {}
+        is_bolt_model = any("bolt" in str(v).lower() or "pin" in str(v).lower() for v in self.class_names.values())
+        if not is_bolt_model:
+            print(f"[BoltPinDetector] ⚠️ PERINGATAN: Model '{os.path.basename(actual_model_to_load)}' memiliki kelas {self.class_names} dan BUKAN model deteksi Baut/Pin!")
+            print(f"[BoltPinDetector] 🔄 Otomatis beralih ke bobot model Baut/Pin resmi...")
+            cur_d = os.path.dirname(os.path.abspath(__file__))
+            p_d = os.path.dirname(cur_d)
+            bolt_cands = [
+                os.path.join(p_d, "models", "best_v2.engine"),
+                os.path.join(p_d, "models", "best_v2.onnx"),
+                os.path.join(p_d, "models", "best_v2.pt"),
+                os.path.join(p_d, "models", "best_v3.pt"),
+                os.path.join(cur_d, "..", "..", "..", "Dataset Yolo", "best_v2.pt")
+            ]
+            for bc in bolt_cands:
+                if os.path.exists(bc):
+                    try:
+                        self.model = YOLO(bc)
+                        if self.device != "cpu" and HAS_TORCH and torch.cuda.is_available() and not bc.endswith((".engine", ".onnx")):
+                            self.model.to(self.device)
+                        actual_model_to_load = bc
+                        self.actual_model_to_load = bc
+                        self.class_names = self.model.names if hasattr(self.model, 'names') else {}
+                        print(f"[BoltPinDetector] ✅ Berhasil beralih ke Model Baut/Pin: {os.path.basename(bc)} (Kelas: {self.class_names})")
+                        break
+                    except Exception as fb_e:
+                        print(f"[BoltPinDetector] Gagal memuat fallback: {fb_e}")
+
         print(f"[BoltPinDetector] Model dimuat: {os.path.basename(actual_model_to_load)} (Device: {self.device_info})")
 
     def detect(self, frame, roi=None):
@@ -122,11 +150,13 @@ class BoltPinDetector:
                 "iou": self.iou_threshold,
                 "device": self.device,
                 "agnostic_nms": self.agnostic_nms,
-                "imgsz": 640,
                 "verbose": False
             }
-            if self.use_half and self.device != "cpu":
-                call_kwargs["half"] = True
+            is_trt_or_onnx = hasattr(self, "actual_model_to_load") and (str(self.actual_model_to_load).endswith((".engine", ".onnx")))
+            if not is_trt_or_onnx:
+                call_kwargs["imgsz"] = 640
+                if self.use_half and self.device != "cpu":
+                    call_kwargs["half"] = True
             results = self.model(**call_kwargs)
         except (RuntimeError, Exception) as e_cuda:
             err_str = str(e_cuda).lower()
