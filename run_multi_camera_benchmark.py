@@ -735,7 +735,7 @@ def _run_top_worker(
         status_buf.value = b"SRC_ERROR"
         return
 
-    win_name = "CAM-01 TOP (SLAT & RIB) | [D]: DB | [W]: Sumber / Cam | [1/V]: Video | [Q]: Keluar"
+    win_name = "CAM-01 TOP (SLAT & RIB) | [1]/[V]: Ganti Video TOP | [W]: Dual Setup | [D]: DB | [Q]: Keluar"
     if mode == "dual":
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win_name, 920, 518)
@@ -993,7 +993,7 @@ def _run_side_worker(
                 is_cam = False
                 print(f"[INFO SIDE WORKER] Webcam #{cam_idx} tidak terdeteksi. Beralih otomatis ke video testing: {os.path.basename(DEFAULT_SIDE_VIDEO)}")
 
-    win_name = f"{camera_id} SIDE [{camera_id} {side}] | [D]: DB | [W]: Sumber / Cam | [2/S]: Video | [Q]: Keluar"
+    win_name = f"{camera_id} SIDE [{camera_id} {side}] | [2]/[O]: Ganti Video SIDE | [W]: Dual Setup | [D]: DB | [Q]: Keluar"
     if mode == "dual":
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win_name, 920, 518)
@@ -1082,13 +1082,21 @@ def _run_side_worker(
 
             # Render Visual jika mode dual
             if mode == "dual":
-                # Tambahkan overlay benchmark banner di bagian bawah frame
+                # Tambahkan overlay benchmark banner di bagian bawah frame Side (Identik dengan Threaded Engine)
                 h_d, w_d = display_frame.shape[:2]
                 db_state = "ON" if (db_bridge and db_bridge.is_enabled()) else "OFF"
-                banner = f"FPS:{avg_fps:4.1f}|Lat:{latency_ms:4.1f}ms|DB:{db_state}|[D]:DB|[V]:Vid|[C]:Cam|[W]:Input|[Q]:Out"
-                cv2.rectangle(display_frame, (10, h_d - 40), (620, h_d - 10), (20, 20, 20), -1)
-                cv2.putText(display_frame, banner, (18, h_d - 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1, cv2.LINE_AA)
+                s_ok = getattr(inspector, 'slat_ok_count', getattr(inspector, 'stats', {}).get('ok_count', 0))
+                s_ng = getattr(inspector, 'slat_ng_count', getattr(inspector, 'stats', {}).get('ng_count', 0))
+                b_ng = getattr(inspector, 'bolt_ng_count', 0)
+                p_ng = getattr(inspector, 'pin_ng_count', 0)
+                c_ng = getattr(inspector, 'crack_ng_count', 0)
+                s_cyc = getattr(inspector, 'slat_cycle_count', 0)
+                qc_txt = f"Slat #{s_cyc} [OK:{s_ok} NG:{s_ng}]"
+                banner = f"FPS: {avg_fps:4.1f} | Lat: {latency_ms:4.1f}ms | [1/V]: Video Top | [2/O]: Video Side | {qc_txt} | [Q]: Keluar"
+                cv2.rectangle(display_frame, (10, h_d - 65), (w_d - 10, h_d - 10), (18, 18, 18), -1)
+                cv2.rectangle(display_frame, (10, h_d - 65), (w_d - 10, h_d - 10), (0, 220, 255), 2, cv2.LINE_AA)
+                cv2.putText(display_frame, banner, (25, h_d - 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.76, (0, 255, 255), 2, cv2.LINE_AA)
 
                 cv2.imshow(win_name, display_frame)
                 key = cv2.waitKey(1) & 0xFF
