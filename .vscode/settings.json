@@ -1,0 +1,18 @@
+{
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/Vision_Engine_Core/02_Top_Inspection_Slat_Rib/src",
+        "${workspaceFolder}/Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/src",
+        "${workspaceFolder}/Jetson_Vision_Engine/02_Top_Inspection_Slat_Rib/src",
+        "${workspaceFolder}/Jetson_Vision_Engine/01_Side_Inspection_Bolt_Pin/src",
+        "${workspaceFolder}/02_Top_Inspection_Slat_Rib/src",
+        "${workspaceFolder}/01_Side_Inspection_Bolt_Pin/src"
+    ],
+    "python.autoComplete.extraPaths": [
+        "${workspaceFolder}/Vision_Engine_Core/02_Top_Inspection_Slat_Rib/src",
+        "${workspaceFolder}/Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/src",
+        "${workspaceFolder}/Jetson_Vision_Engine/02_Top_Inspection_Slat_Rib/src",
+        "${workspaceFolder}/Jetson_Vision_Engine/01_Side_Inspection_Bolt_Pin/src",
+        "${workspaceFolder}/02_Top_Inspection_Slat_Rib/src",
+        "${workspaceFolder}/01_Side_Inspection_Bolt_Pin/src"
+    ]
+}

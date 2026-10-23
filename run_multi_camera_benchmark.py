@@ -79,6 +79,21 @@ else:
     SIDE_SRC_DIR = os.path.join(BASE_DIR, "01_Side_Inspection_Bolt_Pin", "src")
     VIDEO_DIR = os.path.join(BASE_DIR, "Video_Testing")
 
+# Daftarkan direktori modul ke sys.path secara global di level teratas agar dapat diimpor di seluruh proses
+for _p in [
+    TOP_SRC_DIR,
+    SIDE_SRC_DIR,
+    os.path.join(BASE_DIR, "Vision_Engine_Core", "02_Top_Inspection_Slat_Rib", "src"),
+    os.path.join(BASE_DIR, "Vision_Engine_Core", "01_Side_Inspection_Bolt_Pin_Lekukan", "src"),
+    os.path.join(BASE_DIR, "Jetson_Vision_Engine", "02_Top_Inspection_Slat_Rib", "src"),
+    os.path.join(BASE_DIR, "Jetson_Vision_Engine", "01_Side_Inspection_Bolt_Pin", "src"),
+    os.path.join(BASE_DIR, "02_Top_Inspection_Slat_Rib", "src"),
+    os.path.join(BASE_DIR, "01_Side_Inspection_Bolt_Pin", "src"),
+    BASE_DIR
+]:
+    if _p and os.path.exists(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
+
 def is_stream_or_camera(src):
     """Mengecek apakah input berupa index kamera (misal 0, 1) atau URL stream (RTSP, HTTP, GStreamer)."""
     if src is None:
@@ -219,21 +234,34 @@ def configure_windows_process_performance():
 
 def detect_available_cameras(max_devices=6):
     """
-    Mendeteksi seluruh webcam fisik / perangkat video USB yang aktif pada PC/Jetson.
-    Mengembalikan daftar index kamera yang berhasil dibuka dan membaca frame (misal: [0, 1]).
+    Mendeteksi seluruh webcam fisik / perangkat video USB yang aktif pada PC/Jetson secara non-destruktif.
+    Di Linux (Jetson Ubuntu), mendeteksi node /dev/video* tanpa membuka stream agar tidak mengunci V4L2.
     """
-    import cv2
     cams = []
-    for i in range(max_devices):
-        if sys.platform.startswith("win"):
-            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-        else:
-            cap = cv2.VideoCapture(i)
-        if cap is not None and cap.isOpened():
-            ret, _ = cap.read()
-            if ret:
-                cams.append(i)
-            cap.release()
+    if sys.platform.startswith("win"):
+        import cv2
+        for i in range(max_devices):
+            try:
+                cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+                if cap is not None and cap.isOpened():
+                    cams.append(i)
+                    cap.release()
+            except Exception:
+                pass
+    else:
+        import glob
+        nodes = sorted(glob.glob("/dev/video[0-9]*"))
+        for node in nodes:
+            try:
+                idx = int(os.path.basename(node).replace("video", ""))
+                if idx < max_devices and idx not in cams:
+                    cams.append(idx)
+            except ValueError:
+                pass
+        if not cams:
+            for i in range(min(max_devices, 3)):
+                if os.path.exists(f"/dev/video{i}"):
+                    cams.append(i)
     return cams
 
 
@@ -249,7 +277,10 @@ def create_capture(src):
         if sys.platform.startswith("win"):
             cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
         else:
-            cap = cv2.VideoCapture(idx)
+            # Di Linux / Jetson, utamakan CAP_V4L2 untuk stabilitas driver USB
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(idx)
         if cap.isOpened():
             try:
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
@@ -265,385 +296,390 @@ def create_capture(src):
         return cap, False, path
 
 
+def get_available_videos():
+    """Mengambil daftar seluruh file video pengujian yang ada di direktori Video_Testing / Documentation."""
+    search_dirs = [
+        VIDEO_DIR,
+        os.path.join(BASE_DIR, "Video_Testing"),
+        os.path.join(BASE_DIR, "Jetson_Vision_Engine", "Video_Testing"),
+        os.path.abspath(os.path.join(BASE_DIR, "..", "Documentation")),
+        os.path.join(BASE_DIR, "Documentation"),
+    ]
+    exts = (".mp4", ".avi", ".mkv", ".mov", ".wmv")
+    vids = []
+    seen = set()
+    for d in search_dirs:
+        if d and os.path.exists(d):
+            for f in sorted(os.listdir(d)):
+                if f.lower().endswith(exts):
+                    fp = os.path.abspath(os.path.join(d, f))
+                    if fp not in seen:
+                        seen.add(fp)
+                        vids.append(fp)
+    return vids
+
+
+def cycle_next_video(current_src):
+    """Beralih ke file video pengujian berikutnya secara instan tanpa dialog GUI (Zero-Crash)."""
+    vids = get_available_videos()
+    if not vids:
+        print("\n[!] Tidak ada file video pengujian ditemukan di folder Video_Testing.")
+        return current_src
+
+    cur_norm = os.path.abspath(str(current_src)) if current_src else ""
+    try:
+        cur_idx = vids.index(cur_norm)
+        next_idx = (cur_idx + 1) % len(vids)
+    except ValueError:
+        next_idx = 0
+    next_vid = vids[next_idx]
+    print(f"\n[*] [HOTKEY V] Beralih ke video ({next_idx + 1}/{len(vids)}): {os.path.basename(next_vid)}")
+    return next_vid
+
+
+def cycle_next_camera(current_src):
+    """Beralih ke perangkat webcam berikutnya secara instan tanpa dialog GUI (Zero-Crash)."""
+    cams = detect_available_cameras(max_devices=6)
+    if not cams:
+        print("\n[!] Tidak ada perangkat webcam fisik USB yang terdeteksi.")
+        return current_src
+
+    is_cam = str(current_src).strip().isdigit()
+    cur_idx = int(current_src) if is_cam else -1
+    try:
+        cur_pos = cams.index(cur_idx)
+        next_pos = (cur_pos + 1) % len(cams)
+    except ValueError:
+        next_pos = 0
+    next_cam = cams[next_pos]
+    print(f"\n[*] [HOTKEY C] Beralih ke Live Webcam: #{next_cam} (daftar aktif: {cams})")
+    return str(next_cam)
+
+
+def _run_isolated_dialog(dialog_mode, **kwargs):
+    """
+    Menjalankan dialog GUI (Tkinter) di subprocess terpisah (Subprocess Isolation).
+    Menghindari tabrakan event loop X11 dengan OpenCV di Linux/Jetson,
+    serta mencegah fork error di multiprocessing child processes.
+    """
+    import subprocess
+    cmd = [sys.executable, os.path.abspath(__file__), "--gui-dialog", dialog_mode]
+    for k, v in kwargs.items():
+        if v is not None:
+            cmd.extend([f"--{k.replace('_', '-')}", str(v)])
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+        res = {}
+        for line in proc.stdout.strip().splitlines():
+            line = line.strip()
+            if line.startswith("RESULT_FILE:"):
+                res["file"] = line.split(":", 1)[1].strip()
+            elif line.startswith("RESULT_SOURCE:"):
+                res["source"] = line.split(":", 1)[1].strip()
+            elif line.startswith("RESULT_DUAL_TOP:"):
+                res["top"] = line.split(":", 1)[1].strip()
+            elif line.startswith("RESULT_DUAL_SIDE:"):
+                res["side"] = line.split(":", 1)[1].strip()
+        return res
+    except Exception as e:
+        print(f"[!] Gagal mengeksekusi dialog subprocess ({dialog_mode}): {e}")
+        return {}
+
+
 def select_file_dialog(initial_dir=None, title="Pilih File Video"):
     """
-    Membuka file dialog explorer Windows (Tkinter) untuk memilih file video/media inspeksi.
-    Menjamin jendela dialog muncul paling depan (-topmost) dan tidak memblokir OpenCV.
+    Membuka file dialog explorer (Tkinter) secara aman di subprocess terisolasi.
     """
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        try:
-            root.lift()
-            root.focus_force()
-        except Exception:
-            pass
-
-        # Tentukan direktori awal cerdas
-        default_dir = initial_dir
-        if not default_dir or not os.path.exists(default_dir):
-            candidate_dirs = [
-                os.path.join(BASE_DIR, "Jetson_Vision_Engine", "Video_Testing"),
-                os.path.abspath(os.path.join(BASE_DIR, "..", "Documentation")),
-                os.path.join(BASE_DIR, "Documentation"),
-                os.getcwd()
-            ]
-            for c_dir in candidate_dirs:
-                if os.path.exists(c_dir):
-                    default_dir = c_dir
-                    break
-
-        file_path = filedialog.askopenfilename(
-            parent=root,
-            title=title,
-            initialdir=default_dir,
-            filetypes=[
-                ("File Video (*.mp4;*.avi;*.mkv;*.mov;*.wmv)", "*.mp4 *.avi *.mkv *.mov *.wmv"),
-                ("MP4 Video (*.mp4)", "*.mp4"),
-                ("Semua File (*.*)", "*.*")
-            ]
-        )
-        root.update()
-        root.destroy()
-    except Exception as e:
-        print(f"\n[!] File Dialog GUI (Tkinter) tidak dapat dibuka: {e}")
-        print("    ℹ️  Tips Jetson Linux: jalankan 'sudo apt-get install python3-tk' jika ingin jendela explorer.")
-        try:
-            p = input(f"[*] Masukkan path file video untuk [{title}] (Enter untuk batal): ").strip().strip("'\"")
-            if p and os.path.exists(p):
-                return os.path.abspath(p)
-        except Exception:
-            pass
-        return None
+    res = _run_isolated_dialog("file", initial_dir=initial_dir, title=title)
+    if "file" in res and os.path.exists(res["file"]):
+        return res["file"]
+    return None
 
 
 def select_source_dialog(title="Pilih Sumber Kamera / Video", default_source=None):
     """
-    Menampilkan dialog visual modern untuk memilih antara Webcam fisik terdeteksi atau File Video.
+    Menampilkan dialog visual modern untuk memilih Webcam atau File Video secara aman di subprocess terisolasi.
     """
+    res = _run_isolated_dialog("source", title=title, default=default_source)
+    if "source" in res and res["source"]:
+        return res["source"]
+    return default_source
+
+
+def select_dual_camera_setup_dialog(default_top, default_side, side_cam_id="CAM-02"):
+    """
+    Dialog visual terpadu untuk mengatur sumber CAM-01 Top dan CAM-02 Side secara aman di subprocess terisolasi.
+    """
+    res = _run_isolated_dialog("dual", top=default_top, side=default_side, side_id=side_cam_id)
+    new_top = res.get("top", default_top)
+    new_side = res.get("side", default_side)
+    return new_top, new_side
+
+
+def _handle_isolated_gui_dialog():
+    """
+    Handler utama proses terisolasi GUI Tkinter.
+    Dipanggil saat skrip dijalankan dengan argumen flag: --gui-dialog <file|source|dual>.
+    """
+    import argparse
+    parser = argparse.ArgumentParser(description="Subprocess GUI Dialog Runner")
+    parser.add_argument("--gui-dialog", type=str, required=True, choices=["file", "source", "dual"])
+    parser.add_argument("--title", type=str, default="")
+    parser.add_argument("--initial-dir", type=str, default="")
+    parser.add_argument("--default", type=str, default="")
+    parser.add_argument("--top", type=str, default="")
+    parser.add_argument("--side", type=str, default="")
+    parser.add_argument("--side-id", type=str, default="CAM-02")
+    args, _ = parser.parse_known_args()
+
     try:
         import tkinter as tk
         from tkinter import filedialog
+    except Exception as e:
+        sys.stderr.write(f"[!] Tkinter tidak tersedia: {e}\n")
+        sys.exit(1)
 
-        cams = detect_available_cameras(max_devices=6)
+    cams = detect_available_cameras(max_devices=6)
 
-        root = tk.Tk()
-        root.title(title)
-        root.attributes("-topmost", True)
+    if args.gui_dialog == "file":
         try:
-            root.lift()
-            root.focus_force()
-        except Exception:
-            pass
-        root.geometry("480x370")
-        root.resizable(False, False)
-
-        selected_result = {"val": default_source}
-
-        # Header
-        lbl_info = tk.Label(
-            root,
-            text=f"🎥 {title}",
-            font=("Segoe UI", 11, "bold"),
-            pady=10
-        )
-        lbl_info.pack()
-
-        frame_options = tk.LabelFrame(root, text="Pilihan Sumber Input", font=("Segoe UI", 10, "bold"), padx=15, pady=10)
-        frame_options.pack(fill="both", expand=True, padx=15, pady=5)
-
-        is_default_cam = str(default_source).strip().isdigit() if default_source is not None else False
-        var_choice = tk.StringVar(value="webcam" if is_default_cam else "file")
-        default_cam_idx = int(default_source) if is_default_cam else (cams[0] if cams else 0)
-        var_cam_idx = tk.IntVar(value=default_cam_idx)
-
-        # Radio pilihan Webcam
-        if cams:
-            rb_cam = tk.Radiobutton(
-                frame_options,
-                text="Gunakan Perangkat Live Webcam:",
-                variable=var_choice,
-                value="webcam",
-                font=("Segoe UI", 9, "bold")
-            )
-            rb_cam.pack(anchor="w", pady=(0, 4))
-
-            frame_cams = tk.Frame(frame_options, padx=20)
-            frame_cams.pack(fill="x", pady=2)
-            for c_idx in cams:
-                tk.Radiobutton(
-                    frame_cams,
-                    text=f"Webcam #{c_idx}  (Terdeteksi Aktif 720p)",
-                    variable=var_cam_idx,
-                    value=c_idx,
-                    command=lambda: var_choice.set("webcam"),
-                    font=("Segoe UI", 9)
-                ).pack(anchor="w", pady=2)
-        else:
-            lbl_no = tk.Label(frame_options, text="⚠️ Tidak ada webcam USB yang terdeteksi.", fg="gray")
-            lbl_no.pack(anchor="w", pady=2)
-
-        # Radio pilihan File Video
-        rb_file = tk.Radiobutton(
-            frame_options,
-            text="Gunakan File Rekaman Video:",
-            variable=var_choice,
-            value="file",
-            font=("Segoe UI", 9, "bold")
-        )
-        rb_file.pack(anchor="w", pady=(12, 4))
-
-        lbl_file_path = tk.Label(
-            frame_options,
-            text=os.path.basename(str(default_source)) if (default_source and not is_default_cam) else "(Belum memilih file)",
-            font=("Segoe UI", 8, "italic"),
-            fg="#555555"
-        )
-        lbl_file_path.pack(anchor="w", padx=20)
-
-        file_selected_path = {"path": str(default_source) if (default_source and not is_default_cam) else None}
-
-        def on_browse():
-            var_choice.set("file")
-            f = filedialog.askopenfilename(
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            try:
+                root.lift()
+                root.focus_force()
+            except Exception:
+                pass
+            init_d = args.initial_dir if (args.initial_dir and os.path.exists(args.initial_dir)) else VIDEO_DIR
+            fp = filedialog.askopenfilename(
                 parent=root,
-                title="Pilih File Video Pengujian",
+                title=args.title or "Pilih File Video",
+                initialdir=init_d,
                 filetypes=[
                     ("File Video (*.mp4;*.avi;*.mkv;*.mov;*.wmv)", "*.mp4 *.avi *.mkv *.mov *.wmv"),
                     ("Semua File (*.*)", "*.*")
                 ]
             )
-            if f:
-                file_selected_path["path"] = f
-                lbl_file_path.config(text=os.path.basename(f), fg="blue")
+            root.update()
+            root.destroy()
+            if fp and os.path.exists(fp):
+                print(f"RESULT_FILE:{os.path.abspath(fp)}")
+            sys.exit(0)
+        except Exception as e:
+            sys.stderr.write(f"[!] Error file dialog: {e}\n")
+            sys.exit(1)
 
-        btn_browse = tk.Button(
-            frame_options,
-            text="📁 Buka File Explorer...",
-            command=on_browse,
-            font=("Segoe UI", 9)
-        )
-        btn_browse.pack(anchor="w", padx=20, pady=4)
+    elif args.gui_dialog == "source":
+        try:
+            root = tk.Tk()
+            root.title(args.title or "Pilih Sumber Kamera / Video")
+            root.attributes("-topmost", True)
+            try:
+                root.lift()
+                root.focus_force()
+            except Exception:
+                pass
+            root.geometry("480x380")
+            root.resizable(False, False)
 
-        def on_ok():
-            if var_choice.get() == "webcam":
-                selected_result["val"] = str(var_cam_idx.get())
+            selected_result = {"val": args.default}
+
+            lbl_info = tk.Label(root, text=f"🎥 {args.title or 'Pilih Sumber Input'}", font=("Segoe UI", 11, "bold"), pady=10)
+            lbl_info.pack()
+
+            frame_options = tk.LabelFrame(root, text="Pilihan Sumber Input", font=("Segoe UI", 10, "bold"), padx=15, pady=10)
+            frame_options.pack(fill="both", expand=True, padx=15, pady=5)
+
+            is_default_cam = str(args.default).strip().isdigit() if args.default else False
+            var_choice = tk.StringVar(value="webcam" if is_default_cam else "file")
+            default_cam_idx = int(args.default) if is_default_cam else (cams[0] if cams else 0)
+            var_cam_idx = tk.IntVar(value=default_cam_idx)
+
+            if cams:
+                rb_cam = tk.Radiobutton(frame_options, text="Gunakan Perangkat Live Webcam:", variable=var_choice, value="webcam", font=("Segoe UI", 9, "bold"))
+                rb_cam.pack(anchor="w", pady=(0, 4))
+                frame_cams = tk.Frame(frame_options, padx=20)
+                frame_cams.pack(fill="x", pady=2)
+                for c_idx in cams:
+                    tk.Radiobutton(frame_cams, text=f"Webcam #{c_idx}  (Aktif)", variable=var_cam_idx, value=c_idx, command=lambda: var_choice.set("webcam"), font=("Segoe UI", 9)).pack(anchor="w", pady=2)
             else:
-                if file_selected_path["path"]:
-                    selected_result["val"] = file_selected_path["path"]
+                lbl_no = tk.Label(frame_options, text="⚠️ Tidak ada webcam USB yang terdeteksi.", fg="gray")
+                lbl_no.pack(anchor="w", pady=2)
+
+            rb_file = tk.Radiobutton(frame_options, text="Gunakan File Rekaman Video:", variable=var_choice, value="file", font=("Segoe UI", 9, "bold"))
+            rb_file.pack(anchor="w", pady=(12, 4))
+
+            lbl_file_path = tk.Label(
+                frame_options,
+                text=os.path.basename(str(args.default)) if (args.default and not is_default_cam) else "(Belum memilih file)",
+                font=("Segoe UI", 8, "italic"),
+                fg="#555555"
+            )
+            lbl_file_path.pack(anchor="w", padx=20)
+
+            file_selected_path = {"path": str(args.default) if (args.default and not is_default_cam) else None}
+
+            def on_browse():
+                var_choice.set("file")
+                f = filedialog.askopenfilename(
+                    parent=root,
+                    title="Pilih File Video Pengujian",
+                    initialdir=VIDEO_DIR,
+                    filetypes=[
+                        ("File Video (*.mp4;*.avi;*.mkv;*.mov;*.wmv)", "*.mp4 *.avi *.mkv *.mov *.wmv"),
+                        ("Semua File (*.*)", "*.*")
+                    ]
+                )
+                if f:
+                    file_selected_path["path"] = f
+                    lbl_file_path.config(text=os.path.basename(f), fg="blue")
+
+            btn_browse = tk.Button(frame_options, text="📁 Buka File Explorer...", command=on_browse, font=("Segoe UI", 9))
+            btn_browse.pack(anchor="w", padx=20, pady=4)
+
+            def on_ok():
+                if var_choice.get() == "webcam":
+                    selected_result["val"] = str(var_cam_idx.get())
                 else:
-                    selected_result["val"] = default_source
-            root.destroy()
+                    if file_selected_path["path"]:
+                        selected_result["val"] = file_selected_path["path"]
+                    else:
+                        selected_result["val"] = args.default
+                root.destroy()
 
-        frame_btn = tk.Frame(root, pady=10)
-        frame_btn.pack(side="bottom", fill="x", padx=15)
+            frame_btn = tk.Frame(root, pady=10)
+            frame_btn.pack(side="bottom", fill="x", padx=15)
+            tk.Button(frame_btn, text="Pilih Sumber Ini", bg="#007acc", fg="white", font=("Segoe UI", 9, "bold"), width=15, command=on_ok).pack(side="right", padx=5)
+            tk.Button(frame_btn, text="Batal", font=("Segoe UI", 9), width=10, command=root.destroy).pack(side="right")
 
-        btn_apply = tk.Button(
-            frame_btn,
-            text="Pilih Sumber Ini",
-            bg="#007acc",
-            fg="white",
-            font=("Segoe UI", 9, "bold"),
-            width=15,
-            command=on_ok
-        )
-        btn_apply.pack(side="right", padx=5)
+            root.mainloop()
+            if selected_result["val"]:
+                print(f"RESULT_SOURCE:{selected_result['val']}")
+            sys.exit(0)
+        except Exception as e:
+            sys.stderr.write(f"[!] Error source dialog: {e}\n")
+            sys.exit(1)
 
-        btn_cancel = tk.Button(
-            frame_btn,
-            text="Batal",
-            font=("Segoe UI", 9),
-            width=10,
-            command=root.destroy
-        )
-        btn_cancel.pack(side="right")
-
-        root.mainloop()
-        return selected_result["val"]
-    except Exception as e:
-        print(f"\n[!] Dialog GUI (Tkinter) tidak dapat dibuka: {e}")
-        print("    ℹ️  Tips Jetson Linux: jalankan 'sudo apt-get install -y python3-tk' untuk jendela GUI.")
-        print(f"[*] Beralih ke pemilihan sumber via terminal untuk [{title}]:")
+    elif args.gui_dialog == "dual":
         try:
-            cams = detect_available_cameras(max_devices=6)
+            root = tk.Tk()
+            root.title("Pengaturan Sumber Dual Kamera (CAM-01 Top & CAM-02 Side)")
+            root.attributes("-topmost", True)
+            try:
+                root.lift()
+                root.focus_force()
+            except Exception:
+                pass
+            root.geometry("540x510")
+            root.resizable(False, False)
+
+            res = {"top": args.top, "side": args.side}
+
+            lbl_t = tk.Label(root, text="🎥 PENGATURAN SUMBER DUAL KAMERA", font=("Segoe UI", 12, "bold"), pady=8)
+            lbl_t.pack()
+            lbl_sub = tk.Label(
+                root,
+                text=f"Webcam terdeteksi: {len(cams)} perangkat ({', '.join(['#'+str(c) for c in cams]) if cams else 'Tidak ada'})",
+                font=("Segoe UI", 9, "italic"),
+                fg="#444444"
+            )
+            lbl_sub.pack(pady=(0, 8))
+
+            # --- PANEL CAM-01 TOP ---
+            f_top = tk.LabelFrame(root, text="[CAM-01 TOP] Deteksi Plat Slat & Bilah Rib", font=("Segoe UI", 10, "bold"), padx=12, pady=6)
+            f_top.pack(fill="x", padx=15, pady=5)
+
+            is_top_cam = str(args.top).strip().isdigit() if args.top else False
+            var_top_choice = tk.StringVar(value="webcam" if (is_top_cam or (cams and not args.top)) else "file")
+            var_top_cam = tk.IntVar(value=int(args.top) if is_top_cam else (cams[0] if cams else 0))
+            top_file_path = {"path": str(args.top) if (args.top and not is_top_cam) else None}
+
+            f_top_cams = tk.Frame(f_top)
+            f_top_cams.pack(fill="x")
             if cams:
-                print(f"    Webcam terdeteksi: {cams}")
-            print(f"    Sumber saat ini: {default_source}")
-            p = input("    Ketik nomor webcam (misal: 0) atau path video (Enter = tetap): ").strip().strip("'\"")
-            if p:
-                if p.isdigit():
-                    return str(int(p))
-                elif os.path.exists(p):
-                    return os.path.abspath(p)
-                else:
-                    print(f"    [!] Path tidak ditemukan: {p}, tetap memakai {default_source}")
-        except Exception:
-            pass
-        return default_source
+                tk.Radiobutton(f_top_cams, text="Webcam:", variable=var_top_choice, value="webcam", font=("Segoe UI", 9, "bold")).pack(side="left")
+                for c_idx in cams:
+                    tk.Radiobutton(f_top_cams, text=f"Cam #{c_idx}", variable=var_top_cam, value=c_idx, command=lambda: var_top_choice.set("webcam"), font=("Segoe UI", 9)).pack(side="left", padx=6)
+            else:
+                tk.Label(f_top_cams, text="(Tidak ada webcam)", fg="gray").pack(side="left")
 
+            f_top_file = tk.Frame(f_top, pady=4)
+            f_top_file.pack(fill="x")
+            tk.Radiobutton(f_top_file, text="File Video:", variable=var_top_choice, value="file", font=("Segoe UI", 9, "bold")).pack(side="left")
+            lbl_top_fname = tk.Label(f_top_file, text=os.path.basename(str(top_file_path["path"])) if top_file_path["path"] else "(Default Video)", font=("Segoe UI", 8), fg="#0055aa")
+            lbl_top_fname.pack(side="left", padx=6)
 
-def select_dual_camera_setup_dialog(default_top, default_side, side_cam_id="CAM-02"):
-    """
-    Dialog visual terpadu untuk mengatur sumber CAM-01 Top dan CAM-02 Side secara simultan.
-    Mendukung deteksi otomatis webcam USB dan file explorer video.
-    """
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
+            def browse_top():
+                var_top_choice.set("file")
+                f = filedialog.askopenfilename(parent=root, title="Pilih Video CAM-01 Top", initialdir=VIDEO_DIR)
+                if f:
+                    top_file_path["path"] = f
+                    lbl_top_fname.config(text=os.path.basename(f), fg="blue")
 
-        cams = detect_available_cameras(max_devices=6)
+            tk.Button(f_top_file, text="Pilih...", command=browse_top, font=("Segoe UI", 8)).pack(side="right")
 
-        root = tk.Tk()
-        root.title("Pengaturan Sumber Dual Kamera (CAM-01 Top & CAM-02 Side)")
-        root.attributes("-topmost", True)
-        try:
-            root.lift()
-            root.focus_force()
-        except Exception:
-            pass
-        root.geometry("540x510")
-        root.resizable(False, False)
+            # --- PANEL SIDE ---
+            f_side = tk.LabelFrame(root, text=f"[{args.side_id} SIDE] Deteksi Baut, Pin & Bracket Lekukan", font=("Segoe UI", 10, "bold"), padx=12, pady=6)
+            f_side.pack(fill="x", padx=15, pady=8)
 
-        res = {"top": default_top, "side": default_side}
+            is_side_cam = str(args.side).strip().isdigit() if args.side else False
+            var_side_choice = tk.StringVar(value="webcam" if (is_side_cam or (len(cams) >= 2 and not args.side)) else "file")
+            default_side_idx = int(args.side) if is_side_cam else (cams[1] if len(cams) >= 2 else (cams[0] if cams else 0))
+            var_side_cam = tk.IntVar(value=default_side_idx)
+            side_file_path = {"path": str(args.side) if (args.side and not is_side_cam) else None}
 
-        # Header
-        lbl_t = tk.Label(root, text="🎥 PENGATURAN SUMBER DUAL KAMERA", font=("Segoe UI", 12, "bold"), pady=8)
-        lbl_t.pack()
-        lbl_sub = tk.Label(
-            root,
-            text=f"Webcam terdeteksi: {len(cams)} perangkat ({', '.join(['#'+str(c) for c in cams]) if cams else 'Tidak ada'})",
-            font=("Segoe UI", 9, "italic"),
-            fg="#444444"
-        )
-        lbl_sub.pack(pady=(0, 8))
-
-        # --- PANEL CAM-01 TOP ---
-        f_top = tk.LabelFrame(root, text="[CAM-01 TOP] Deteksi Plat Slat & Bilah Rib", font=("Segoe UI", 10, "bold"), padx=12, pady=6)
-        f_top.pack(fill="x", padx=15, pady=5)
-
-        is_top_cam = str(default_top).strip().isdigit() if default_top is not None else False
-        var_top_choice = tk.StringVar(value="webcam" if (is_top_cam or (cams and not default_top)) else "file")
-        var_top_cam = tk.IntVar(value=int(default_top) if is_top_cam else (cams[0] if cams else 0))
-        top_file_path = {"path": str(default_top) if (default_top and not is_top_cam) else None}
-
-        f_top_cams = tk.Frame(f_top)
-        f_top_cams.pack(fill="x")
-        if cams:
-            tk.Radiobutton(f_top_cams, text="Webcam:", variable=var_top_choice, value="webcam", font=("Segoe UI", 9, "bold")).pack(side="left")
-            for c_idx in cams:
-                tk.Radiobutton(f_top_cams, text=f"Cam #{c_idx}", variable=var_top_cam, value=c_idx, command=lambda: var_top_choice.set("webcam"), font=("Segoe UI", 9)).pack(side="left", padx=6)
-        else:
-            tk.Label(f_top_cams, text="(Tidak ada webcam)", fg="gray").pack(side="left")
-
-        f_top_file = tk.Frame(f_top, pady=4)
-        f_top_file.pack(fill="x")
-        tk.Radiobutton(f_top_file, text="File Video:", variable=var_top_choice, value="file", font=("Segoe UI", 9, "bold")).pack(side="left")
-        lbl_top_fname = tk.Label(f_top_file, text=os.path.basename(str(top_file_path["path"])) if top_file_path["path"] else "(Default Video)", font=("Segoe UI", 8), fg="#0055aa")
-        lbl_top_fname.pack(side="left", padx=6)
-
-        def browse_top():
-            var_top_choice.set("file")
-            f = filedialog.askopenfilename(parent=root, title="Pilih Video CAM-01 Top")
-            if f:
-                top_file_path["path"] = f
-                lbl_top_fname.config(text=os.path.basename(f), fg="blue")
-
-        tk.Button(f_top_file, text="Pilih...", command=browse_top, font=("Segoe UI", 8)).pack(side="right")
-
-        # --- PANEL CAM-02 SIDE ---
-        f_side = tk.LabelFrame(root, text=f"[{side_cam_id} SIDE] Deteksi Baut, Pin & Bracket Lekukan", font=("Segoe UI", 10, "bold"), padx=12, pady=6)
-        f_side.pack(fill="x", padx=15, pady=8)
-
-        is_side_cam = str(default_side).strip().isdigit() if default_side is not None else False
-        var_side_choice = tk.StringVar(value="webcam" if (is_side_cam or (len(cams) >= 2 and not default_side)) else "file")
-        default_side_idx = int(default_side) if is_side_cam else (cams[1] if len(cams) >= 2 else (cams[0] if cams else 0))
-        var_side_cam = tk.IntVar(value=default_side_idx)
-        side_file_path = {"path": str(default_side) if (default_side and not is_side_cam) else None}
-
-        f_side_cams = tk.Frame(f_side)
-        f_side_cams.pack(fill="x")
-        if cams:
-            tk.Radiobutton(f_side_cams, text="Webcam:", variable=var_side_choice, value="webcam", font=("Segoe UI", 9, "bold")).pack(side="left")
-            for c_idx in cams:
-                tk.Radiobutton(f_side_cams, text=f"Cam #{c_idx}", variable=var_side_cam, value=c_idx, command=lambda: var_side_choice.set("webcam"), font=("Segoe UI", 9)).pack(side="left", padx=6)
-        else:
-            tk.Label(f_side_cams, text="(Tidak ada webcam)", fg="gray").pack(side="left")
-
-        f_side_file = tk.Frame(f_side, pady=4)
-        f_side_file.pack(fill="x")
-        tk.Radiobutton(f_side_file, text="File Video:", variable=var_side_choice, value="file", font=("Segoe UI", 9, "bold")).pack(side="left")
-        lbl_side_fname = tk.Label(f_side_file, text=os.path.basename(str(side_file_path["path"])) if side_file_path["path"] else "(Default Video)", font=("Segoe UI", 8), fg="#0055aa")
-        lbl_side_fname.pack(side="left", padx=6)
-
-        def browse_side():
-            var_side_choice.set("file")
-            f = filedialog.askopenfilename(parent=root, title=f"Pilih Video {side_cam_id} Side")
-            if f:
-                side_file_path["path"] = f
-                lbl_side_fname.config(text=os.path.basename(f), fg="blue")
-
-        tk.Button(f_side_file, text="Pilih...", command=browse_side, font=("Segoe UI", 8)).pack(side="right")
-
-        # Tombol aksi
-        def on_confirm_all():
-            if var_top_choice.get() == "webcam":
-                res["top"] = str(var_top_cam.get())
-            elif top_file_path["path"]:
-                res["top"] = top_file_path["path"]
-
-            if var_side_choice.get() == "webcam":
-                res["side"] = str(var_side_cam.get())
-            elif side_file_path["path"]:
-                res["side"] = side_file_path["path"]
-
-            root.destroy()
-
-        f_bottom = tk.Frame(root, pady=15)
-        f_bottom.pack(side="bottom", fill="x", padx=15)
-
-        tk.Button(f_bottom, text="Terapkan & Mulai", bg="#007acc", fg="white", font=("Segoe UI", 10, "bold"), width=18, command=on_confirm_all).pack(side="right", padx=5)
-        tk.Button(f_bottom, text="Gunakan Bawaan", font=("Segoe UI", 9), width=15, command=root.destroy).pack(side="right")
-
-        root.mainloop()
-        return res["top"], res["side"]
-    except Exception as e:
-        print(f"\n[!] Dialog GUI Dual Kamera (Tkinter) tidak dapat dibuka: {e}")
-        print("    ℹ️  Tips Jetson Linux: jalankan 'sudo apt-get install -y python3-tk' jika ingin jendela GUI.")
-        print("[*] Beralih ke pemilihan sumber dual kamera via terminal interaktif:")
-        try:
-            cams = detect_available_cameras(max_devices=6)
+            f_side_cams = tk.Frame(f_side)
+            f_side_cams.pack(fill="x")
             if cams:
-                print(f"    Webcam terdeteksi: {cams}")
+                tk.Radiobutton(f_side_cams, text="Webcam:", variable=var_side_choice, value="webcam", font=("Segoe UI", 9, "bold")).pack(side="left")
+                for c_idx in cams:
+                    tk.Radiobutton(f_side_cams, text=f"Cam #{c_idx}", variable=var_side_cam, value=c_idx, command=lambda: var_side_choice.set("webcam"), font=("Segoe UI", 9)).pack(side="left", padx=6)
+            else:
+                tk.Label(f_side_cams, text="(Tidak ada webcam)", fg="gray").pack(side="left")
 
-            res_top = default_top
-            print(f"\n--- [CAM-01 TOP] (Saat ini: {default_top}) ---")
-            inp_top = input("    Index webcam (misal: 0) atau path video (Enter = tetap): ").strip().strip("'\"")
-            if inp_top:
-                if inp_top.isdigit():
-                    res_top = str(int(inp_top))
-                elif os.path.exists(inp_top):
-                    res_top = os.path.abspath(inp_top)
-                else:
-                    print(f"    [!] Path tidak ditemukan: {inp_top}, tetap memakai {default_top}")
+            f_side_file = tk.Frame(f_side, pady=4)
+            f_side_file.pack(fill="x")
+            tk.Radiobutton(f_side_file, text="File Video:", variable=var_side_choice, value="file", font=("Segoe UI", 9, "bold")).pack(side="left")
+            lbl_side_fname = tk.Label(f_side_file, text=os.path.basename(str(side_file_path["path"])) if side_file_path["path"] else "(Default Video)", font=("Segoe UI", 8), fg="#0055aa")
+            lbl_side_fname.pack(side="left", padx=6)
 
-            res_side = default_side
-            print(f"\n--- [{side_cam_id} SIDE] (Saat ini: {default_side}) ---")
-            inp_side = input("    Index webcam (misal: 1) atau path video (Enter = tetap): ").strip().strip("'\"")
-            if inp_side:
-                if inp_side.isdigit():
-                    res_side = str(int(inp_side))
-                elif os.path.exists(inp_side):
-                    res_side = os.path.abspath(inp_side)
-                else:
-                    print(f"    [!] Path tidak ditemukan: {inp_side}, tetap memakai {default_side}")
+            def browse_side():
+                var_side_choice.set("file")
+                f = filedialog.askopenfilename(parent=root, title=f"Pilih Video {args.side_id} Side", initialdir=VIDEO_DIR)
+                if f:
+                    side_file_path["path"] = f
+                    lbl_side_fname.config(text=os.path.basename(f), fg="blue")
 
-            return res_top, res_side
-        except Exception:
-            return default_top, default_side
+            tk.Button(f_side_file, text="Pilih...", command=browse_side, font=("Segoe UI", 8)).pack(side="right")
+
+            def on_confirm_all():
+                if var_top_choice.get() == "webcam":
+                    res["top"] = str(var_top_cam.get())
+                elif top_file_path["path"]:
+                    res["top"] = top_file_path["path"]
+
+                if var_side_choice.get() == "webcam":
+                    res["side"] = str(var_side_cam.get())
+                elif side_file_path["path"]:
+                    res["side"] = side_file_path["path"]
+
+                root.destroy()
+
+            f_bottom = tk.Frame(root, pady=15)
+            f_bottom.pack(side="bottom", fill="x", padx=15)
+            tk.Button(f_bottom, text="Terapkan & Mulai", bg="#007acc", fg="white", font=("Segoe UI", 10, "bold"), width=18, command=on_confirm_all).pack(side="right", padx=5)
+            tk.Button(f_bottom, text="Gunakan Bawaan", font=("Segoe UI", 9), width=15, command=root.destroy).pack(side="right")
+
+            root.mainloop()
+            if res.get("top"):
+                print(f"RESULT_DUAL_TOP:{res['top']}")
+            if res.get("side"):
+                print(f"RESULT_DUAL_SIDE:{res['side']}")
+            sys.exit(0)
+        except Exception as e:
+            sys.stderr.write(f"[!] Error dual dialog: {e}\n")
+            sys.exit(1)
 
 
 # ======================================================================================
@@ -781,7 +817,29 @@ def _run_top_worker(
                 elif key in [ord("r"), ord("R")]:
                     inspector.reset_counters()
                     print("\n[*] [CAM-01 TOP] Counter QC & Cache Deduplikasi di-reset ke 0.\n")
-                elif key in [ord("w"), ord("W"), ord("c"), ord("C")]:
+                elif key in [ord("v"), ord("V")]:
+                    new_src = cycle_next_video(cap_src)
+                    if new_src and str(new_src) != str(cap_src):
+                        if cap is not None and cap.isOpened():
+                            cap.release()
+                        new_cap, is_cam, cap_src = create_capture(new_src)
+                        if new_cap.isOpened():
+                            cap = new_cap
+                            frame_count = 0
+                            fps_history.clear()
+                            inspector.reset_counters()
+                elif key in [ord("c"), ord("C")]:
+                    new_src = cycle_next_camera(cap_src)
+                    if new_src and str(new_src) != str(cap_src):
+                        if cap is not None and cap.isOpened():
+                            cap.release()
+                        new_cap, is_cam, cap_src = create_capture(new_src)
+                        if new_cap.isOpened():
+                            cap = new_cap
+                            frame_count = 0
+                            fps_history.clear()
+                            inspector.reset_counters()
+                elif key in [ord("w"), ord("W")]:
                     print("\n[*] [CAM-01 TOP] Membuka Dialog Pemilihan Sumber (Webcam / File Video)...")
                     new_src = select_source_dialog(
                         title="[CAM-01 TOP] Pilih Sumber Video / Kamera Plat & Sirip",
@@ -789,33 +847,37 @@ def _run_top_worker(
                     )
                     cv2.waitKey(1)
                     if new_src is not None and str(new_src) != str(cap_src):
-                        cap.release()
+                        if cap is not None and cap.isOpened():
+                            cap.release()
                         new_cap, is_cam, cap_src = create_capture(new_src)
                         if new_cap.isOpened():
                             cap = new_cap
                             frame_count = 0
                             fps_history.clear()
+                            inspector.reset_counters()
                             s_desc = f"Webcam #{cap_src}" if is_cam else os.path.basename(str(cap_src))
                             print(f"[*] [CAM-01 TOP] Sumber input dialihkan ke: {s_desc}")
                         else:
                             print(f"[!] [CAM-01 TOP] Gagal membuka sumber baru: {new_src}, kembali ke sumber sebelumnya.")
-                            cap = cv2.VideoCapture(cap_src)
-                elif key in [ord("1"), ord("v"), ord("V"), ord("t"), ord("T"), ord("o"), ord("O"), ord("f"), ord("F")]:
+                            cap, is_cam, cap_src = create_capture(cap_src)
+                elif key in [ord("1"), ord("t"), ord("T"), ord("o"), ord("O"), ord("f"), ord("F")]:
                     print("\n[*] [CAM-01 TOP] Membuka File Dialog Explorer...")
-                    init_d = os.path.dirname(cap_src) if os.path.exists(str(cap_src)) else os.path.join(BASE_DIR, "Jetson_Vision_Engine", "Video_Testing")
+                    init_d = os.path.dirname(cap_src) if os.path.exists(str(cap_src)) else VIDEO_DIR
                     new_top = select_file_dialog(
                         initial_dir=init_d,
                         title="[CAM-01 TOP] Pilih File Video Plat Slat & Bilah Rib"
                     )
                     cv2.waitKey(1)  # Refresh window focus
                     if new_top and os.path.exists(new_top):
-                        cap.release()
-                        cap_src = new_top
-                        is_cam = False
-                        cap = cv2.VideoCapture(cap_src)
-                        frame_count = 0
-                        fps_history.clear()
-                        print(f"[*] [CAM-01 TOP] Video berhasil dialihkan ke: {os.path.basename(new_top)}")
+                        if cap is not None and cap.isOpened():
+                            cap.release()
+                        new_cap, is_cam, cap_src = create_capture(new_top)
+                        if new_cap.isOpened():
+                            cap = new_cap
+                            frame_count = 0
+                            fps_history.clear()
+                            inspector.reset_counters()
+                            print(f"[*] [CAM-01 TOP] Video berhasil dialihkan ke: {os.path.basename(new_top)}")
 
             # Rekam ke database SQLite dan kirim notifikasi ke MS Teams menggunakan Best-Shot Buffer jika DB aktif
             if inspector and inspector.is_db_enabled():
@@ -1026,7 +1088,7 @@ def _run_side_worker(
                 # Tambahkan overlay benchmark banner di bagian bawah frame
                 h_d, w_d = display_frame.shape[:2]
                 db_state = "ON" if (db_bridge and db_bridge.is_enabled()) else "OFF"
-                banner = f"FPS: {avg_fps:4.1f} | Lat: {latency_ms:4.1f}ms | DB:{db_state} | [D]:DB | [W]:Cam/File | [2]:Video | [Q]:Keluar"
+                banner = f"FPS:{avg_fps:4.1f}|Lat:{latency_ms:4.1f}ms|DB:{db_state}|[D]:DB|[V]:Vid|[C]:Cam|[W]:Input|[Q]:Out"
                 cv2.rectangle(display_frame, (10, h_d - 40), (620, h_d - 10), (20, 20, 20), -1)
                 cv2.putText(display_frame, banner, (18, h_d - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1, cv2.LINE_AA)
@@ -1042,7 +1104,33 @@ def _run_side_worker(
                         st = db_bridge.toggle()
                         status_str = "AKTIF (RECORDING & NOTIFIKASI TEAMS)" if st else "MATI (DRY-RUN BENCHMARK)"
                         print(f"\n[*] [{camera_id} SIDE] SAKLAR DATABASE & TEAMS: {status_str}\n")
-                elif key in [ord("w"), ord("W"), ord("c"), ord("C")]:
+                elif key in [ord("v"), ord("V")]:
+                    new_src = cycle_next_video(side_video_path)
+                    if new_src and str(new_src) != str(side_video_path):
+                        if cap is not None and cap.isOpened():
+                            cap.release()
+                        new_cap, is_cam, side_video_path = create_capture(new_src)
+                        if new_cap.isOpened():
+                            cap = new_cap
+                            frame_count = 0
+                            consecutive_cam_fails = 0
+                            fps_history.clear()
+                            if inspector is not None:
+                                inspector.reset_session()
+                elif key in [ord("c"), ord("C")]:
+                    new_src = cycle_next_camera(side_video_path)
+                    if new_src and str(new_src) != str(side_video_path):
+                        if cap is not None and cap.isOpened():
+                            cap.release()
+                        new_cap, is_cam, side_video_path = create_capture(new_src)
+                        if new_cap.isOpened():
+                            cap = new_cap
+                            frame_count = 0
+                            consecutive_cam_fails = 0
+                            fps_history.clear()
+                            if inspector is not None:
+                                inspector.reset_session()
+                elif key in [ord("w"), ord("W")]:
                     print(f"\n[*] [{camera_id} SIDE] Membuka Dialog Pemilihan Sumber (Webcam / File Video)...")
                     curr_s = side_video_path if (not is_cam and side_video_path) else "0"
                     new_src = select_source_dialog(
@@ -1059,14 +1147,16 @@ def _run_side_worker(
                             frame_count = 0
                             consecutive_cam_fails = 0
                             fps_history.clear()
+                            if inspector is not None:
+                                inspector.reset_session()
                             s_desc = f"Webcam #{side_video_path}" if is_cam else os.path.basename(str(side_video_path))
                             print(f"[*] [{camera_id} SIDE] Sumber input dialihkan ke: {s_desc}")
                         else:
                             print(f"[!] [{camera_id} SIDE] Gagal membuka sumber baru: {new_src}, kembali ke video sebelumnya.")
-                            cap = cv2.VideoCapture(curr_s)
+                            cap, is_cam, side_video_path = create_capture(curr_s)
                 elif key in [ord("2"), ord("o"), ord("O"), ord("f"), ord("F"), ord("s"), ord("S")]:
                     print(f"\n[*] [{camera_id} SIDE] Membuka File Dialog Explorer...")
-                    candidate_side_dir = os.path.dirname(side_video_path) if side_video_path and os.path.exists(side_video_path) else os.path.abspath(os.path.join(BASE_DIR, "..", "Documentation"))
+                    candidate_side_dir = os.path.dirname(side_video_path) if side_video_path and os.path.exists(side_video_path) else VIDEO_DIR
                     new_side = select_file_dialog(
                         initial_dir=candidate_side_dir,
                         title=f"[{camera_id} SIDE] Pilih File Video Baut, Pin & Bracket"
@@ -1075,13 +1165,15 @@ def _run_side_worker(
                     if new_side and os.path.exists(new_side):
                         if cap is not None and cap.isOpened():
                             cap.release()
-                        side_video_path = new_side
-                        is_cam = False
-                        cap = cv2.VideoCapture(side_video_path)
-                        frame_count = 0
-                        consecutive_cam_fails = 0
-                        fps_history.clear()
-                        print(f"[*] [CAM-01 SIDE] Video berhasil dialihkan ke: {os.path.basename(new_side)}")
+                        new_cap, is_cam, side_video_path = create_capture(new_side)
+                        if new_cap.isOpened():
+                            cap = new_cap
+                            frame_count = 0
+                            consecutive_cam_fails = 0
+                            fps_history.clear()
+                            if inspector is not None:
+                                inspector.reset_session()
+                            print(f"[*] [{camera_id} SIDE] Video berhasil dialihkan ke: {os.path.basename(new_side)}")
     except KeyboardInterrupt:
         stop_event.set()
     finally:
@@ -1532,7 +1624,34 @@ def _run_threaded_engine(args):
                 if side_inspector:
                     side_inspector.reset_session()
                 print("\n[*] Counter QC & Cache Deduplikasi kedua kamera di-reset ke 0.\n")
-            elif key in [ord("1"), ord("v"), ord("V"), ord("t"), ord("T")]:
+            elif key in [ord("v"), ord("V")]:
+                new_top = cycle_next_video(top_source_path)
+                if new_top and str(new_top) != str(top_source_path):
+                    with top_lock:
+                        if cap_top is not None:
+                            cap_top.release()
+                        cap_top, is_cam_top, top_source_path = create_capture(new_top)
+                    if top_inspector:
+                        top_inspector.reset_counters()
+            elif key in [ord("b"), ord("B")]:
+                new_side = cycle_next_video(side_source_path)
+                if new_side and str(new_side) != str(side_source_path):
+                    with side_lock:
+                        if cap_side is not None:
+                            cap_side.release()
+                        cap_side, is_cam_side, side_source_path = create_capture(new_side)
+                    if side_inspector:
+                        side_inspector.reset_session()
+            elif key in [ord("c"), ord("C")]:
+                new_cam = cycle_next_camera(top_source_path)
+                if new_cam and str(new_cam) != str(top_source_path):
+                    with top_lock:
+                        if cap_top is not None:
+                            cap_top.release()
+                        cap_top, is_cam_top, top_source_path = create_capture(new_cam)
+                    if top_inspector:
+                        top_inspector.reset_counters()
+            elif key in [ord("1"), ord("t"), ord("T")]:
                 print("\n[*] [CAM-01 TOP] Membuka File Explorer untuk Memilih Video Baru Plat & Rib...")
                 init_top = os.path.dirname(str(top_source_path)) if (top_source_path and os.path.exists(str(top_source_path))) else VIDEO_DIR
                 new_top = select_file_dialog(
@@ -1562,7 +1681,7 @@ def _run_threaded_engine(args):
                     if side_inspector:
                         side_inspector.reset_session()
                     print(f"[*] {args.side_cam_id} Side berhasil beralih ke video: {os.path.basename(str(side_source_path))}")
-            elif key in [ord("w"), ord("W"), ord("c"), ord("C")]:
+            elif key in [ord("w"), ord("W")]:
                 print("\n[*] Membuka Dialog Pengaturan Sumber Dual Kamera (Webcam / File Video)...")
                 new_top, new_side = select_dual_camera_setup_dialog(
                     default_top=top_source_path,
@@ -1694,6 +1813,21 @@ def _run_threaded_engine(args):
 # MASTER ORCHESTRATOR & BENCHMARK SUPERVISOR
 # ======================================================================================
 def main():
+    if "--gui-dialog" in sys.argv:
+        _handle_isolated_gui_dialog()
+        return
+
+    import signal
+    def _sig_clean(sig, frame):
+        print(f"\n[*] Sinyal ({sig}) diterima. Menutup pipeline secara bersih...")
+        sys.exit(0)
+
+    try:
+        signal.signal(signal.SIGINT, _sig_clean)
+        signal.signal(signal.SIGTERM, _sig_clean)
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(
         description="Master Multi-Camera Benchmark Runner (Top Slat/Rib + Side Bolt/Pin)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1715,9 +1849,12 @@ Contoh Penggunaan:
 
 Shortcut Keyboard Saat Berjalan:
   [Q] / [ESC]       : Keluar dari benchmark & tampilkan laporan ringkasan
-  [1] / [V] / [T]   : Buka File Explorer untuk mengganti video CAM-01 TOP (Plat Slat & Bilah Rib)
-  [2] / [O] / [F]   : Buka File Explorer untuk mengganti video CAM-02 SIDE (Baut, Pin & Bracket)
-  [W] / [C]         : Buka dialog visual pengaturan sumber dual kamera (Webcam / File Video)
+  [V]               : Beralih instan ke file video pengujian berikutnya (Zero-Crash, tanpa dialog)
+  [B]               : Beralih instan ke video CAM-02 Side berikutnya (pada mode Threaded)
+  [C]               : Beralih instan ke perangkat live webcam USB berikutnya (0 -> 1 -> ...)
+  [W]               : Buka dialog visual pengaturan sumber dual kamera (Webcam / File Video)
+  [1] / [T]         : Buka File Explorer dialog untuk mengganti video CAM-01 TOP
+  [2] / [O]         : Buka File Explorer dialog untuk mengganti video CAM-02 SIDE
   [D]               : Saklar Database Logging & Notifikasi Teams (ON / OFF)
   [R]               : Reset counter QC & cache deduplikasi ke 0
         """
@@ -2102,6 +2239,10 @@ Shortcut Keyboard Saat Berjalan:
 
 
 if __name__ == "__main__":
+    if "--gui-dialog" in sys.argv:
+        _handle_isolated_gui_dialog()
+        sys.exit(0)
+
     # Wajib menggunakan metode 'spawn' untuk multiprocessing PyTorch & CUDA di Windows & Linux
     mp.set_start_method("spawn", force=True)
     main()
