@@ -304,9 +304,15 @@ def select_file_dialog(initial_dir=None, title="Pilih File Video"):
         )
         root.update()
         root.destroy()
-        return file_path if file_path and os.path.exists(file_path) else None
     except Exception as e:
-        print(f"[!] Gagal membuka file dialog: {e}")
+        print(f"\n[!] File Dialog GUI (Tkinter) tidak dapat dibuka: {e}")
+        print("    ℹ️  Tips Jetson Linux: jalankan 'sudo apt-get install python3-tk' jika ingin jendela explorer.")
+        try:
+            p = input(f"[*] Masukkan path file video untuk [{title}] (Enter untuk batal): ").strip().strip("'\"")
+            if p and os.path.exists(p):
+                return os.path.abspath(p)
+        except Exception:
+            pass
         return None
 
 
@@ -449,7 +455,24 @@ def select_source_dialog(title="Pilih Sumber Kamera / Video", default_source=Non
         root.mainloop()
         return selected_result["val"]
     except Exception as e:
-        print(f"[WARN] Dialog error: {e}")
+        print(f"\n[!] Dialog GUI (Tkinter) tidak dapat dibuka: {e}")
+        print("    ℹ️  Tips Jetson Linux: jalankan 'sudo apt-get install -y python3-tk' untuk jendela GUI.")
+        print(f"[*] Beralih ke pemilihan sumber via terminal untuk [{title}]:")
+        try:
+            cams = detect_available_cameras(max_devices=6)
+            if cams:
+                print(f"    Webcam terdeteksi: {cams}")
+            print(f"    Sumber saat ini: {default_source}")
+            p = input("    Ketik nomor webcam (misal: 0) atau path video (Enter = tetap): ").strip().strip("'\"")
+            if p:
+                if p.isdigit():
+                    return str(int(p))
+                elif os.path.exists(p):
+                    return os.path.abspath(p)
+                else:
+                    print(f"    [!] Path tidak ditemukan: {p}, tetap memakai {default_source}")
+        except Exception:
+            pass
         return default_source
 
 
@@ -573,8 +596,39 @@ def select_dual_camera_setup_dialog(default_top, default_side, side_cam_id="CAM-
         root.mainloop()
         return res["top"], res["side"]
     except Exception as e:
-        print(f"[WARN] Dialog error: {e}")
-        return default_top, default_side
+        print(f"\n[!] Dialog GUI Dual Kamera (Tkinter) tidak dapat dibuka: {e}")
+        print("    ℹ️  Tips Jetson Linux: jalankan 'sudo apt-get install -y python3-tk' jika ingin jendela GUI.")
+        print("[*] Beralih ke pemilihan sumber dual kamera via terminal interaktif:")
+        try:
+            cams = detect_available_cameras(max_devices=6)
+            if cams:
+                print(f"    Webcam terdeteksi: {cams}")
+
+            res_top = default_top
+            print(f"\n--- [CAM-01 TOP] (Saat ini: {default_top}) ---")
+            inp_top = input("    Index webcam (misal: 0) atau path video (Enter = tetap): ").strip().strip("'\"")
+            if inp_top:
+                if inp_top.isdigit():
+                    res_top = str(int(inp_top))
+                elif os.path.exists(inp_top):
+                    res_top = os.path.abspath(inp_top)
+                else:
+                    print(f"    [!] Path tidak ditemukan: {inp_top}, tetap memakai {default_top}")
+
+            res_side = default_side
+            print(f"\n--- [{side_cam_id} SIDE] (Saat ini: {default_side}) ---")
+            inp_side = input("    Index webcam (misal: 1) atau path video (Enter = tetap): ").strip().strip("'\"")
+            if inp_side:
+                if inp_side.isdigit():
+                    res_side = str(int(inp_side))
+                elif os.path.exists(inp_side):
+                    res_side = os.path.abspath(inp_side)
+                else:
+                    print(f"    [!] Path tidak ditemukan: {inp_side}, tetap memakai {default_side}")
+
+            return res_top, res_side
+        except Exception:
+            return default_top, default_side
 
 
 # ======================================================================================

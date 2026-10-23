@@ -97,7 +97,14 @@ def select_file_dialog(initial_dir=None, title="Pilih File Video / Foto Inspeksi
         root.destroy()
         return file_path if file_path else None
     except Exception as e:
-        print(f"[!] Gagal membuka file dialog: {e}")
+        print(f"\n[!] File Dialog GUI (Tkinter) tidak dapat dibuka: {e}")
+        print("    ℹ️  Tips Jetson Linux: jalankan 'sudo apt-get install -y python3-tk' jika ingin jendela file dialog.")
+        try:
+            p = input(f"[*] Masukkan path file untuk [{title}] (Enter untuk batal): ").strip().strip("'\"")
+            if p and os.path.exists(p):
+                return os.path.abspath(p)
+        except Exception:
+            pass
         return None
 
 
@@ -489,25 +496,38 @@ class HybridRibInspector:
         # 2. Batas lateral: bilah sirip tidak pernah menempel bezel kiri/kanan (x1 >= 115px, x2 <= 1805px)
         # 3. Ketebalan vertikal fisik: 35px - 145px
         # 4. Rasio aspek bilah tipis memanjang: 7.5 - 26.0
-        min_bw = int(0.40 * w_f)
-        max_bw = int(0.95 * w_f)
-        min_x1 = int(0.03 * w_f)
-        max_x2 = int(0.97 * w_f)
-        min_bh = 30
-        max_bh = int(0.18 * h_f)
+        min_bw = int(0.35 * w_f)
+        max_bw = int(0.96 * w_f)
+        min_x1 = int(0.02 * w_f)
+        max_x2 = int(0.98 * w_f)
+        min_bh = max(18, int(0.018 * h_f))
+        max_bh = int(0.20 * h_f)
         nominal_w = int(0.635 * w_f)
 
         try:
-            results = self.yolo_model.predict(
-                source=infer_img,
-                imgsz=target_imgsz,
-                conf=self.conf_thresh,
-                iou=self.iou_thresh,
-                device=self.device,
-                half=self.use_half,
-                agnostic_nms=True,
-                verbose=False
-            )
+            predict_kwargs = {
+                "source": infer_img,
+                "conf": self.conf_thresh,
+                "iou": self.iou_thresh,
+                "device": self.device,
+                "agnostic_nms": True,
+                "verbose": False
+            }
+            # Jangan override imgsz & half jika model adalah TensorRT .engine
+            is_trt = self.model_path and str(self.model_path).endswith(".engine")
+            if not is_trt:
+                predict_kwargs["imgsz"] = target_imgsz
+                predict_kwargs["half"] = self.use_half
+
+            try:
+                results = self.yolo_model.predict(**predict_kwargs)
+            except Exception as e_fp16:
+                if predict_kwargs.get("half", False):
+                    predict_kwargs["half"] = False
+                    results = self.yolo_model.predict(**predict_kwargs)
+                else:
+                    raise e_fp16
+
             if len(results) > 0 and results[0].boxes is not None:
                 boxes = results[0].boxes
                 for i in range(len(boxes)):
@@ -536,8 +556,8 @@ class HybridRibInspector:
                             (min_bw <= bw <= max_bw) and
                             (x1 >= min_x1 and x2 <= max_x2) and
                             (min_bh <= bh <= max_bh) and
-                            (6.5 <= ar <= 32.0) and
-                            (y1 >= zy1) and (cy <= zy2)
+                            (5.5 <= ar <= 35.0) and
+                            (cy >= zy1 - 35) and (cy <= zy2 + 35)
                         )
 
                         if is_valid:
@@ -549,8 +569,10 @@ class HybridRibInspector:
                                 best_box = [x1, y1, x2, y2]
                                 max_conf = conf
 
-        except Exception:
-            pass
+        except Exception as e:
+            if not hasattr(self, "_last_yolo_err") or self._last_yolo_err != str(e):
+                print(f"[WARN HybridRibInspector YOLO] Gagal inferensi ({type(e).__name__}): {e}")
+                self._last_yolo_err = str(e)
 
         is_detected = best_box is not None
         return is_detected, best_box, max_conf, rib_boxes
