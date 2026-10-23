@@ -298,13 +298,21 @@ class HybridRibInspector:
             if model_path and os.path.exists(model_path):
                 try:
                     self.yolo_model = YOLO(model_path)
-                    if self.device != "cpu" and HAS_TORCH and torch.cuda.is_available():
-                        self.yolo_model.to(self.device)
+                    is_trt_or_onnx = str(model_path).endswith((".engine", ".onnx"))
+                    if self.device != "cpu" and HAS_TORCH and torch.cuda.is_available() and not is_trt_or_onnx:
+                        try:
+                            self.yolo_model.to(self.device)
+                            if hasattr(self.yolo_model, "model") and self.yolo_model.model is not None:
+                                self.yolo_model.model.half()
+                            self.use_half = True
+                        except Exception:
+                            pass
+                    elif is_trt_or_onnx:
                         self.use_half = True
                     self.class_names = self.yolo_model.names if hasattr(self.yolo_model, 'names') else {0: 'rib'}
 
                     # Validasi kelas model: pastikan bukan model Bolt/Pin yang salah konfigurasi
-                    is_rib_model = any("rib" in str(v).lower() or "sirip" in str(v).lower() for v in self.class_names.values())
+                    is_rib_model = any("rib" in str(v).lower() or "sirip" in str(v).lower() for v in self.class_names.values()) or ("rib" in os.path.basename(model_path).lower())
                     if not is_rib_model:
                         print(f"[HybridRibInspector] ⚠️ PERINGATAN: Model '{os.path.basename(model_path)}' memiliki kelas {self.class_names} dan BUKAN model deteksi Rib/Sirip!")
                         print(f"[HybridRibInspector] 🔄 Otomatis beralih ke bobot model Rib resmi...")
@@ -316,8 +324,16 @@ class HybridRibInspector:
                         if fallback_rib:
                             try:
                                 self.yolo_model = YOLO(fallback_rib)
-                                if self.device != "cpu" and HAS_TORCH and torch.cuda.is_available():
-                                    self.yolo_model.to(self.device)
+                                is_fb_trt_or_onnx = str(fallback_rib).endswith((".engine", ".onnx"))
+                                if self.device != "cpu" and HAS_TORCH and torch.cuda.is_available() and not is_fb_trt_or_onnx:
+                                    try:
+                                        self.yolo_model.to(self.device)
+                                        if hasattr(self.yolo_model, "model") and self.yolo_model.model is not None:
+                                            self.yolo_model.model.half()
+                                        self.use_half = True
+                                    except Exception:
+                                        pass
+                                elif is_fb_trt_or_onnx:
                                     self.use_half = True
                                 self.model_path = fallback_rib
                                 self.class_names = self.yolo_model.names if hasattr(self.yolo_model, 'names') else {0: 'rib'}
