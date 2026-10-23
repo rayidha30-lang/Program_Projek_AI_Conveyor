@@ -100,7 +100,10 @@ class BracketAnomalyDetector:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model PatchCore tidak ditemukan di: {model_path}")
 
-        if device is None:
+        if device == "cuda" and (not TORCH_AVAILABLE or not torch.cuda.is_available()):
+            print("[WARN BracketAnomalyDetector] CUDA tidak tersedia pada build PyTorch saat ini. Beralih ke CPU.")
+            device = "cpu"
+        elif device is None:
             device = "cuda" if (TORCH_AVAILABLE and torch.cuda.is_available()) else "cpu"
 
         print(f"[*] Memuat model PatchCore dari: {model_path}")
