@@ -243,6 +243,8 @@ def detect_available_cameras(max_devices=6):
         for i in range(max_devices):
             try:
                 cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+                if cap is None or not cap.isOpened():
+                    cap = cv2.VideoCapture(i)
                 if cap is not None and cap.isOpened():
                     cams.append(i)
                     cap.release()
@@ -276,6 +278,8 @@ def create_capture(src):
         idx = int(src)
         if sys.platform.startswith("win"):
             cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(idx)
         else:
             # Di Linux / Jetson, utamakan CAP_V4L2 untuk stabilitas driver USB
             cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
@@ -496,16 +500,14 @@ def _handle_isolated_gui_dialog():
             default_cam_idx = int(args.default) if is_default_cam else (cams[0] if cams else 0)
             var_cam_idx = tk.IntVar(value=default_cam_idx)
 
-            if cams:
-                rb_cam = tk.Radiobutton(frame_options, text="Gunakan Perangkat Live Webcam:", variable=var_choice, value="webcam", font=("Segoe UI", 9, "bold"))
-                rb_cam.pack(anchor="w", pady=(0, 4))
-                frame_cams = tk.Frame(frame_options, padx=20)
-                frame_cams.pack(fill="x", pady=2)
-                for c_idx in cams:
-                    tk.Radiobutton(frame_cams, text=f"Webcam #{c_idx}  (Aktif)", variable=var_cam_idx, value=c_idx, command=lambda: var_choice.set("webcam"), font=("Segoe UI", 9)).pack(anchor="w", pady=2)
-            else:
-                lbl_no = tk.Label(frame_options, text="⚠️ Tidak ada webcam USB yang terdeteksi.", fg="gray")
-                lbl_no.pack(anchor="w", pady=2)
+            candidate_cams = sorted(list(set(cams + [0, 1, 2])))
+            rb_cam = tk.Radiobutton(frame_options, text="Gunakan Perangkat Live Webcam:", variable=var_choice, value="webcam", font=("Segoe UI", 9, "bold"))
+            rb_cam.pack(anchor="w", pady=(0, 4))
+            frame_cams = tk.Frame(frame_options, padx=20)
+            frame_cams.pack(fill="x", pady=2)
+            for c_idx in candidate_cams:
+                tag = " (Aktif)" if c_idx in cams else ""
+                tk.Radiobutton(frame_cams, text=f"Webcam #{c_idx}{tag}", variable=var_cam_idx, value=c_idx, command=lambda: var_choice.set("webcam"), font=("Segoe UI", 9)).pack(anchor="w", pady=2)
 
             rb_file = tk.Radiobutton(frame_options, text="Gunakan File Rekaman Video:", variable=var_choice, value="file", font=("Segoe UI", 9, "bold"))
             rb_file.pack(anchor="w", pady=(12, 4))
@@ -595,14 +597,12 @@ def _handle_isolated_gui_dialog():
             var_top_cam = tk.IntVar(value=int(args.top) if is_top_cam else (cams[0] if cams else 0))
             top_file_path = {"path": str(args.top) if (args.top and not is_top_cam) else None}
 
+            candidate_cams = sorted(list(set(cams + [0, 1, 2])))
             f_top_cams = tk.Frame(f_top)
             f_top_cams.pack(fill="x")
-            if cams:
-                tk.Radiobutton(f_top_cams, text="Webcam:", variable=var_top_choice, value="webcam", font=("Segoe UI", 9, "bold")).pack(side="left")
-                for c_idx in cams:
-                    tk.Radiobutton(f_top_cams, text=f"Cam #{c_idx}", variable=var_top_cam, value=c_idx, command=lambda: var_top_choice.set("webcam"), font=("Segoe UI", 9)).pack(side="left", padx=6)
-            else:
-                tk.Label(f_top_cams, text="(Tidak ada webcam)", fg="gray").pack(side="left")
+            tk.Radiobutton(f_top_cams, text="Webcam:", variable=var_top_choice, value="webcam", font=("Segoe UI", 9, "bold")).pack(side="left")
+            for c_idx in candidate_cams:
+                tk.Radiobutton(f_top_cams, text=f"Cam #{c_idx}", variable=var_top_cam, value=c_idx, command=lambda: var_top_choice.set("webcam"), font=("Segoe UI", 9)).pack(side="left", padx=6)
 
             f_top_file = tk.Frame(f_top, pady=4)
             f_top_file.pack(fill="x")
@@ -631,12 +631,9 @@ def _handle_isolated_gui_dialog():
 
             f_side_cams = tk.Frame(f_side)
             f_side_cams.pack(fill="x")
-            if cams:
-                tk.Radiobutton(f_side_cams, text="Webcam:", variable=var_side_choice, value="webcam", font=("Segoe UI", 9, "bold")).pack(side="left")
-                for c_idx in cams:
-                    tk.Radiobutton(f_side_cams, text=f"Cam #{c_idx}", variable=var_side_cam, value=c_idx, command=lambda: var_side_choice.set("webcam"), font=("Segoe UI", 9)).pack(side="left", padx=6)
-            else:
-                tk.Label(f_side_cams, text="(Tidak ada webcam)", fg="gray").pack(side="left")
+            tk.Radiobutton(f_side_cams, text="Webcam:", variable=var_side_choice, value="webcam", font=("Segoe UI", 9, "bold")).pack(side="left")
+            for c_idx in candidate_cams:
+                tk.Radiobutton(f_side_cams, text=f"Cam #{c_idx}", variable=var_side_cam, value=c_idx, command=lambda: var_side_choice.set("webcam"), font=("Segoe UI", 9)).pack(side="left", padx=6)
 
             f_side_file = tk.Frame(f_side, pady=4)
             f_side_file.pack(fill="x")
