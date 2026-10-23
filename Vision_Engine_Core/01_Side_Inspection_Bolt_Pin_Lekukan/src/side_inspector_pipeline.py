@@ -129,7 +129,15 @@ class SideConveyorInspector:
         print(f"[*] Menginisialisasi Side Conveyor Inspector: [{self.camera_id} - {self.side}]")
         print("=" * 60)
 
-        if device is None:
+        if device == "cuda":
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    print("[WARN SideConveyorInspector] CUDA diminta tapi tidak tersedia di PyTorch. Fallback ke CPU.")
+                    device = "cpu"
+            except Exception:
+                device = "cpu"
+        elif device is None:
             try:
                 import torch
                 device = "cuda" if torch.cuda.is_available() else "cpu"

@@ -116,16 +116,18 @@ class BoltPinDetector:
 
         # Jalankan Inferensi YOLO dengan Agnostic NMS untuk mencegah bounding box ganda
         try:
-            results = self.model(
-                source=infer_img,
-                conf=self.conf_threshold,
-                iou=self.iou_threshold,
-                device=self.device,
-                agnostic_nms=self.agnostic_nms,
-                imgsz=640,
-                half=self.use_half,
-                verbose=False
-            )
+            call_kwargs = {
+                "source": infer_img,
+                "conf": self.conf_threshold,
+                "iou": self.iou_threshold,
+                "device": self.device,
+                "agnostic_nms": self.agnostic_nms,
+                "imgsz": 640,
+                "verbose": False
+            }
+            if self.use_half and self.device != "cpu":
+                call_kwargs["half"] = True
+            results = self.model(**call_kwargs)
         except (RuntimeError, Exception) as e_cuda:
             err_str = str(e_cuda).lower()
             if ("out of memory" in err_str or "cuda" in err_str or "allocation" in err_str) and self.device != "cpu":

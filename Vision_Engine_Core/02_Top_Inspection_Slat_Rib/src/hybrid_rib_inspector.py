@@ -517,7 +517,8 @@ class HybridRibInspector:
             is_trt = self.model_path and str(self.model_path).endswith(".engine")
             if not is_trt:
                 predict_kwargs["imgsz"] = target_imgsz
-                predict_kwargs["half"] = self.use_half
+                if self.use_half and self.device != "cpu":
+                    predict_kwargs["half"] = True
 
             try:
                 results = self.yolo_model.predict(**predict_kwargs)
