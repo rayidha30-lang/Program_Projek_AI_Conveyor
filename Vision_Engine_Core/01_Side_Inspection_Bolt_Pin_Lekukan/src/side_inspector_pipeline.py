@@ -212,13 +212,20 @@ class SideConveyorInspector:
         self.last_audit_frame = -999
         self.last_ng_frame = -999
         self.latched_ng_info = None
+        self.last_counted_slat_cycle = -1      # Latch penghitungan entitas fisik slat (Single Entity Latch)
+        self.current_slat_has_bolt_ng = False  # Akumulator defek baut pada slat aktif
+        self.current_slat_has_pin_ng = False   # Akumulator defek pin pada slat aktif
+        self.current_slat_has_crack_ng = False # Akumulator defek lekukan/crack pada slat aktif
+        self.current_slat_bolt_seen = False    # Penanda visual komponen slat terlihat di ROI
 
-        # Statistik Sesi
+        # Statistik Sesi (Per-Slat Entity QC Counters)
         self.stats = {
             "total_frames": 0,
             "total_slats": 0,
             "ok_count": 0,
             "ng_count": 0,
+            "frame_ok_count": 0,
+            "frame_ng_count": 0,
             "invalid_count": 0,
             "bolt_ng": 0,
             "pin_ng": 0,
@@ -252,11 +259,18 @@ class SideConveyorInspector:
         self.last_audit_frame = -999
         self.last_ng_frame = -999
         self.latched_ng_info = None
+        self.last_counted_slat_cycle = -1
+        self.current_slat_has_bolt_ng = False
+        self.current_slat_has_pin_ng = False
+        self.current_slat_has_crack_ng = False
+        self.current_slat_bolt_seen = False
         self.stats = {
             "total_frames": 0,
             "total_slats": 0,
             "ok_count": 0,
             "ng_count": 0,
+            "frame_ok_count": 0,
+            "frame_ng_count": 0,
             "invalid_count": 0,
             "bolt_ng": 0,
             "pin_ng": 0,
@@ -265,6 +279,52 @@ class SideConveyorInspector:
         self._bolt_ng_count = 0
         self._pin_ng_count = 0
         self._crack_ng_count = 0
+
+    def _finalize_slat_qc(self):
+        """
+        Finalisasi evaluasi kualitas untuk 1 entitas plat slat fisik secara tunggal (Single Entity Slat Latch).
+        Memastikan 1 slat fisik hanya dihitung tepat 1 kali ke dalam statistik (OK atau NG).
+        """
+        if self.slat_cycle_count <= 0:
+            return
+        if self.slat_cycle_count == self.last_counted_slat_cycle:
+            return
+
+        # Pastikan evaluasi PatchCore (lekukan/crack) tuntas jika ada sampel skor
+        if self.current_slat_scores and not self.slat_evaluated:
+            rep_score = min(self.current_slat_scores)
+            self.last_slat_score = rep_score
+            self.last_slat_verdict = "NG" if rep_score >= self.custom_patchcore_thresh else "OK"
+            self.slat_evaluated = True
+
+        is_crack_ng = self.current_slat_has_crack_ng or (self.last_slat_verdict == "NG")
+        is_bolt_ng = self.current_slat_has_bolt_ng
+        is_pin_ng = self.current_slat_has_pin_ng
+
+        is_slat_ng = (is_bolt_ng or is_pin_ng or is_crack_ng)
+
+        if is_slat_ng:
+            self.stats["ng_count"] += 1
+            if is_bolt_ng:
+                self.stats["bolt_ng"] = self.stats.get("bolt_ng", 0) + 1
+                self._bolt_ng_count = self.stats["bolt_ng"]
+            if is_pin_ng:
+                self.stats["pin_ng"] = self.stats.get("pin_ng", 0) + 1
+                self._pin_ng_count = self.stats["pin_ng"]
+            if is_crack_ng:
+                self.stats["crack_ng"] = self.stats.get("crack_ng", 0) + 1
+                self._crack_ng_count = self.stats["crack_ng"]
+        else:
+            self.stats["ok_count"] += 1
+
+        self.last_counted_slat_cycle = self.slat_cycle_count
+
+    def close(self):
+        """Menutup inspector, memfinalisasi slat aktif jika belum, dan membersihkan resource."""
+        if self.slat_cycle_count > 0 and self.slat_cycle_count != self.last_counted_slat_cycle:
+            self._finalize_slat_qc()
+        if self.db_bridge is not None:
+            self.db_bridge.close()
 
     @property
     def slat_ok_count(self):
@@ -498,6 +558,10 @@ class SideConveyorInspector:
                             # Video/stream baru mulai saat plat sudah di tengah jalan; lewati plat parsial ini
                             pass
                         else:
+                            # Pastikan slat sebelumnya difinalisasi jika belum sempat lewat falling edge
+                            if self.slat_cycle_count > 0 and self.slat_cycle_count != self.last_counted_slat_cycle:
+                                self._finalize_slat_qc()
+
                             self.slat_cycle_count += 1
                             self.stats["total_slats"] = self.slat_cycle_count
                             self.slat_settling_countdown = self.slat_settling_delay
@@ -508,6 +572,10 @@ class SideConveyorInspector:
                             self.sweet_spot_sample = None
                             self.last_slat_verdict = "WAIT"
                             self.last_slat_score = 0.0
+                            self.current_slat_has_bolt_ng = False
+                            self.current_slat_has_pin_ng = False
+                            self.current_slat_has_crack_ng = False
+                            self.current_slat_bolt_seen = False
             else:
                 self.consecutive_plat_frames = 0
                 if beam_val < self.photocell_thresh_low:
@@ -545,6 +613,9 @@ class SideConveyorInspector:
                         else:
                             self.last_slat_verdict = "WAIT"
                         self.slat_evaluated = True
+
+                    # Finalisasi evaluasi QC entitas slat yang baru selesai transit (Single Entity Slat Latch)
+                    self._finalize_slat_qc()
             else:
                 self.consecutive_gap_frames = 0
 
@@ -657,6 +728,17 @@ class SideConveyorInspector:
         cv2.putText(display_frame, label_text, (bx + 5, max(16, by - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.50, lek_color, 2)
 
+        # Akumulasi temuan defek fisik sepanjang transit plat slat aktif
+        if is_plate_present:
+            if bolt_verdict == "NG":
+                self.current_slat_has_bolt_ng = True
+            if pin_verdict == "NG":
+                self.current_slat_has_pin_ng = True
+            if lekukan_verdict == "NG":
+                self.current_slat_has_crack_ng = True
+            if len(bolts) > 0 or len(pins) > 0:
+                self.current_slat_bolt_seen = True
+
         # 4. Tentukan Overall Verdict Sisi Ini
         # Prioritas visual live: NG > INVALID > OK > WAIT
         if bolt_verdict == "NG" or pin_verdict == "NG" or lekukan_verdict == "NG":
@@ -678,9 +760,9 @@ class SideConveyorInspector:
         transit_cooldown_ok = (current_f - self.last_emit_frame) >= self.min_slat_transit_frames or (current_f < self.last_emit_frame)
 
         # Evaluasi apakah slat ini berstatus NG
-        is_bolt_ng = (bolt_verdict == "NG")
-        is_pin_ng = (pin_verdict == "NG")
-        is_lek_ng = (self.last_slat_verdict == "NG")
+        is_bolt_ng = self.current_slat_has_bolt_ng or (bolt_verdict == "NG")
+        is_pin_ng = self.current_slat_has_pin_ng or (pin_verdict == "NG")
+        is_lek_ng = self.current_slat_has_crack_ng or (self.last_slat_verdict == "NG")
         is_ng_slat = (is_bolt_ng or is_pin_ng or is_lek_ng)
 
         # Latch Entity: Emit HANYA 1 kali per siklus slat fisik begitu status NG terkonfirmasi secara tuntas
@@ -704,23 +786,14 @@ class SideConveyorInspector:
             emit_raw = best_sample.get("raw_frame", frame)
             emit_ann = best_sample.get("ann_frame", display_frame)
 
-        # Update Statistik jika ada inspeksi aktif
+        # Update Statistik Frame (telemetri live per-frame untuk analisis throughput)
         if overall_side in ["OK", "NG", "INVALID"]:
             if overall_side == "OK":
-                self.stats["ok_count"] += 1
+                self.stats["frame_ok_count"] = self.stats.get("frame_ok_count", 0) + 1
             elif overall_side == "NG":
-                self.stats["ng_count"] += 1
-                if bolt_verdict == "NG":
-                    self.stats["bolt_ng"] = self.stats.get("bolt_ng", 0) + 1
-                    self._bolt_ng_count = self.stats["bolt_ng"]
-                if pin_verdict == "NG":
-                    self.stats["pin_ng"] = self.stats.get("pin_ng", 0) + 1
-                    self._pin_ng_count = self.stats["pin_ng"]
-                if lekukan_verdict == "NG":
-                    self.stats["crack_ng"] = self.stats.get("crack_ng", 0) + 1
-                    self._crack_ng_count = self.stats["crack_ng"]
+                self.stats["frame_ng_count"] = self.stats.get("frame_ng_count", 0) + 1
             else:
-                self.stats["invalid_count"] += 1
+                self.stats["invalid_count"] = self.stats.get("invalid_count", 0) + 1
 
         # 5. Format Payload Sesuai Standar PRD
         payload = {
