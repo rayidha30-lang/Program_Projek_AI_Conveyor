@@ -267,7 +267,7 @@ class HybridRibInspector:
             ]
             candidates = (engine_candidates + pt_candidates + onnx_candidates) if self.device != "cpu" else (pt_candidates + onnx_candidates)
 
-            if model_path is None:
+            if not model_path or not os.path.exists(model_path):
                 env_top = os.environ.get("MODEL_TOP_PATH")
                 if env_top:
                     cand_env = [
@@ -281,7 +281,7 @@ class HybridRibInspector:
                             model_path = ce
                             break
 
-            if model_path is None:
+            if not model_path or not os.path.exists(model_path):
                 for c in candidates:
                     if os.path.exists(c):
                         model_path = c
