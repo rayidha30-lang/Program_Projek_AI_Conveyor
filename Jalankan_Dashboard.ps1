@@ -1,6 +1,6 @@
 # Jalankan Backend API di window terpisah
 Write-Host 'Menjalankan Backend API...' -ForegroundColor Cyan
-Start-Process powershell -ArgumentList '-NoExit', '-Command', "Set-Location '$PSScriptRoot\Program AI'; python api.py"
+Start-Process powershell -ArgumentList '-NoExit', '-Command', "Set-Location '$PSScriptRoot\backend_api'; python api.py"
 
 Start-Sleep -Seconds 2
 

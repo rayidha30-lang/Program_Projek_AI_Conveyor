@@ -10,7 +10,7 @@ cd /d "%~dp0"
 
 :: 2. Menjalankan Backend REST API Server di window cmd terpisah (cmd /k agar jendela tetap terbuka)
 echo [1/2] Menjalankan Backend REST API Server (Python Flask :5000)...
-start "Backend API - Conveyor Inspection" cmd /k "cd /d "%~dp0Program AI" && python api.py"
+start "Backend API - Conveyor Inspection" cmd /k "cd /d "%~dp0backend_api" && python api.py"
 
 :: Beri jeda 2 detik agar server API siap
 timeout /t 2 /nobreak >nul
