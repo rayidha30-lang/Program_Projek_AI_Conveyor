@@ -482,7 +482,7 @@ class HoughStitchingInspector:
             c_curr1 = cost1[idx_int1, cols1]
             c_next1 = cost1[idx_int1 + 1, cols1]
             denom1 = 2.0 * (c_prev1 - 2.0 * c_curr1 + c_next1)
-            sub_shift1 = np.where(np.abs(denom1) > 1e-4, (c_prev1 - c_next1) / denom1, 0.0)
+            sub_shift1 = np.divide(c_prev1 - c_next1, denom1, out=np.zeros_like(denom1, dtype=np.float32), where=(np.abs(denom1) > 1e-4))
             sub_shift1 = np.clip(sub_shift1, -0.5, 0.5)
             best_pts1 = best_pts1 + sub_shift1
 
@@ -544,7 +544,7 @@ class HoughStitchingInspector:
                     c_curr3 = cost3[idx_int3, cols3]
                     c_next3 = cost3[idx_int3 + 1, cols3]
                     denom3 = 2.0 * (c_prev3 - 2.0 * c_curr3 + c_next3)
-                    sub_shift3 = np.where(np.abs(denom3) > 1e-4, (c_prev3 - c_next3) / denom3, 0.0)
+                    sub_shift3 = np.divide(c_prev3 - c_next3, denom3, out=np.zeros_like(denom3, dtype=np.float32), where=(np.abs(denom3) > 1e-4))
                     sub_shift3 = np.clip(sub_shift3, -0.5, 0.5)
                     best_pts3 = best_pts3 + sub_shift3
 
@@ -657,6 +657,7 @@ class HoughStitchingInspector:
             "mll_ratio": self.mll_ratio,
             "is_seam_ok": is_seam_ok,
             # Metrik Metrologi Geometris Utama:
+            "confidence": float(cov),
             "pv_flatness": pv,
             "sagitta": sagitta,
             "coverage": cov,
@@ -1021,8 +1022,8 @@ class HoughStitchingInspector:
 
             # Pill Badge Metrologi di Atas Kontur
             scale = getattr(self, "scale_factor_mm_per_px", 0.515)
-            lbl_metro = f"METROLOGI: PV={pv*scale:.1f}mm ({pv:.1f}px) | Sag={sagitta*scale:.1f}mm ({sagitta:.1f}px) | Cov={cov*100:.0f}%"
-            pill_w = 490
+            lbl_metro = f"METROLOGI: Conf={cov:.2f} | PV={pv*scale:.1f}mm ({pv:.1f}px) | Sag={sagitta*scale:.1f}mm ({sagitta:.1f}px)"
+            pill_w = 510
             pill_h = 24
             pill_x1 = max(10, min(self.canonical_w - pill_w - 10, int(xs[mid_idx]) - (pill_w // 2)))
             pill_y1 = max(6, min(self.canonical_h - pill_h - 6, y_seam - 32))
@@ -1121,7 +1122,7 @@ class HoughStitchingInspector:
         cov_col = (0, 220, 0) if cov >= self.min_continuity_cov else (0, 165, 255)
         max_dev_mm = max_dev * scale
         l_seam_mm = l_seam * scale
-        cv2.putText(hud, f"Kontinuitas Celah: {cov*100:.1f}% (Min {self.min_continuity_cov*100:.0f}%) | Max Dev: {max_dev_mm:.1f} mm ({max_dev:.1f} px) | Celah: {l_seam_mm:.0f} mm ({l_seam:.0f} px)",
+        cv2.putText(hud, f"Kontinuitas Celah: {cov*100:.1f}% [Conf: {cov:.2f}] (Min {self.min_continuity_cov*100:.0f}%) | Max Dev: {max_dev_mm:.1f} mm ({max_dev:.1f} px) | Celah: {l_seam_mm:.0f} mm ({l_seam:.0f} px)",
                     (222, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (190, 215, 235), 1, cv2.LINE_AA)
 
         # Baris 4: Deskripsi Diagnosa

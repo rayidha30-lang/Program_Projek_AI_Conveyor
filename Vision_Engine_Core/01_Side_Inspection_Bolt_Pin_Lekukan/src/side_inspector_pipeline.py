@@ -493,6 +493,7 @@ class SideConveyorInspector:
                 pin_verdict = "NG"
 
         # Visualisasi Baut & Pin
+        drawn_pins = set()
         for pair in pairs:
             b = pair["bolt"]
             p = pair["pin"]
@@ -504,12 +505,22 @@ class SideConveyorInspector:
                         (bx_1, max(15, by_1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, b_color, 2)
 
             if p is not None:
+                drawn_pins.add(id(p))
                 px1, py1, px2, py2 = p["box"]
                 p_color = (0, 0, 255) if p["is_ng"] else (0, 255, 128)
                 cv2.rectangle(display_frame, (px1, py1), (px2, py2), p_color, 2)
-                cv2.putText(display_frame, f"{p['class_name']}",
-                            (px1, max(15, py1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, p_color, 1)
+                cv2.putText(display_frame, f"{p['class_name']} {p['confidence']:.2f}",
+                            (px1, max(15, py1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.44, p_color, 2)
                 cv2.line(display_frame, b["centroid"], p["centroid"], (255, 255, 0), 1)
+
+        # Gambar pin yang belum berpasangan (jika ada)
+        for p in pins:
+            if id(p) not in drawn_pins:
+                px1, py1, px2, py2 = p["box"]
+                p_color = (0, 0, 255) if p["is_ng"] else (0, 255, 128)
+                cv2.rectangle(display_frame, (px1, py1), (px2, py2), p_color, 2)
+                cv2.putText(display_frame, f"{p['class_name']} {p['confidence']:.2f}",
+                            (px1, max(15, py1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.44, p_color, 2)
 
         # 3. Virtual Photocell / Optical Probe (Sensor Kehadiran Pelat Slat di Gerbang Masuk Poligon)
         # Menghitung koordinat adaptif sensor probe tepat di area masuk / leher poligon braket
@@ -796,6 +807,9 @@ class SideConveyorInspector:
                 self.stats["invalid_count"] = self.stats.get("invalid_count", 0) + 1
 
         # 5. Format Payload Sesuai Standar PRD
+        max_b_conf = max([b["confidence"] for b in bolts], default=0.0)
+        max_p_conf = max([p["confidence"] for p in pins], default=0.0)
+
         payload = {
             "camera_id": self.camera_id,
             "side": self.side,
@@ -805,9 +819,9 @@ class SideConveyorInspector:
             "emit_raw_frame": emit_raw,
             "emit_ann_frame": emit_ann,
             "components": [
-                {"name": "BOLT", "result": bolt_verdict},
-                {"name": "PIN", "result": pin_verdict},
-                {"name": "LEKUKAN", "result": lekukan_verdict}
+                {"name": "BOLT", "result": bolt_verdict, "confidence": max_b_conf},
+                {"name": "PIN", "result": pin_verdict, "confidence": max_p_conf},
+                {"name": "LEKUKAN", "result": lekukan_verdict, "confidence": self.last_slat_score}
             ],
             "bracket_details": inspected_bracket_info or self.last_bracket_info
         }
@@ -852,13 +866,18 @@ class SideConveyorInspector:
         cv2.putText(img, f"STATUS: {res}", (15, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.85, res_color, 2)
 
-        # Rincian Komponen
-        c_x = int(w * 0.45)
+        # Rincian Komponen dengan Confidence
+        c_x = int(w * 0.42)
         for c in payload["components"]:
             c_col = (0, 255, 0) if c["result"] == "OK" else ((0, 0, 255) if c["result"] == "NG" else (180, 180, 180))
-            txt = f"{c['name']}: {c['result']}"
-            cv2.putText(img, txt, (c_x, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.65, c_col, 2)
-            c_x += 160
+            conf_val = c.get("confidence", 0.0)
+            if c["name"] == "LEKUKAN":
+                conf_str = f" [{conf_val:.3f}]" if conf_val > 0 else ""
+            else:
+                conf_str = f" [{conf_val:.2f}]" if conf_val > 0 else ""
+            txt = f"{c['name']}: {c['result']}{conf_str}"
+            cv2.putText(img, txt, (c_x, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.58, c_col, 2)
+            c_x += int(w * 0.19)
 
 
 def select_video_file(initial_dir=None, title="Pilih File Video Inspeksi"):

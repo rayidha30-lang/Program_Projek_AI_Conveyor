@@ -840,6 +840,7 @@ class HybridRibInspector:
                         "mode": self.mode,
                         "message": f"Sirip dalam transit (Buffer {self.absence_frames}/{self.max_absence_tolerance})",
                         "detection_reason": "Transit Hysteresis",
+                        "confidence": float(yolo_conf if yolo_conf > 0 else (dual_ratio if self.mode == "DUAL_POLARITY_ONLY" else 0.0)),
                         "pv_flatness": float(np.median(self.prime_pv_samples)) if self.prime_pv_samples else 0.0,
                         "sagitta": float(np.median(self.prime_sagitta_samples)) if self.prime_sagitta_samples else 0.0,
                         "max_deviation": 0.0,
@@ -877,6 +878,7 @@ class HybridRibInspector:
                 "mode": self.mode,
                 "message": "Plat datar melintas (Menunggu Sirip / Rib)",
                 "detection_reason": reason,
+                "confidence": 0.0,
                 "pv_flatness": 0.0,
                 "sagitta": 0.0,
                 "max_deviation": 0.0,
@@ -918,6 +920,7 @@ class HybridRibInspector:
                 "mode": self.mode,
                 "message": "Objek terlalu tipis (Bukan sirip tegak)",
                 "detection_reason": f"{reason} -> Ditolak (Tinggi ROI < 35px)",
+                "confidence": 0.0,
                 "pv_flatness": 0.0,
                 "sagitta": 0.0,
                 "max_deviation": 0.0,
@@ -1307,6 +1310,7 @@ class HybridRibInspector:
             "mode": self.mode,
             "message": eval_msg,
             "detection_reason": f"{reason} | Bilah Terkunci (Cov={coverage*100:.0f}%)",
+            "confidence": float(yolo_conf if yolo_conf > 0 else (dual_ratio if self.mode == "DUAL_POLARITY_ONLY" else 0.0)),
             "pv_flatness": eval_pv,
             "sagitta": eval_sag,
             "max_deviation": max_dev,
@@ -1355,8 +1359,10 @@ class HybridRibInspector:
             box = res.get("active_box")
             if box:
                 bx1, by1, bx2, by2 = box
+                rib_conf = float(res.get("confidence", 0.0) or 0.0)
+                conf_str = f" | Conf: {rib_conf:.2f}" if rib_conf > 0 else ""
                 cv2.rectangle(vis, (bx1, by1), (bx2, by2), (255, 170, 0), 2, cv2.LINE_AA)
-                cv2.putText(vis, f"SIRIP AKTIF ({bx2-bx1}x{by2-by1} px)", (bx1, max(22, by1 - 8)),
+                cv2.putText(vis, f"SIRIP AKTIF ({bx2-bx1}x{by2-by1} px{conf_str})", (bx1, max(22, by1 - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 170, 0), 2, cv2.LINE_AA)
 
             # Gambar Kurva Punggung Atas (Top Ridge Curve) menempel di bilah fisik
@@ -1437,7 +1443,9 @@ class HybridRibInspector:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 220, 200), 1, cv2.LINE_AA)
         cv2.putText(hud, f"Validasi Sensor: {res.get('detection_reason', '')}", (25, 206),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.41, (220, 220, 120), 1, cv2.LINE_AA)
-        cv2.putText(hud, f"Statistik QC   : Total Rib #{self.rib_count} | OK: {self.ok_count} | NG: {self.ng_count}", (25, 230),
+        rib_conf = float(res.get("confidence", 0.0) or 0.0)
+        conf_str = f" [Conf: {rib_conf:.2f}]" if rib_conf > 0 else ""
+        cv2.putText(hud, f"Statistik QC   : Total Rib #{self.rib_count}{conf_str} | OK: {self.ok_count} | NG: {self.ng_count}", (25, 230),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (180, 240, 180), 1, cv2.LINE_AA)
 
         # Patch Citra Sirip di sebelah kanan HUD jika tersedia

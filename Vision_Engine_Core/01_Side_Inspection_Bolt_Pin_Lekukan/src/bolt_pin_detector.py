@@ -381,7 +381,7 @@ if __name__ == "__main__":
                 px1, py1, px2, py2 = p["box"]
                 p_col = (0, 0, 255) if p["is_ng"] else (0, 255, 200)
                 cv2.rectangle(vis, (px1, py1), (px2, py2), p_col, 2)
-                cv2.putText(vis, f"{p['class_name']}", (px1, max(18, py1 - 6)),
+                cv2.putText(vis, f"{p['class_name']} {p['confidence']:.2f}", (px1, max(18, py1 - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, p_col, 1)
                 # Garis penghubung baut ke pin
                 cv2.line(vis, b["centroid"], p["centroid"], (255, 255, 0), 2)

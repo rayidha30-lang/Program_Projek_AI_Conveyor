@@ -484,7 +484,9 @@ class CombinedTopInspector:
             is_slat_ng = bool(slat_res.get("is_ng", False))
             poly_col = (0, 0, 255) if is_slat_ng else (0, 220, 0)
             cv2.polylines(ann, [pts_arr], True, poly_col, 3, cv2.LINE_AA)
-            cv2.putText(ann, f"GERBANG SLAT #{slat_no if slat_no is not None else ''}",
+            slat_conf = float(slat_res.get("confidence", slat_res.get("coverage", 0.0)) or 0.0)
+            conf_slat_str = f" [Conf: {slat_conf:.2f}]" if slat_conf > 0 else ""
+            cv2.putText(ann, f"GERBANG SLAT #{slat_no if slat_no is not None else ''}{conf_slat_str}",
                         (pts_px[0][0], max(26, pts_px[0][1] - 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, poly_col, 2, cv2.LINE_AA)
 
@@ -520,9 +522,11 @@ class CombinedTopInspector:
             is_rib_ng = bool(rib_res.get("is_ng", False))
             b_col = (0, 0, 255) if is_rib_ng else (255, 170, 0)
             cv2.rectangle(ann, (bx1, by1), (bx2, by2), b_col, 3, cv2.LINE_AA)
+            rib_conf = float(rib_res.get("confidence", 0.0) or 0.0)
+            conf_rib_str = f" [Conf: {rib_conf:.2f}]" if rib_conf > 0 else ""
             cv2.putText(
                 ann,
-                f"SIRIP #{rib_no if rib_no is not None else ''} [{'NG' if is_rib_ng else 'OK'}]",
+                f"SIRIP #{rib_no if rib_no is not None else ''} [{'NG' if is_rib_ng else 'OK'}]{conf_rib_str}",
                 (bx1, max(25, by1 - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
@@ -554,8 +558,12 @@ class CombinedTopInspector:
 
         s_stat = slat_res.get("status", "WAIT")
         r_stat = rib_res.get("status", "WAIT")
+        slat_conf = float(slat_res.get("confidence", slat_res.get("coverage", 0.0)) or 0.0)
+        rib_conf = float(rib_res.get("confidence", 0.0) or 0.0)
+        conf_slat_hdr = f" ({slat_conf:.2f})" if slat_conf > 0 else ""
+        conf_rib_hdr = f" ({rib_conf:.2f})" if rib_conf > 0 else ""
 
-        title = f"[AI METROLOGY EVIDENCE] TOP CAM-01 | SLAT #{slat_no if slat_no is not None else '-'}: [{s_stat}] | RIB #{rib_no if rib_no is not None else '-'}: [{r_stat}]"
+        title = f"[AI METROLOGY EVIDENCE] TOP CAM-01 | SLAT #{slat_no if slat_no is not None else '-'}: [{s_stat}]{conf_slat_hdr} | RIB #{rib_no if rib_no is not None else '-'}: [{r_stat}]{conf_rib_hdr}"
         cv2.putText(ann, title, (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 230, 255), 2, cv2.LINE_AA)
 
         metrics_txt = (
@@ -1008,8 +1016,10 @@ class CombinedTopInspector:
                 poly_color = (0, 30, 255)     # Merah (NG)
 
             # Gambar Polygon Gerbang Inspeksi Slat (DIBESARKAN)
+            slat_conf = float(slat_res.get("confidence", slat_res.get("coverage", 0.0)) or 0.0)
+            slat_tag = f"GERBANG INSPEKSI SLAT [Conf: {slat_conf:.2f}]" if slat_conf > 0 else "GERBANG INSPEKSI SLAT"
             cv2.polylines(main_resized, [poly_s], isClosed=True, color=poly_color, thickness=3, lineType=cv2.LINE_AA)
-            cv2.putText(main_resized, "GERBANG INSPEKSI SLAT", (poly_s[0][0], max(26, poly_s[0][1] - 10)),
+            cv2.putText(main_resized, slat_tag, (poly_s[0][0], max(26, poly_s[0][1] - 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, poly_color, 2, cv2.LINE_AA)
 
             # Gambar Mini Trigger Zone pada rantai samping
@@ -1081,7 +1091,9 @@ class CombinedTopInspector:
                 scale_y = getattr(self, "scale_factor_y_mm_per_px", 0.442)
                 w_mm = int(round(w_px * scale_x))
                 h_mm = int(round(h_px * scale_y))
-                rib_tag = f"SIRIP AKTIF ({w_mm}x{h_mm} mm | {w_px}x{h_px} px)"
+                rib_conf = float(rib_res.get("confidence", 0.0) or 0.0)
+                conf_lbl = f" | Conf: {rib_conf:.2f}" if rib_conf > 0 else ""
+                rib_tag = f"SIRIP AKTIF ({w_mm}x{h_mm} mm{conf_lbl} | {w_px}x{h_px} px)"
                 cv2.rectangle(main_resized, (rx1, ry1), (rx2, ry2), (255, 170, 0), 2, cv2.LINE_AA)
                 cv2.putText(main_resized, rib_tag, (rx1, max(24, ry1 - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 170, 0), 2, cv2.LINE_AA)
@@ -1202,7 +1214,9 @@ class CombinedTopInspector:
                     (25, 139), cv2.FONT_HERSHEY_SIMPLEX, 0.46, pv_c, 1, cv2.LINE_AA)
         cv2.putText(hud, f"Sagitta Curv: {s_sag_mm:4.1f} mm ({s_sag:.1f} px) [Maks: {max_sag_mm:.1f} mm]",
                     (25, 158), cv2.FONT_HERSHEY_SIMPLEX, 0.46, sag_c, 1, cv2.LINE_AA)
-        cv2.putText(hud, f"QC PLAT SLAT: #{self.slat_inspector.slat_count:02d} | OK: {self.slat_inspector.ok_count} | NG: {self.slat_inspector.ng_count} | [{s_stat}]",
+        slat_conf = float(slat_res.get("confidence", slat_res.get("coverage", 0.0)) or 0.0)
+        conf_s_str = f" | Conf: {slat_conf:.2f}" if slat_conf > 0 else ""
+        cv2.putText(hud, f"QC PLAT SLAT: #{self.slat_inspector.slat_count:02d}{conf_s_str} | OK: {self.slat_inspector.ok_count} | NG: {self.slat_inspector.ng_count} | [{s_stat}]",
                     (25, 178), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 240, 180), 2, cv2.LINE_AA)
 
         # ----------------------------------------------------------------------
@@ -1234,7 +1248,9 @@ class CombinedTopInspector:
         rtip_c = (0, 255, 0) if r_tip <= self.rib_inspector.tip_thresh else (0, 0, 255)
         cv2.putText(hud, f"Dev Badan: {r_dev_mm:4.1f}mm [Maks: {dev_lim_mm:.1f}mm] | Tip: {r_tip_mm:4.1f}mm",
                     (505, 158), cv2.FONT_HERSHEY_SIMPLEX, 0.44, rdev_c, 1, cv2.LINE_AA)
-        cv2.putText(hud, f"QC SIRIP RIB: #{self.rib_inspector.rib_count:02d} | OK: {self.rib_inspector.ok_count} | NG: {self.rib_inspector.ng_count} | [{r_stat}]",
+        rib_conf = float(rib_res.get("confidence", 0.0) or 0.0)
+        conf_r_str = f" | Conf: {rib_conf:.2f}" if rib_conf > 0 else ""
+        cv2.putText(hud, f"QC SIRIP RIB: #{self.rib_inspector.rib_count:02d}{conf_r_str} | OK: {self.rib_inspector.ok_count} | NG: {self.rib_inspector.ng_count} | [{r_stat}]",
                     (505, 178), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 240, 180), 2, cv2.LINE_AA)
 
         # ----------------------------------------------------------------------
