@@ -384,9 +384,15 @@ def _run_isolated_dialog(dialog_mode, **kwargs):
         for line in proc.stdout.strip().splitlines():
             line = line.strip()
             if line.startswith("RESULT_FILE:"):
-                res["file"] = line.split(":", 1)[1].strip()
+                f_val = line.split(":", 1)[1].strip()
+                res["file"] = f_val
+                if "source" not in res:
+                    res["source"] = f_val
             elif line.startswith("RESULT_SOURCE:"):
-                res["source"] = line.split(":", 1)[1].strip()
+                s_val = line.split(":", 1)[1].strip()
+                res["source"] = s_val
+                if "file" not in res and os.path.exists(s_val):
+                    res["file"] = s_val
             elif line.startswith("RESULT_DUAL_TOP:"):
                 res["top"] = line.split(":", 1)[1].strip()
             elif line.startswith("RESULT_DUAL_SIDE:"):
@@ -399,11 +405,12 @@ def _run_isolated_dialog(dialog_mode, **kwargs):
 
 def select_file_dialog(initial_dir=None, title="Pilih File Video"):
     """
-    Membuka file dialog explorer (Tkinter) secara aman di subprocess terisolasi.
+    Membuka file dialog explorer secara aman di subprocess terisolasi.
     """
     res = _run_isolated_dialog("file", initial_dir=initial_dir, title=title)
-    if "file" in res and os.path.exists(res["file"]):
-        return res["file"]
+    new_f = res.get("file") or res.get("source")
+    if new_f and os.path.exists(new_f):
+        return new_f
     return None
 
 
@@ -412,8 +419,9 @@ def select_source_dialog(title="Pilih Sumber Kamera / Video", default_source=Non
     Menampilkan dialog visual modern untuk memilih Webcam atau File Video secara aman di subprocess terisolasi.
     """
     res = _run_isolated_dialog("source", title=title, default=default_source)
-    if "source" in res and res["source"]:
-        return res["source"]
+    new_src = res.get("source") or res.get("file")
+    if new_src:
+        return new_src
     return default_source
 
 
@@ -1896,15 +1904,7 @@ Shortcut Keyboard Saat Berjalan:
         env_duration = 0
     env_csv = os.environ.get("RECORD_CSV", None)
     env_db = os.environ.get("ENABLE_DB_LOGGING", "false").lower() in ("true", "1", "yes")
-    env_engine = os.environ.get("BENCHMARK_ENGINE", None)
-    if not env_engine:
-        # Pada Linux multi-core (seperti Jetson Orin Nano 6-core ARM64), default ke 'process'
-        # agar kedua pipeline inspeksi berjalan di core CPU terpisah tanpa terhambat Python GIL.
-        # Pada Windows / Laptop standar (RAM 8GB), default ke 'threads' untuk stabilitas memori.
-        if sys.platform.startswith("linux") and (os.cpu_count() or 1) >= 4:
-            env_engine = "process"
-        else:
-            env_engine = "threads"
+    env_engine = os.environ.get("BENCHMARK_ENGINE", "threads")
 
     parser.add_argument(
         "--mode",

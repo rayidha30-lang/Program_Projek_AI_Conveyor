@@ -9,10 +9,13 @@ Deskripsi:
   X11 / GTK (Anti "stack smashing detected") pada Jetson Orin Nano (Ubuntu Linux) dan Windows.
 
 Fitur:
-  1. Linux: Prioritaskan Zenity (Native GNOME/Ubuntu GTK dialog) jika tersedia.
-     Zenity adalah utilitas sistem operasi Linux resmi, 100% kebal dari buffer overflow Python/Tkinter.
-  2. Windows & Linux (Tkinter Fallback): Tkinter ringan dengan font adaptif & safe window hints.
-  3. Output terstandarisasi stdout untuk dibaca oleh runner benchmark.
+  1. Unified Dual Camera Setup Dialog: Menampilkan panel CAM-01 Top dan CAM-02 Side
+     sekaligus dalam satu jendela visual terpadu (persis seperti di Windows laptop).
+  2. Tkinter Memory-Safe: Font adaptif (Segoe UI / DejaVu Sans), variable master terikat,
+     tanpa manipulasi -topmost berisiko pada Linux X11 unmapped window.
+  3. Zenity Fallback: Jika Tkinter tidak dapat membuka display (misal SSH/X11 error),
+     otomatis fallback ke native Zenity dialog.
+  4. Protokol Output Ganda: Mencetak RESULT_SOURCE dan RESULT_FILE untuk kompatibilitas mutlak.
 ========================================================================================
 """
 
@@ -32,8 +35,7 @@ def get_available_cameras(max_devices=6):
     """Mendeteksi index webcam fisik USB tanpa mengimpor OpenCV (Zero-Crash)."""
     cams = []
     if sys.platform.startswith("win"):
-        # Di Windows, gunakan DirectShow detection via script kecil jika perlu, atau default list
-        # Hindari import cv2 di dialog GUI runner agar proses tetap murni Tkinter
+        # Di Windows, list default webcam candidates
         cams = [0, 1]
     else:
         # Di Linux / Jetson, baca langsung dari virtual filesystem /dev/video*
@@ -50,157 +52,13 @@ def get_available_cameras(max_devices=6):
     return cams
 
 
-# ======================================================================================
-# STRATEGI 1: ZENITY RUNNER (NATIVE UBUNTU LINUX DIALOG - 100% ZERO CRASH)
-# ======================================================================================
-
 def has_zenity():
     """Mengecek apakah utilitas native GNOME/Ubuntu 'zenity' tersedia di Linux."""
     return sys.platform.startswith("linux") and shutil.which("zenity") is not None
 
 
-def run_zenity_file(title="Pilih File Video", initial_dir=None):
-    """Membuka file dialog native Ubuntu GNOME via Zenity."""
-    init_d = initial_dir if (initial_dir and os.path.exists(initial_dir)) else VIDEO_DIR
-    cmd = [
-        "zenity",
-        "--file-selection",
-        f"--title={title}",
-        f"--filename={init_d}/",
-        "--file-filter=File Video | *.mp4 *.avi *.mkv *.mov *.wmv",
-        "--file-filter=Semua File | *"
-    ]
-    try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if res.returncode == 0:
-            selected = res.stdout.strip()
-            if selected and os.path.exists(selected):
-                print(f"RESULT_FILE:{os.path.abspath(selected)}")
-                return True
-    except Exception as e:
-        sys.stderr.write(f"[Zenity] Error file dialog: {e}\n")
-    return False
-
-
-def run_zenity_source(title="Pilih Sumber Kamera / Video", default_source=None):
-    """Membuka dialog visual pemilihan input kamera/video via Zenity."""
-    cams = get_available_cameras()
-    is_default_cam = str(default_source).strip().isdigit() if default_source else False
-    def_cam_idx = int(default_source) if is_default_cam else (cams[0] if cams else 0)
-
-    # Susun opsi untuk zenity --list --radiolist
-    cmd = [
-        "zenity",
-        "--list",
-        "--radiolist",
-        f"--title={title}",
-        "--text=Pilih salah satu sumber input pengujian:",
-        "--column=Pilih",
-        "--column=ID / Tipe",
-        "--column=Keterangan",
-        "--width=520",
-        "--height=380"
-    ]
-
-    for c in cams:
-        is_sel = "TRUE" if (is_default_cam and c == def_cam_idx) else ("FALSE" if is_default_cam else ("TRUE" if c == cams[0] else "FALSE"))
-        cmd.extend([is_sel, f"CAM_{c}", f"Live USB Webcam #{c}"])
-
-    file_label = f"File Video: {os.path.basename(str(default_source))}" if (default_source and not is_default_cam) else "Pilih File Rekaman Video Baru..."
-    cmd.extend(["FALSE", "FILE", file_label])
-
-    try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if res.returncode == 0:
-            choice = res.stdout.strip()
-            if choice.startswith("CAM_"):
-                cam_id = choice.replace("CAM_", "")
-                print(f"RESULT_SOURCE:{cam_id}")
-                return True
-            elif choice == "FILE":
-                # Buka file picker
-                return run_zenity_file(title="Pilih File Video Pengujian", initial_dir=VIDEO_DIR)
-    except Exception as e:
-        sys.stderr.write(f"[Zenity] Error source dialog: {e}\n")
-    return False
-
-
-def run_zenity_dual(default_top=None, default_side=None, side_id="CAM-02"):
-    """Membuka pengaturan dual camera via Zenity step-by-step yang bersih."""
-    # Step 1: Top Camera
-    cams = get_available_cameras()
-    cmd_top = [
-        "zenity",
-        "--list",
-        "--radiolist",
-        "--title=Pengaturan [CAM-01 TOP] (Plat & Sirip Rib)",
-        "--text=Langkah 1/2: Pilih sumber untuk CAM-01 TOP:",
-        "--column=Pilih",
-        "--column=ID",
-        "--column=Keterangan",
-        "--width=520",
-        "--height=360"
-    ]
-    for c in cams:
-        cmd_top.extend(["TRUE" if c == 0 else "FALSE", f"CAM_{c}", f"Live USB Webcam #{c}"])
-    cmd_top.extend(["FALSE", "FILE", "Pilih File Rekaman Video..."])
-
-    top_result = str(default_top) if default_top else "0"
-    try:
-        res = subprocess.run(cmd_top, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if res.returncode == 0:
-            ch = res.stdout.strip()
-            if ch.startswith("CAM_"):
-                top_result = ch.replace("CAM_", "")
-            elif ch == "FILE":
-                cmd_f = ["zenity", "--file-selection", "--title=Pilih Video CAM-01 TOP", f"--filename={VIDEO_DIR}/"]
-                rf = subprocess.run(cmd_f, stdout=subprocess.PIPE, text=True)
-                if rf.returncode == 0 and rf.stdout.strip():
-                    top_result = rf.stdout.strip()
-    except Exception:
-        pass
-
-    # Step 2: Side Camera
-    cmd_side = [
-        "zenity",
-        "--list",
-        "--radiolist",
-        f"--title=Pengaturan [{side_id} SIDE] (Baut & Pin)",
-        f"--text=Langkah 2/2: Pilih sumber untuk {side_id} SIDE:",
-        "--column=Pilih",
-        "--column=ID",
-        "--column=Keterangan",
-        "--width=520",
-        "--height=360"
-    ]
-    for c in cams:
-        cmd_side.extend(["TRUE" if c == 1 else "FALSE", f"CAM_{c}", f"Live USB Webcam #{c}"])
-    cmd_side.extend(["FALSE", "FILE", "Pilih File Rekaman Video..."])
-
-    side_result = str(default_side) if default_side else "1"
-    try:
-        res = subprocess.run(cmd_side, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if res.returncode == 0:
-            ch = res.stdout.strip()
-            if ch.startswith("CAM_"):
-                side_result = ch.replace("CAM_", "")
-            elif ch == "FILE":
-                cmd_f = ["zenity", "--file-selection", f"--title=Pilih Video {side_id} SIDE", f"--filename={VIDEO_DIR}/"]
-                rf = subprocess.run(cmd_f, stdout=subprocess.PIPE, text=True)
-                if rf.returncode == 0 and rf.stdout.strip():
-                    side_result = rf.stdout.strip()
-    except Exception:
-        pass
-
-    if top_result:
-        print(f"RESULT_DUAL_TOP:{top_result}")
-    if side_result:
-        print(f"RESULT_DUAL_SIDE:{side_result}")
-    return True
-
-
 # ======================================================================================
-# STRATEGI 2: TKINTER RUNNER (STANDALONE, PURE MEMORY SAFE)
+# STRATEGI 1: TKINTER RUNNER (STANDALONE, PURE MEMORY SAFE & UNIFIED UI)
 # ======================================================================================
 
 def run_tkinter_file(title="Pilih File Video", initial_dir=None):
@@ -215,6 +73,7 @@ def run_tkinter_file(title="Pilih File Video", initial_dir=None):
             root.attributes("-topmost", True)
         except Exception:
             pass
+
     init_d = initial_dir if (initial_dir and os.path.exists(initial_dir)) else VIDEO_DIR
     fp = filedialog.askopenfilename(
         parent=root,
@@ -229,8 +88,11 @@ def run_tkinter_file(title="Pilih File Video", initial_dir=None):
         root.destroy()
     except Exception:
         pass
+
     if fp and os.path.exists(fp):
-        print(f"RESULT_FILE:{os.path.abspath(fp)}")
+        norm_p = os.path.abspath(fp)
+        print(f"RESULT_FILE:{norm_p}")
+        print(f"RESULT_SOURCE:{norm_p}")
         return True
     return False
 
@@ -250,6 +112,12 @@ def run_tkinter_source(title="Pilih Sumber Kamera / Video", default_source=None)
             root.attributes("-topmost", True)
         except Exception:
             pass
+    else:
+        try:
+            root.lift()
+            root.focus_force()
+        except Exception:
+            pass
 
     root.geometry("500x420")
     root.minsize(450, 380)
@@ -258,7 +126,6 @@ def run_tkinter_source(title="Pilih Sumber Kamera / Video", default_source=None)
     f_title = (f_fam, 11, "bold")
     f_sec = (f_fam, 10, "bold")
     f_reg = (f_fam, 9)
-    f_sm = (f_fam, 8)
 
     selected_result = {"val": default_source}
 
@@ -312,7 +179,7 @@ def run_tkinter_source(title="Pilih Sumber Kamera / Video", default_source=None)
             ]
         )
         if f:
-            file_selected_path["path"] = f
+            file_selected_path["path"] = os.path.abspath(f)
             lbl_file_path.config(text=os.path.basename(f), fg="blue")
 
     btn_browse = tk.Button(frame_options, text="📁 Buka File Explorer...", command=on_browse, font=f_reg)
@@ -323,7 +190,7 @@ def run_tkinter_source(title="Pilih Sumber Kamera / Video", default_source=None)
             selected_result["val"] = str(var_cam_idx.get())
         else:
             if file_selected_path["path"]:
-                selected_result["val"] = file_selected_path["path"]
+                selected_result["val"] = str(file_selected_path["path"])
             else:
                 selected_result["val"] = default_source
         root.destroy()
@@ -335,13 +202,18 @@ def run_tkinter_source(title="Pilih Sumber Kamera / Video", default_source=None)
 
     root.mainloop()
     if selected_result["val"]:
-        print(f"RESULT_SOURCE:{selected_result['val']}")
+        val_str = str(selected_result["val"])
+        print(f"RESULT_SOURCE:{val_str}")
+        print(f"RESULT_FILE:{val_str}")
         return True
     return False
 
 
 def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
-    """Dialog visual pengaturan dual camera (Top & Side) menggunakan Tkinter murni."""
+    """
+    Dialog visual pengaturan dual camera terpadu (CAM-01 Top & CAM-02 Side dalam 1 jendela).
+    Persis seperti tampilan pada laptop Windows, namun 100% aman dieksekusi di Jetson Linux.
+    """
     import tkinter as tk
     from tkinter import filedialog
 
@@ -352,6 +224,12 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
     if sys.platform.startswith("win"):
         try:
             root.attributes("-topmost", True)
+        except Exception:
+            pass
+    else:
+        try:
+            root.lift()
+            root.focus_force()
         except Exception:
             pass
 
@@ -402,7 +280,7 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
         var_top_choice.set("file")
         f = filedialog.askopenfilename(parent=root, title="Pilih Video CAM-01 Top", initialdir=VIDEO_DIR)
         if f:
-            top_file_path["path"] = f
+            top_file_path["path"] = os.path.abspath(f)
             lbl_top_fname.config(text=os.path.basename(f), fg="blue")
 
     tk.Button(f_top_file, text="Pilih...", command=browse_top, font=f_sm).pack(side="right")
@@ -433,7 +311,7 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
         var_side_choice.set("file")
         f = filedialog.askopenfilename(parent=root, title=f"Pilih Video {side_id} Side", initialdir=VIDEO_DIR)
         if f:
-            side_file_path["path"] = f
+            side_file_path["path"] = os.path.abspath(f)
             lbl_side_fname.config(text=os.path.basename(f), fg="blue")
 
     tk.Button(f_side_file, text="Pilih...", command=browse_side, font=f_sm).pack(side="right")
@@ -448,12 +326,12 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
         if var_top_choice.get() == "webcam":
             res["top"] = str(var_top_cam.get())
         elif top_file_path["path"]:
-            res["top"] = top_file_path["path"]
+            res["top"] = str(top_file_path["path"])
 
         if var_side_choice.get() == "webcam":
             res["side"] = str(var_side_cam.get())
         elif side_file_path["path"]:
-            res["side"] = side_file_path["path"]
+            res["side"] = str(side_file_path["path"])
 
         root.destroy()
 
@@ -467,6 +345,165 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
         print(f"RESULT_DUAL_TOP:{res['top']}")
     if res.get("side"):
         print(f"RESULT_DUAL_SIDE:{res['side']}")
+    return True
+
+
+# ======================================================================================
+# STRATEGI 2: ZENITY RUNNER (FALLBACK UNTUK ENVIRONMENT LINUX NON-TKINTER)
+# ======================================================================================
+
+def run_zenity_file(title="Pilih File Video", initial_dir=None):
+    """Membuka file dialog native Ubuntu GNOME via Zenity."""
+    init_d = initial_dir if (initial_dir and os.path.exists(initial_dir)) else VIDEO_DIR
+    cmd = [
+        "zenity",
+        "--file-selection",
+        f"--title={title}",
+        f"--filename={init_d}/",
+        "--file-filter=File Video | *.mp4 *.avi *.mkv *.mov *.wmv",
+        "--file-filter=Semua File | *"
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0:
+            selected = res.stdout.strip()
+            if selected and os.path.exists(selected):
+                norm_p = os.path.abspath(selected)
+                print(f"RESULT_FILE:{norm_p}")
+                print(f"RESULT_SOURCE:{norm_p}")
+                return True
+    except Exception as e:
+        sys.stderr.write(f"[Zenity] Error file dialog: {e}\n")
+    return False
+
+
+def run_zenity_source(title="Pilih Sumber Kamera / Video", default_source=None):
+    """Membuka dialog visual pemilihan input kamera/video via Zenity."""
+    cams = get_available_cameras()
+    is_default_cam = str(default_source).strip().isdigit() if default_source else False
+    def_cam_idx = int(default_source) if is_default_cam else (cams[0] if cams else 0)
+
+    cmd = [
+        "zenity",
+        "--list",
+        "--radiolist",
+        f"--title={title}",
+        "--text=Pilih salah satu sumber input pengujian:",
+        "--column=Pilih",
+        "--column=ID / Tipe",
+        "--column=Keterangan",
+        "--width=520",
+        "--height=380"
+    ]
+
+    for c in cams:
+        is_sel = "TRUE" if (is_default_cam and c == def_cam_idx) else ("FALSE" if is_default_cam else ("TRUE" if c == cams[0] else "FALSE"))
+        cmd.extend([is_sel, f"CAM_{c}", f"Live USB Webcam #{c}"])
+
+    file_label = f"File Video: {os.path.basename(str(default_source))}" if (default_source and not is_default_cam) else "Pilih File Rekaman Video Baru..."
+    cmd.extend(["FALSE", "FILE", file_label])
+
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0:
+            choice = res.stdout.strip()
+            if choice.startswith("CAM_"):
+                cam_id = choice.replace("CAM_", "")
+                print(f"RESULT_SOURCE:{cam_id}")
+                print(f"RESULT_FILE:{cam_id}")
+                return True
+            elif choice == "FILE":
+                init_d = VIDEO_DIR
+                cmd_f = [
+                    "zenity",
+                    "--file-selection",
+                    f"--title={title}",
+                    f"--filename={init_d}/",
+                    "--file-filter=File Video | *.mp4 *.avi *.mkv *.mov *.wmv",
+                    "--file-filter=Semua File | *"
+                ]
+                res_f = subprocess.run(cmd_f, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if res_f.returncode == 0:
+                    selected = res_f.stdout.strip()
+                    if selected and os.path.exists(selected):
+                        norm_p = os.path.abspath(selected)
+                        print(f"RESULT_SOURCE:{norm_p}")
+                        print(f"RESULT_FILE:{norm_p}")
+                        return True
+    except Exception as e:
+        sys.stderr.write(f"[Zenity] Error source dialog: {e}\n")
+    return False
+
+
+def run_zenity_dual(default_top=None, default_side=None, side_id="CAM-02"):
+    """Membuka pengaturan dual camera via Zenity step-by-step."""
+    cams = get_available_cameras()
+    cmd_top = [
+        "zenity",
+        "--list",
+        "--radiolist",
+        "--title=Pengaturan [CAM-01 TOP] (Plat & Sirip Rib)",
+        "--text=Langkah 1/2: Pilih sumber untuk CAM-01 TOP:",
+        "--column=Pilih",
+        "--column=ID",
+        "--column=Keterangan",
+        "--width=520",
+        "--height=360"
+    ]
+    for c in cams:
+        cmd_top.extend(["TRUE" if c == 0 else "FALSE", f"CAM_{c}", f"Live USB Webcam #{c}"])
+    cmd_top.extend(["FALSE", "FILE", "Pilih File Rekaman Video..."])
+
+    top_result = str(default_top) if default_top else "0"
+    try:
+        res = subprocess.run(cmd_top, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0:
+            ch = res.stdout.strip()
+            if ch.startswith("CAM_"):
+                top_result = ch.replace("CAM_", "")
+            elif ch == "FILE":
+                cmd_f = ["zenity", "--file-selection", "--title=Pilih Video CAM-01 TOP", f"--filename={VIDEO_DIR}/"]
+                rf = subprocess.run(cmd_f, stdout=subprocess.PIPE, text=True)
+                if rf.returncode == 0 and rf.stdout.strip():
+                    top_result = os.path.abspath(rf.stdout.strip())
+    except Exception:
+        pass
+
+    cmd_side = [
+        "zenity",
+        "--list",
+        "--radiolist",
+        f"--title=Pengaturan [{side_id} SIDE] (Baut & Pin)",
+        f"--text=Langkah 2/2: Pilih sumber untuk {side_id} SIDE:",
+        "--column=Pilih",
+        "--column=ID",
+        "--column=Keterangan",
+        "--width=520",
+        "--height=360"
+    ]
+    for c in cams:
+        cmd_side.extend(["TRUE" if c == 1 else "FALSE", f"CAM_{c}", f"Live USB Webcam #{c}"])
+    cmd_side.extend(["FALSE", "FILE", "Pilih File Rekaman Video..."])
+
+    side_result = str(default_side) if default_side else "1"
+    try:
+        res = subprocess.run(cmd_side, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0:
+            ch = res.stdout.strip()
+            if ch.startswith("CAM_"):
+                side_result = ch.replace("CAM_", "")
+            elif ch == "FILE":
+                cmd_f = ["zenity", "--file-selection", f"--title=Pilih Video {side_id} SIDE", f"--filename={VIDEO_DIR}/"]
+                rf = subprocess.run(cmd_f, stdout=subprocess.PIPE, text=True)
+                if rf.returncode == 0 and rf.stdout.strip():
+                    side_result = os.path.abspath(rf.stdout.strip())
+    except Exception:
+        pass
+
+    if top_result:
+        print(f"RESULT_DUAL_TOP:{top_result}")
+    if side_result:
+        print(f"RESULT_DUAL_SIDE:{side_result}")
     return True
 
 
@@ -485,32 +522,49 @@ def main():
     parser.add_argument("--side-id", type=str, default="CAM-02")
     args = parser.parse_args()
 
-    # Jika berjalan di Linux dan Zenity tersedia, gunakan Zenity untuk jaminan 100% Zero-Crash!
     use_zenity = has_zenity()
 
-    if args.dialog == "file":
-        if use_zenity:
-            ok = run_zenity_file(title=args.title or "Pilih File Video", initial_dir=args.initial_dir)
+    if args.dialog == "dual":
+        # Prioritas 1: Tkinter Unified Dual Setup (satu jendela terpadu Top & Side, persis seperti di laptop)
+        try:
+            ok = run_tkinter_dual(default_top=args.top, default_side=args.side, side_id=args.side_id)
             if ok:
                 sys.exit(0)
-        run_tkinter_file(title=args.title or "Pilih File Video", initial_dir=args.initial_dir)
-        sys.exit(0)
+        except Exception as e:
+            sys.stderr.write(f"[Tkinter Dual] Fallback ke Zenity ({e})\n")
+            if use_zenity:
+                ok = run_zenity_dual(default_top=args.top, default_side=args.side, side_id=args.side_id)
+                if ok:
+                    sys.exit(0)
+        sys.exit(1)
 
     elif args.dialog == "source":
-        if use_zenity:
-            ok = run_zenity_source(title=args.title or "Pilih Sumber Kamera / Video", default_source=args.default)
+        # Prioritas 1: Tkinter Source Picker
+        try:
+            ok = run_tkinter_source(title=args.title or "Pilih Sumber Kamera / Video", default_source=args.default)
             if ok:
                 sys.exit(0)
-        run_tkinter_source(title=args.title or "Pilih Sumber Kamera / Video", default_source=args.default)
-        sys.exit(0)
+        except Exception as e:
+            sys.stderr.write(f"[Tkinter Source] Fallback ke Zenity ({e})\n")
+            if use_zenity:
+                ok = run_zenity_source(title=args.title or "Pilih Sumber Kamera / Video", default_source=args.default)
+                if ok:
+                    sys.exit(0)
+        sys.exit(1)
 
-    elif args.dialog == "dual":
-        if use_zenity:
-            ok = run_zenity_dual(default_top=args.top, default_side=args.side, side_id=args.side_id)
+    elif args.dialog == "file":
+        # Prioritas 1: File Dialog
+        try:
+            ok = run_tkinter_file(title=args.title or "Pilih File Video", initial_dir=args.initial_dir)
             if ok:
                 sys.exit(0)
-        run_tkinter_dual(default_top=args.top, default_side=args.side, side_id=args.side_id)
-        sys.exit(0)
+        except Exception as e:
+            sys.stderr.write(f"[Tkinter File] Fallback ke Zenity ({e})\n")
+            if use_zenity:
+                ok = run_zenity_file(title=args.title or "Pilih File Video", initial_dir=args.initial_dir)
+                if ok:
+                    sys.exit(0)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
