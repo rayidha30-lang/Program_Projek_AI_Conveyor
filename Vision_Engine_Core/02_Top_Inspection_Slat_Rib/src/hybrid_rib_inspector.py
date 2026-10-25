@@ -1175,10 +1175,18 @@ class HybridRibInspector:
             parabola_bend = 24.0 * np.sin(norm_x * np.pi)
             smooth_ys = smooth_ys + parabola_bend
 
-        # Garis Acuan Baseline Kokoh (Robust Baseline Estimator)
-        # Menggunakan estimasi slope median berpasangan (Theil-Sen Subsampled)
-        # Kebal terhadap efek tekukan/dent lokal yang dapat memiringkan baseline OLS
+        # Garis Acuan Baseline Kokoh & Full-Span Gating
         n_pts = len(r_xs)
+        w_span = float(r_xs[-1] - r_xs[0])
+        med_top_y = int(np.median(smooth_ys))
+        self.active_rib_frames += 1
+
+        # FULL-SPAN ANTI-TRUNCATION GATING:
+        # Menolak fitting kelengkungan jika kontur belum terbentang tip-to-tip (lebar < 880px atau coverage < 70%).
+        # Memotong rentang horizontal (X) secara matematis melipatgandakan Sagitta semu parabola.
+        full_span_valid = (w_span >= 880.0 and coverage >= 0.70)
+
+        # Baseline Estimator (Theil-Sen Subsampled)
         step_eval = max(1, n_pts // 30)
         sub_xs = r_xs[::step_eval]
         sub_ys = smooth_ys[::step_eval]
@@ -1198,46 +1206,50 @@ class HybridRibInspector:
             baseline = np.polyval(poly1, r_xs)
 
         dev = smooth_ys - baseline
-        pv = float(np.percentile(dev, 98) - np.percentile(dev, 2))
-        max_dev = float(np.max(np.abs(dev)))
-
-        # Evaluasi Deviasi Badan vs Ujung (Tip):
-        # Zona tip: 75 px terluar dari batas bilah aktif kiri & kanan
-        tip_zone_px = 75.0
-        left_tip_mask = (r_xs < (r_xs[0] + tip_zone_px))
-        right_tip_mask = (r_xs > (r_xs[-1] - tip_zone_px))
-        tip_mask = left_tip_mask | right_tip_mask
-
-        left_tip_dev = float(np.percentile(np.abs(dev[left_tip_mask]), 95)) if np.any(left_tip_mask) and np.sum(left_tip_mask) >= 4 else 0.0
-        right_tip_dev = float(np.percentile(np.abs(dev[right_tip_mask]), 95)) if np.any(right_tip_mask) and np.sum(right_tip_mask) >= 4 else 0.0
-        tip_dev = max(left_tip_dev, right_tip_dev)
-
-        inner_mask = ~tip_mask
-        if np.any(inner_mask):
-            inner_dev = float(np.percentile(np.abs(dev[inner_mask]), 98))
-        else:
-            inner_dev = max_dev
-
-        # Regresi Polinomial Parabola Orde-2 (Kelengkungan Sagitta)
-        poly2 = np.polyfit(r_xs, smooth_ys, deg=2)
-        w_span = float(r_xs[-1] - r_xs[0])
-        sagitta = abs(float(poly2[0])) * ((w_span / 2.0) ** 2)
-
-        # Evaluasi Kriteria Mutu Kelurusan QC Frame Saat Ini
-        med_top_y = int(np.median(smooth_ys))
-        self.active_rib_frames += 1
-
-        # PRIME ZONE EVALUATION: Hanya kumpulkan sampel metrologi jika berada di zona tengah konveyor!
-        # Menghindari distorsi optik, bayangan jatuh, dan interferensi mekanis di zona keluar (Y < 330)
         is_in_prime = (self.prime_min_y <= med_top_y <= self.prime_max_y)
-        if is_in_prime:
-            self.prime_pv_samples.append(pv)
-            self.prime_sagitta_samples.append(sagitta)
-            self.prime_inner_dev_samples.append(inner_dev)
-            self.prime_tip_dev_samples.append(tip_dev)
 
-        # Konsensus Metrologi Prime Zone Berbasis Median (Kebal terhadap glitch sesaat)
-        if len(self.prime_pv_samples) >= 3:
+        if not full_span_valid:
+            # Kontur belum membentang utuh -> Tahan penilaian metrologi, hindari lonjakan Sagitta palsu
+            pv = 0.0
+            sagitta = 0.0
+            max_dev = 0.0
+            inner_dev = 0.0
+            tip_dev = 0.0
+        else:
+            pv = float(np.percentile(dev, 98) - np.percentile(dev, 2))
+            max_dev = float(np.max(np.abs(dev)))
+
+            # Evaluasi Deviasi Badan vs Ujung (Tip):
+            tip_zone_px = 75.0
+            left_tip_mask = (r_xs < (r_xs[0] + tip_zone_px))
+            right_tip_mask = (r_xs > (r_xs[-1] - tip_zone_px))
+            tip_mask = left_tip_mask | right_tip_mask
+
+            left_tip_dev = float(np.percentile(np.abs(dev[left_tip_mask]), 95)) if np.any(left_tip_mask) and np.sum(left_tip_mask) >= 4 else 0.0
+            right_tip_dev = float(np.percentile(np.abs(dev[right_tip_mask]), 95)) if np.any(right_tip_mask) and np.sum(right_tip_mask) >= 4 else 0.0
+            tip_dev = max(left_tip_dev, right_tip_dev)
+
+            inner_mask = ~tip_mask
+            if np.any(inner_mask):
+                inner_dev = float(np.percentile(np.abs(dev[inner_mask]), 98))
+            else:
+                inner_dev = max_dev
+
+            # Regresi Polinomial Parabola Orde-2 (Kelengkungan Sagitta)
+            poly2 = np.polyfit(r_xs, smooth_ys, deg=2)
+            sagitta = abs(float(poly2[0])) * ((w_span / 2.0) ** 2)
+
+            # Hanya kumpulkan sampel metrologi jika berada di zona prime konveyor dan kontur utuh!
+            if is_in_prime:
+                self.prime_pv_samples.append(pv)
+                self.prime_sagitta_samples.append(sagitta)
+                self.prime_inner_dev_samples.append(inner_dev)
+                self.prime_tip_dev_samples.append(tip_dev)
+
+        # KONSENSUS METROLOGI PRIME ZONE (Minimal 5 Sampel Stabil)
+        # Menjamin vonis tidak diambil secara terburu-buru sebelum objek mapan di zona tengah
+        sample_count = len(self.prime_pv_samples)
+        if sample_count >= 3:
             eval_pv = float(np.median(self.prime_pv_samples))
             eval_sag = float(np.median(self.prime_sagitta_samples))
             eval_idev = float(np.median(self.prime_inner_dev_samples))
@@ -1248,19 +1260,24 @@ class HybridRibInspector:
             eval_idev = inner_dev
             eval_tdev = tip_dev
 
-        # Evaluasi Multi-Variate Terkalibrasi:
-        # Cacat kelengkungan badan harus terkonfirmasi oleh Sagitta tinggi DAN PV tinggi (atau Sagitta sangat ekstrim > 14.5 px)
+        # Evaluasi Multi-Variate Terkalibrasi
         curv_defect = (eval_sag > self.sagitta_thresh and eval_pv > self.pv_thresh) or (eval_sag > 14.5)
         dev_defect = (eval_idev > self.dev_thresh and eval_pv > self.pv_thresh) or (eval_idev > 12.0)
         tip_defect = (eval_tdev > self.tip_thresh)
         flat_defect = (eval_pv > 18.0)
         transit_is_ok = not (curv_defect or dev_defect or tip_defect or flat_defect)
 
-        # Registrasi Objek & Pembaruan Status Transit Konsensus
-        if self.active_rib_frames < self.min_transit_frames:
-            status = "WAIT"
+        # Registrasi Objek & Pembaruan Status Berbasis Konsensus Transaksional
+        if sample_count < 5:
+            # Belum cukup sampel prime zone -> Tetap WAIT agar tidak memicu False NG prematur
+            if self.current_rib_status is not None:
+                status = self.current_rib_status
+            else:
+                status = "WAIT"
+            eval_msg = f"Stabilisasi Prime Zone ({sample_count}/5 sampel | Span={w_span:.0f}px)"
         else:
-            if self.active_rib_frames == self.min_transit_frames:
+            # Sampel prime zone cukup (>= 5 sampel) -> Tentukan vonis pertama untuk sirip ini
+            if self.current_rib_status is None:
                 self.rib_count += 1
                 if transit_is_ok:
                     self.current_rib_status = "OK"
@@ -1268,28 +1285,26 @@ class HybridRibInspector:
                 else:
                     self.current_rib_status = "NG"
                     self.ng_count += 1
-
-            # Pembaruan dinamis selama transit di prime zone
-            if is_in_prime and len(self.prime_pv_samples) >= 6:
-                if self.current_rib_status == "OK" and not transit_is_ok:
+            else:
+                # Revisi dinamis hanya jika didukung oleh sampel median jangka panjang (>= 8-10 sampel)
+                if self.current_rib_status == "OK" and not transit_is_ok and sample_count >= 8:
                     self.current_rib_status = "NG"
                     self.ok_count = max(0, self.ok_count - 1)
                     self.ng_count += 1
-                elif self.current_rib_status == "NG" and transit_is_ok and len(self.prime_pv_samples) >= 12:
+                elif self.current_rib_status == "NG" and transit_is_ok and sample_count >= 10:
                     self.current_rib_status = "OK"
                     self.ng_count = max(0, self.ng_count - 1)
                     self.ok_count += 1
 
             status = self.current_rib_status
+            if status == "OK":
+                self.last_ng_reason = None
+                eval_msg = f"SIRIP LURUS (OK) | Top Y={med_top_y}px | PV={eval_pv:.1f}px, Sag={eval_sag:.1f}px, Dev={eval_idev:.1f}px, Tip={eval_tdev:.1f}px"
+            else:
+                self.last_ng_reason = "NG"
+                eval_msg = f"SIRIP BENGKOK (NG) | PV={eval_pv:.1f}px, Sag={eval_sag:.1f}px, Dev={eval_idev:.1f}px, Tip={eval_tdev:.1f}px"
 
         self.last_presence = True
-
-        if status == "OK":
-            self.last_ng_reason = None
-            eval_msg = f"SIRIP LURUS (OK) | Top Y={med_top_y}px | PV={eval_pv:.1f}px, Sag={eval_sag:.1f}px, Dev={eval_idev:.1f}px, Tip={eval_tdev:.1f}px"
-        else:
-            self.last_ng_reason = "NG"
-            eval_msg = f"SIRIP BENGKOK (NG) | PV={eval_pv:.1f}px, Sag={eval_sag:.1f}px, Dev={eval_idev:.1f}px, Tip={eval_tdev:.1f}px"
 
         # Patch fisik sirip yang tepat mengunci dari med_top_y ke med_top_y + 110 px
         patch_y1 = max(0, med_top_y - 8)
@@ -1307,9 +1322,11 @@ class HybridRibInspector:
             "is_rib_present": True,
             "is_ok": (status == "OK"),
             "is_ng": (status == "NG"),
+            "final_consensus_ready": bool(sample_count >= 5),
+            "rib_count": self.rib_count,
             "mode": self.mode,
             "message": eval_msg,
-            "detection_reason": f"{reason} | Bilah Terkunci (Cov={coverage*100:.0f}%)",
+            "detection_reason": f"{reason} | Bilah Terkunci (Cov={coverage*100:.0f}%, Span={w_span:.0f}px)",
             "confidence": float(yolo_conf if yolo_conf > 0 else (dual_ratio if self.mode == "DUAL_POLARITY_ONLY" else 0.0)),
             "pv_flatness": eval_pv,
             "sagitta": eval_sag,

@@ -574,6 +574,46 @@ class CombinedTopInspector:
 
         return ann
 
+    def purge_top_candidate_if_ok(self, curr_slat_ok=False, curr_rib_ok=False, slat_no=None, rib_no=None):
+        """
+        Mekanisme Transactional Latch:
+        Membatalkan (purge) kandidat Best-Shot di memori jika vonis akhir objek menyatakan OK.
+        Mencegah 100% bug desinkronisasi di mana frame NG prematur tersimpan padahal counter QC = OK.
+        """
+        if self._best_top_candidate is None:
+            return
+
+        cand = self._best_top_candidate
+        cand_rib_ng = bool(cand.get("rib_res", {}).get("is_ng", False))
+        cand_slat_ng = bool(cand.get("slat_res", {}).get("is_ng", False))
+        cand_rib_no = cand.get("rib_no")
+        cand_slat_no = cand.get("slat_no")
+
+        # Kasus 1: Rib dikonfirmasi OK dan kandidat hanya berisi cacat Rib
+        if curr_rib_ok and cand_rib_ng and not cand_slat_ng:
+            if rib_no is None or rib_no == cand_rib_no:
+                self._best_top_candidate = None
+                return
+
+        # Kasus 2: Slat dikonfirmasi OK dan kandidat hanya berisi cacat Slat
+        if curr_slat_ok and cand_slat_ng and not cand_rib_ng:
+            if slat_no is None or slat_no == cand_slat_no:
+                self._best_top_candidate = None
+                return
+
+        # Kasus 3: Keduanya dikonfirmasi OK
+        if curr_rib_ok and curr_slat_ok:
+            self._best_top_candidate = None
+            return
+
+        # Kasus 4: Kandidat gabungan, tapi salah satu terbukti OK
+        if curr_rib_ok and cand_rib_ng and cand_slat_ng:
+            cand["rib_res"]["is_ng"] = False
+            cand["rib_res"]["status"] = "OK"
+        if curr_slat_ok and cand_slat_ng and cand_rib_ng:
+            cand["slat_res"]["is_ng"] = False
+            cand["slat_res"]["status"] = "OK"
+
     def flush_best_shot_if_needed(self):
         """
         Memancarkan kandidat Best-Shot ke db_bridge jika siklus selesai dan terdapat NG terkonfirmasi.
@@ -582,10 +622,32 @@ class CombinedTopInspector:
         if self._best_top_candidate is None:
             return False
         cand = self._best_top_candidate
-        self._best_top_candidate = None
 
         slat_no = cand["slat_no"]
         rib_no = cand["rib_no"]
+
+        # Validasi ganda terhadap status riil inspector saat ini
+        cand_rib_ng = bool(cand.get("rib_res", {}).get("is_ng", False))
+        cand_slat_ng = bool(cand.get("slat_res", {}).get("is_ng", False))
+
+        current_rib_stat = getattr(self.rib_inspector, "current_rib_status", None)
+        current_slat_stat = getattr(self.slat_inspector, "latched_status", None)
+        current_rib_count = getattr(self.rib_inspector, "rib_count", 0)
+        current_slat_count = getattr(self.slat_inspector, "slat_count", 0)
+
+        # Jika kandidat tercatat Rib NG tapi vonis akhir sirip tersebut OK -> Batalkan emisi!
+        if cand_rib_ng and not cand_slat_ng:
+            if cand_rib_no == current_rib_count and current_rib_stat == "OK":
+                self._best_top_candidate = None
+                return False
+
+        # Jika kandidat tercatat Slat NG tapi vonis akhir plat tersebut OK -> Batalkan emisi!
+        if cand_slat_ng and not cand_rib_ng:
+            if cand_slat_no == current_slat_count and current_slat_stat == "OK":
+                self._best_top_candidate = None
+                return False
+
+        self._best_top_candidate = None
 
         # Cek deduplikasi agar 1 siklus NG tidak pernah di-emit ganda
         if slat_no is not None and slat_no == self._last_emitted_slat_id and rib_no == self._last_emitted_rib_id:
@@ -618,20 +680,14 @@ class CombinedTopInspector:
         slat_res = inspect_res.get("slat_res", {}) if inspect_res else {}
         rib_res = inspect_res.get("rib_res", {}) if inspect_res else {}
 
-        is_slat_ng = bool(slat_res.get("is_ng", False))
-        is_rib_ng = bool(rib_res.get("is_ng", False))
-
-        # Filter eliminasi false alarm: Abaikan vonis NG jika kontur garis sirip belum membentang penuh (tip-to-tip < 850px)
-        rib_xs = rib_res.get("xs_contour")
-        rib_span = float(rib_xs[-1] - rib_xs[0]) if (rib_xs is not None and len(rib_xs) > 10) else 0.0
-        if is_rib_ng and rib_span < 850.0:
-            is_rib_ng = False
-
         curr_slat_no = slat_no if slat_no is not None else getattr(self.slat_inspector, "slat_count", 0)
         curr_rib_no = rib_no if rib_no is not None else getattr(self.rib_inspector, "rib_count", 0)
 
-        # 1. Jika siklus berganti (slat baru atau rib baru melintas), emit kandidat siklus sebelumnya
-        if self._current_slat_cycle_id is not None and curr_slat_no != self._current_slat_cycle_id:
+        # 1. Deteksi pergantian siklus (Slat berganti ATAU Rib berganti)
+        slat_changed = (self._current_slat_cycle_id is not None and curr_slat_no != self._current_slat_cycle_id)
+        rib_changed = (self._current_rib_cycle_id is not None and curr_rib_no != self._current_rib_cycle_id and curr_rib_no > 0)
+
+        if slat_changed or rib_changed:
             self.flush_best_shot_if_needed()
             self._current_slat_cycle_id = curr_slat_no
             self._current_rib_cycle_id = curr_rib_no
@@ -639,10 +695,30 @@ class CombinedTopInspector:
             self._current_slat_cycle_id = curr_slat_no
             self._current_rib_cycle_id = curr_rib_no
 
+        # 2. Periksa konfirmasi status OK untuk melakukan Transactional Purge
+        curr_rib_ok = bool(rib_res.get("is_ok", False)) or (rib_res.get("status") == "OK")
+        curr_slat_ok = bool(slat_res.get("is_ok", False)) or (slat_res.get("status") == "OK")
+        if curr_rib_ok or curr_slat_ok:
+            self.purge_top_candidate_if_ok(
+                curr_slat_ok=curr_slat_ok,
+                curr_rib_ok=curr_rib_ok,
+                slat_no=curr_slat_no,
+                rib_no=curr_rib_no
+            )
+
+        is_slat_ng = bool(slat_res.get("is_ng", False)) and (slat_res.get("status") == "NG")
+        is_rib_ng = bool(rib_res.get("is_ng", False)) and (rib_res.get("status") == "NG")
+
+        # Filter eliminasi false alarm: Abaikan vonis NG jika kontur garis sirip belum membentang penuh (tip-to-tip < 880px)
+        rib_xs = rib_res.get("xs_contour")
+        rib_span = float(rib_xs[-1] - rib_xs[0]) if (rib_xs is not None and len(rib_xs) > 10) else 0.0
+        if is_rib_ng and rib_span < 880.0:
+            is_rib_ng = False
+
         if not is_slat_ng and not is_rib_ng:
             return False
 
-        # 2. Hitung severity score (tingkat keparahan cacat) pada frame saat ini
+        # 3. Hitung severity score (tingkat keparahan cacat) pada frame saat ini
         slat_score = 0.0
         if is_slat_ng:
             s_pv = float(slat_res.get("pv_flatness", 0.0) or 0.0)
@@ -658,7 +734,7 @@ class CombinedTopInspector:
 
         total_severity = max(slat_score, rib_score)
 
-        # 3. Update kandidat Best-Shot jika frame ini memiliki keparahan lebih tinggi
+        # 4. Update kandidat Best-Shot jika frame ini memiliki keparahan lebih tinggi
         need_update = False
         if self._best_top_candidate is None:
             need_update = True
