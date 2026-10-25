@@ -367,7 +367,11 @@ def _run_isolated_dialog(dialog_mode, **kwargs):
     serta mencegah fork error di multiprocessing child processes.
     """
     import subprocess
-    cmd = [sys.executable, os.path.abspath(__file__), "--gui-dialog", dialog_mode]
+    dialog_script = os.path.join(BASE_DIR, "scripts", "gui_source_dialog.py")
+    if os.path.exists(dialog_script):
+        cmd = [sys.executable, dialog_script, "--dialog", dialog_mode]
+    else:
+        cmd = [sys.executable, os.path.abspath(__file__), "--gui-dialog", dialog_mode]
     for k, v in kwargs.items():
         if v is not None:
             cmd.extend([f"--{k.replace('_', '-')}", str(v)])
