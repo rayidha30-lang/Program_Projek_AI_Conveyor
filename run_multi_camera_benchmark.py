@@ -373,6 +373,9 @@ def _run_isolated_dialog(dialog_mode, **kwargs):
             cmd.extend([f"--{k.replace('_', '-')}", str(v)])
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+        if proc.returncode != 0 and proc.stderr:
+            sys.stderr.write(f"[!] Warning dialog subprocess ({dialog_mode}):\n{proc.stderr.strip()}\n")
+            sys.stderr.flush()
         res = {}
         for line in proc.stdout.strip().splitlines():
             line = line.strip()
@@ -445,16 +448,37 @@ def _handle_isolated_gui_dialog():
 
     cams = detect_available_cameras(max_devices=6)
 
+    # Definisi font lintas-platform (Windows: Segoe UI, Linux Jetson: DejaVu Sans / Helvetica)
+    if sys.platform.startswith("win"):
+        F_FAMILY = "Segoe UI"
+    elif sys.platform.startswith("linux"):
+        F_FAMILY = "DejaVu Sans"
+    else:
+        F_FAMILY = "Helvetica"
+
+    F_TITLE = (F_FAMILY, 11, "bold")
+    F_SEC = (F_FAMILY, 10, "bold")
+    F_BOLD = (F_FAMILY, 9, "bold")
+    F_REG = (F_FAMILY, 9)
+    F_SM = (F_FAMILY, 8)
+    F_ITALIC = (F_FAMILY, 8, "italic")
+
+    def _apply_x11_safe_window_props(win):
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        try:
+            win.lift()
+            win.focus_force()
+        except Exception:
+            pass
+
     if args.gui_dialog == "file":
         try:
             root = tk.Tk()
             root.withdraw()
-            root.attributes("-topmost", True)
-            try:
-                root.lift()
-                root.focus_force()
-            except Exception:
-                pass
+            _apply_x11_safe_window_props(root)
             init_d = args.initial_dir if (args.initial_dir and os.path.exists(args.initial_dir)) else VIDEO_DIR
             fp = filedialog.askopenfilename(
                 parent=root,
@@ -465,8 +489,11 @@ def _handle_isolated_gui_dialog():
                     ("Semua File (*.*)", "*.*")
                 ]
             )
-            root.update()
-            root.destroy()
+            try:
+                root.update()
+                root.destroy()
+            except Exception:
+                pass
             if fp and os.path.exists(fp):
                 print(f"RESULT_FILE:{os.path.abspath(fp)}")
             sys.exit(0)
@@ -478,21 +505,16 @@ def _handle_isolated_gui_dialog():
         try:
             root = tk.Tk()
             root.title(args.title or "Pilih Sumber Kamera / Video")
-            root.attributes("-topmost", True)
-            try:
-                root.lift()
-                root.focus_force()
-            except Exception:
-                pass
-            root.geometry("480x380")
-            root.resizable(False, False)
+            _apply_x11_safe_window_props(root)
+            root.geometry("480x400")
+            root.minsize(440, 360)
 
             selected_result = {"val": args.default}
 
-            lbl_info = tk.Label(root, text=f"🎥 {args.title or 'Pilih Sumber Input'}", font=("Segoe UI", 11, "bold"), pady=10)
+            lbl_info = tk.Label(root, text=f"🎥 {args.title or 'Pilih Sumber Input'}", font=F_TITLE, pady=10)
             lbl_info.pack()
 
-            frame_options = tk.LabelFrame(root, text="Pilihan Sumber Input", font=("Segoe UI", 10, "bold"), padx=15, pady=10)
+            frame_options = tk.LabelFrame(root, text="Pilihan Sumber Input", font=F_SEC, padx=15, pady=10)
             frame_options.pack(fill="both", expand=True, padx=15, pady=5)
 
             is_default_cam = str(args.default).strip().isdigit() if args.default else False
@@ -501,21 +523,21 @@ def _handle_isolated_gui_dialog():
             var_cam_idx = tk.IntVar(value=default_cam_idx)
 
             candidate_cams = sorted(list(set(cams + [0, 1, 2])))
-            rb_cam = tk.Radiobutton(frame_options, text="Gunakan Perangkat Live Webcam:", variable=var_choice, value="webcam", font=("Segoe UI", 9, "bold"))
+            rb_cam = tk.Radiobutton(frame_options, text="Gunakan Perangkat Live Webcam:", variable=var_choice, value="webcam", font=F_BOLD)
             rb_cam.pack(anchor="w", pady=(0, 4))
             frame_cams = tk.Frame(frame_options, padx=20)
             frame_cams.pack(fill="x", pady=2)
             for c_idx in candidate_cams:
                 tag = " (Aktif)" if c_idx in cams else ""
-                tk.Radiobutton(frame_cams, text=f"Webcam #{c_idx}{tag}", variable=var_cam_idx, value=c_idx, command=lambda: var_choice.set("webcam"), font=("Segoe UI", 9)).pack(anchor="w", pady=2)
+                tk.Radiobutton(frame_cams, text=f"Webcam #{c_idx}{tag}", variable=var_cam_idx, value=c_idx, command=lambda: var_choice.set("webcam"), font=F_REG).pack(anchor="w", pady=2)
 
-            rb_file = tk.Radiobutton(frame_options, text="Gunakan File Rekaman Video:", variable=var_choice, value="file", font=("Segoe UI", 9, "bold"))
+            rb_file = tk.Radiobutton(frame_options, text="Gunakan File Rekaman Video:", variable=var_choice, value="file", font=F_BOLD)
             rb_file.pack(anchor="w", pady=(12, 4))
 
             lbl_file_path = tk.Label(
                 frame_options,
                 text=os.path.basename(str(args.default)) if (args.default and not is_default_cam) else "(Belum memilih file)",
-                font=("Segoe UI", 8, "italic"),
+                font=F_ITALIC,
                 fg="#555555"
             )
             lbl_file_path.pack(anchor="w", padx=20)
@@ -537,7 +559,7 @@ def _handle_isolated_gui_dialog():
                     file_selected_path["path"] = f
                     lbl_file_path.config(text=os.path.basename(f), fg="blue")
 
-            btn_browse = tk.Button(frame_options, text="📁 Buka File Explorer...", command=on_browse, font=("Segoe UI", 9))
+            btn_browse = tk.Button(frame_options, text="📁 Buka File Explorer...", command=on_browse, font=F_REG)
             btn_browse.pack(anchor="w", padx=20, pady=4)
 
             def on_ok():
@@ -552,8 +574,8 @@ def _handle_isolated_gui_dialog():
 
             frame_btn = tk.Frame(root, pady=10)
             frame_btn.pack(side="bottom", fill="x", padx=15)
-            tk.Button(frame_btn, text="Pilih Sumber Ini", bg="#007acc", fg="white", font=("Segoe UI", 9, "bold"), width=15, command=on_ok).pack(side="right", padx=5)
-            tk.Button(frame_btn, text="Batal", font=("Segoe UI", 9), width=10, command=root.destroy).pack(side="right")
+            tk.Button(frame_btn, text="Pilih Sumber Ini", bg="#007acc", fg="white", font=F_BOLD, width=15, command=on_ok).pack(side="right", padx=5)
+            tk.Button(frame_btn, text="Batal", font=F_REG, width=10, command=root.destroy).pack(side="right")
 
             root.mainloop()
             if selected_result["val"]:
@@ -567,29 +589,24 @@ def _handle_isolated_gui_dialog():
         try:
             root = tk.Tk()
             root.title("Pengaturan Sumber Dual Kamera (CAM-01 Top & CAM-02 Side)")
-            root.attributes("-topmost", True)
-            try:
-                root.lift()
-                root.focus_force()
-            except Exception:
-                pass
-            root.geometry("540x510")
-            root.resizable(False, False)
+            _apply_x11_safe_window_props(root)
+            root.geometry("560x530")
+            root.minsize(500, 480)
 
             res = {"top": args.top, "side": args.side}
 
-            lbl_t = tk.Label(root, text="🎥 PENGATURAN SUMBER DUAL KAMERA", font=("Segoe UI", 12, "bold"), pady=8)
+            lbl_t = tk.Label(root, text="🎥 PENGATURAN SUMBER DUAL KAMERA", font=F_TITLE, pady=8)
             lbl_t.pack()
             lbl_sub = tk.Label(
                 root,
                 text=f"Webcam terdeteksi: {len(cams)} perangkat ({', '.join(['#'+str(c) for c in cams]) if cams else 'Tidak ada'})",
-                font=("Segoe UI", 9, "italic"),
+                font=F_ITALIC,
                 fg="#444444"
             )
             lbl_sub.pack(pady=(0, 8))
 
             # --- PANEL CAM-01 TOP ---
-            f_top = tk.LabelFrame(root, text="[CAM-01 TOP] Deteksi Plat Slat & Bilah Rib", font=("Segoe UI", 10, "bold"), padx=12, pady=6)
+            f_top = tk.LabelFrame(root, text="[CAM-01 TOP] Deteksi Plat Slat & Bilah Rib", font=F_SEC, padx=12, pady=6)
             f_top.pack(fill="x", padx=15, pady=5)
 
             is_top_cam = str(args.top).strip().isdigit() if args.top else False
@@ -600,14 +617,14 @@ def _handle_isolated_gui_dialog():
             candidate_cams = sorted(list(set(cams + [0, 1, 2])))
             f_top_cams = tk.Frame(f_top)
             f_top_cams.pack(fill="x")
-            tk.Radiobutton(f_top_cams, text="Webcam:", variable=var_top_choice, value="webcam", font=("Segoe UI", 9, "bold")).pack(side="left")
+            tk.Radiobutton(f_top_cams, text="Webcam:", variable=var_top_choice, value="webcam", font=F_BOLD).pack(side="left")
             for c_idx in candidate_cams:
-                tk.Radiobutton(f_top_cams, text=f"Cam #{c_idx}", variable=var_top_cam, value=c_idx, command=lambda: var_top_choice.set("webcam"), font=("Segoe UI", 9)).pack(side="left", padx=6)
+                tk.Radiobutton(f_top_cams, text=f"Cam #{c_idx}", variable=var_top_cam, value=c_idx, command=lambda: var_top_choice.set("webcam"), font=F_REG).pack(side="left", padx=6)
 
             f_top_file = tk.Frame(f_top, pady=4)
             f_top_file.pack(fill="x")
-            tk.Radiobutton(f_top_file, text="File Video:", variable=var_top_choice, value="file", font=("Segoe UI", 9, "bold")).pack(side="left")
-            lbl_top_fname = tk.Label(f_top_file, text=os.path.basename(str(top_file_path["path"])) if top_file_path["path"] else "(Default Video)", font=("Segoe UI", 8), fg="#0055aa")
+            tk.Radiobutton(f_top_file, text="File Video:", variable=var_top_choice, value="file", font=F_BOLD).pack(side="left")
+            lbl_top_fname = tk.Label(f_top_file, text=os.path.basename(str(top_file_path["path"])) if top_file_path["path"] else "(Default Video)", font=F_SM, fg="#0055aa")
             lbl_top_fname.pack(side="left", padx=6)
 
             def browse_top():
@@ -617,10 +634,10 @@ def _handle_isolated_gui_dialog():
                     top_file_path["path"] = f
                     lbl_top_fname.config(text=os.path.basename(f), fg="blue")
 
-            tk.Button(f_top_file, text="Pilih...", command=browse_top, font=("Segoe UI", 8)).pack(side="right")
+            tk.Button(f_top_file, text="Pilih...", command=browse_top, font=F_SM).pack(side="right")
 
             # --- PANEL SIDE ---
-            f_side = tk.LabelFrame(root, text=f"[{args.side_id} SIDE] Deteksi Baut, Pin & Bracket Lekukan", font=("Segoe UI", 10, "bold"), padx=12, pady=6)
+            f_side = tk.LabelFrame(root, text=f"[{args.side_id} SIDE] Deteksi Baut, Pin & Bracket Lekukan", font=F_SEC, padx=12, pady=6)
             f_side.pack(fill="x", padx=15, pady=8)
 
             is_side_cam = str(args.side).strip().isdigit() if args.side else False
@@ -631,14 +648,14 @@ def _handle_isolated_gui_dialog():
 
             f_side_cams = tk.Frame(f_side)
             f_side_cams.pack(fill="x")
-            tk.Radiobutton(f_side_cams, text="Webcam:", variable=var_side_choice, value="webcam", font=("Segoe UI", 9, "bold")).pack(side="left")
+            tk.Radiobutton(f_side_cams, text="Webcam:", variable=var_side_choice, value="webcam", font=F_BOLD).pack(side="left")
             for c_idx in candidate_cams:
-                tk.Radiobutton(f_side_cams, text=f"Cam #{c_idx}", variable=var_side_cam, value=c_idx, command=lambda: var_side_choice.set("webcam"), font=("Segoe UI", 9)).pack(side="left", padx=6)
+                tk.Radiobutton(f_side_cams, text=f"Cam #{c_idx}", variable=var_side_cam, value=c_idx, command=lambda: var_side_choice.set("webcam"), font=F_REG).pack(side="left", padx=6)
 
             f_side_file = tk.Frame(f_side, pady=4)
             f_side_file.pack(fill="x")
-            tk.Radiobutton(f_side_file, text="File Video:", variable=var_side_choice, value="file", font=("Segoe UI", 9, "bold")).pack(side="left")
-            lbl_side_fname = tk.Label(f_side_file, text=os.path.basename(str(side_file_path["path"])) if side_file_path["path"] else "(Default Video)", font=("Segoe UI", 8), fg="#0055aa")
+            tk.Radiobutton(f_side_file, text="File Video:", variable=var_side_choice, value="file", font=F_BOLD).pack(side="left")
+            lbl_side_fname = tk.Label(f_side_file, text=os.path.basename(str(side_file_path["path"])) if side_file_path["path"] else "(Default Video)", font=F_SM, fg="#0055aa")
             lbl_side_fname.pack(side="left", padx=6)
 
             def browse_side():
@@ -648,7 +665,7 @@ def _handle_isolated_gui_dialog():
                     side_file_path["path"] = f
                     lbl_side_fname.config(text=os.path.basename(f), fg="blue")
 
-            tk.Button(f_side_file, text="Pilih...", command=browse_side, font=("Segoe UI", 8)).pack(side="right")
+            tk.Button(f_side_file, text="Pilih...", command=browse_side, font=F_SM).pack(side="right")
 
             def on_confirm_all():
                 if var_top_choice.get() == "webcam":
@@ -665,8 +682,8 @@ def _handle_isolated_gui_dialog():
 
             f_bottom = tk.Frame(root, pady=15)
             f_bottom.pack(side="bottom", fill="x", padx=15)
-            tk.Button(f_bottom, text="Terapkan & Mulai", bg="#007acc", fg="white", font=("Segoe UI", 10, "bold"), width=18, command=on_confirm_all).pack(side="right", padx=5)
-            tk.Button(f_bottom, text="Gunakan Bawaan", font=("Segoe UI", 9), width=15, command=root.destroy).pack(side="right")
+            tk.Button(f_bottom, text="Terapkan & Mulai", bg="#007acc", fg="white", font=F_SEC, width=18, command=on_confirm_all).pack(side="right", padx=5)
+            tk.Button(f_bottom, text="Gunakan Bawaan", font=F_REG, width=15, command=root.destroy).pack(side="right")
 
             root.mainloop()
             if res.get("top"):
@@ -1875,7 +1892,15 @@ Shortcut Keyboard Saat Berjalan:
         env_duration = 0
     env_csv = os.environ.get("RECORD_CSV", None)
     env_db = os.environ.get("ENABLE_DB_LOGGING", "false").lower() in ("true", "1", "yes")
-    env_engine = os.environ.get("BENCHMARK_ENGINE", "threads")
+    env_engine = os.environ.get("BENCHMARK_ENGINE", None)
+    if not env_engine:
+        # Pada Linux multi-core (seperti Jetson Orin Nano 6-core ARM64), default ke 'process'
+        # agar kedua pipeline inspeksi berjalan di core CPU terpisah tanpa terhambat Python GIL.
+        # Pada Windows / Laptop standar (RAM 8GB), default ke 'threads' untuk stabilitas memori.
+        if sys.platform.startswith("linux") and (os.cpu_count() or 1) >= 4:
+            env_engine = "process"
+        else:
+            env_engine = "threads"
 
     parser.add_argument(
         "--mode",
@@ -1950,7 +1975,7 @@ Shortcut Keyboard Saat Berjalan:
         "--engine",
         choices=["threads", "process"],
         default=env_engine,
-        help="Arsitektur runner: 'threads' (default: hemat RAM/VRAM untuk laptop 8GB & single GPU, zero IPC crash), atau 'process' (multiprocessing untuk Jetson Orin multi-core)."
+        help="Arsitektur runner: 'threads' (hemat RAM/VRAM laptop & zero IPC crash), atau 'process' (multiprocessing multi-core untuk Jetson Orin)."
     )
 
     args = parser.parse_args()
