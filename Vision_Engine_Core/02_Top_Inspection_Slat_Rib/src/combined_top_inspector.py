@@ -623,8 +623,10 @@ class CombinedTopInspector:
             return False
         cand = self._best_top_candidate
 
-        slat_no = cand["slat_no"]
-        rib_no = cand["rib_no"]
+        slat_no = cand.get("slat_no")
+        rib_no = cand.get("rib_no")
+        cand_slat_no = slat_no
+        cand_rib_no = rib_no
 
         # Validasi ganda terhadap status riil inspector saat ini
         cand_rib_ng = bool(cand.get("rib_res", {}).get("is_ng", False))
