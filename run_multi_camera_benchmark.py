@@ -57,7 +57,7 @@ def _load_env_file():
                         k, v = line.split("=", 1)
                         k = k.strip()
                         v = v.strip().strip("'\"")
-                        if k and k not in os.environ:
+                        if k:
                             os.environ[k] = v
                 break
             except Exception:
@@ -1981,8 +1981,24 @@ Shortcut Keyboard Saat Berjalan:
         default=env_engine,
         help="Arsitektur runner: 'threads' (hemat RAM/VRAM laptop & zero IPC crash), atau 'process' (multiprocessing multi-core untuk Jetson Orin)."
     )
+    try:
+        env_bolt_conf = float(os.environ.get("BOLT_CONF_THRESHOLD", "0.55"))
+    except ValueError:
+        env_bolt_conf = 0.55
+    try:
+        env_bolt_iou = float(os.environ.get("BOLT_IOU_THRESHOLD", "0.35"))
+    except ValueError:
+        env_bolt_iou = 0.35
+    parser.add_argument("--bolt-conf", type=float, default=env_bolt_conf, help=f"Ambang batas confidence deteksi baut/pin (default dari .env: {env_bolt_conf})")
+    parser.add_argument("--bolt-iou", type=float, default=env_bolt_iou, help=f"Ambang batas NMS IoU deteksi baut/pin (default dari .env: {env_bolt_iou})")
 
     args = parser.parse_args()
+
+    # Sinkronkan threshold baut ke os.environ agar sub-worker otomatis menggunakannya
+    if args.bolt_conf is not None:
+        os.environ["BOLT_CONF_THRESHOLD"] = str(args.bolt_conf)
+    if args.bolt_iou is not None:
+        os.environ["BOLT_IOU_THRESHOLD"] = str(args.bolt_iou)
 
 
     # Auto-resolve device (CUDA jika tersedia, else CPU)
@@ -2258,12 +2274,15 @@ Shortcut Keyboard Saat Berjalan:
         print(f"  • {args.side_cam_id} Side (Bolt & Pin)  : {f_side} frames ({avg_side_fps:.1f} rata-rata FPS)")
     print(f"  • Throughput Gabungan       : {(avg_top_fps + avg_side_fps):.1f} frames/detik")
 
-    # Evaluasi Ambang Batas Kelayakan
-    target_fps = 20.0  # Standar kelayakan konveyor real-time
+    # Evaluasi Ambang Batas Kelayakan (Dibaca langsung dari TARGET_MIN_FPS di .env)
+    try:
+        target_fps = float(os.environ.get("TARGET_MIN_FPS", "20.0"))
+    except ValueError:
+        target_fps = 20.0
     if avg_top_fps >= target_fps and (args.mode == "top-only" or avg_side_fps >= target_fps):
-        verdict = "🟢 SANGAT STABIL (Memenuhi standar real-time conveyor >= 20 FPS)"
-    elif avg_top_fps >= 15.0:
-        verdict = "🟡 CUKUP (15 - 20 FPS, disarankan konversi model ke TensorRT FP16 di Jetson)"
+        verdict = f"🟢 SANGAT STABIL (Memenuhi standar real-time conveyor >= {target_fps:.1f} FPS)"
+    elif avg_top_fps >= (target_fps * 0.75):
+        verdict = f"🟡 CUKUP ({target_fps * 0.75:.1f} - {target_fps:.1f} FPS, disarankan konversi model ke TensorRT FP16 di Jetson)"
     else:
         verdict = "🔴 BUTUH OPTIMASI (< 15 FPS, gunakan mode headless & akselerasi TensorRT)"
 

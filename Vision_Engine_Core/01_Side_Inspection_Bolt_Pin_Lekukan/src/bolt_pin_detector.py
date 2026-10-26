@@ -27,15 +27,16 @@ class BoltPinDetector:
     Mendukung deteksi diskrit 'bolt_ok', 'bolt_ng', 'pin_ok', 'pin_ng',
     serta verifikasi jarak relatif centroid antara baut dan pin.
     """
-    def __init__(self, model_path, conf_threshold=0.35, iou_threshold=0.45, max_pin_distance=45.0, agnostic_nms=True, device=None):
+    def __init__(self, model_path, conf_threshold=0.55, iou_threshold=0.35, max_pin_distance=140.0, agnostic_nms=True, device=None, crop_before_infer=False):
         """
         Inisialisasi Model YOLO.
-        :param model_path: Path file bobot .pt YOLO (misal: 'models/best_v2.pt')
-        :param conf_threshold: Ambang batas confidence deteksi (0.0 - 1.0)
-        :param iou_threshold: Ambang batas IoU untuk Non-Maximum Suppression (NMS)
-        :param max_pin_distance: Jarak toleransi maksimum pusat baut ke pin (px)
+        :param model_path: Path file bobot .pt YOLO (misal: 'models/best_v26n.pt')
+        :param conf_threshold: Ambang batas confidence deteksi (default: 0.55 untuk menekan false positive)
+        :param iou_threshold: Ambang batas IoU untuk Non-Maximum Suppression (default: 0.35 anti kotak ganda)
+        :param max_pin_distance: Jarak toleransi maksimum pusat baut ke pin (px, default: 140.0)
         :param agnostic_nms: Mengeliminasi duplikat antar-kelas yang saling tumpang tindih
         :param device: Komputasi AI ('auto', 'cuda', 0, atau 'cpu')
+        :param crop_before_infer: Jika True, potong citra sebelum inferensi. Jika False (default), gunakan inferensi full frame + filter spasial ROI agar skala & rasio aspek tidak terdistorsi.
         """
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model YOLO tidak ditemukan di: {model_path}")
@@ -84,6 +85,7 @@ class BoltPinDetector:
         self.iou_threshold = iou_threshold
         self.max_pin_distance = max_pin_distance
         self.agnostic_nms = agnostic_nms
+        self.crop_before_infer = crop_before_infer
         self.class_names = self.model.names if hasattr(self.model, 'names') else {}
         is_bolt_model = any("bolt" in str(v).lower() or "pin" in str(v).lower() for v in self.class_names.values())
         if not is_bolt_model:
@@ -92,6 +94,9 @@ class BoltPinDetector:
             cur_d = os.path.dirname(os.path.abspath(__file__))
             p_d = os.path.dirname(cur_d)
             bolt_cands = [
+                os.path.join(p_d, "models", "best_v26n.engine"),
+                os.path.join(p_d, "models", "best_v26n.onnx"),
+                os.path.join(p_d, "models", "best_v26n.pt"),
                 os.path.join(p_d, "models", "best_v2.engine"),
                 os.path.join(p_d, "models", "best_v2.onnx"),
                 os.path.join(p_d, "models", "best_v2.pt"),
@@ -130,17 +135,22 @@ class BoltPinDetector:
                 "message": "Frame kosong"
             }
 
-        # Jika ROI diberikan, potong gambar untuk efisiensi
+        # Tentukan strategi inferensi ROI:
+        # Full-frame inference + Spatial filtering (default) mencegah distorsi skala & rasio aspek yang memicu kotak ganda
         offset_x, offset_y = 0, 0
         infer_img = frame
+        roi_bounds = None
+
         if roi is not None:
             rx1, ry1, rx2, ry2 = [int(v) for v in roi]
             h, w = frame.shape[:2]
             rx1, ry1 = max(0, rx1), max(0, ry1)
             rx2, ry2 = min(w, rx2), min(h, ry2)
             if rx2 > rx1 and ry2 > ry1:
-                infer_img = frame[ry1:ry2, rx1:rx2]
-                offset_x, offset_y = rx1, ry1
+                roi_bounds = (rx1, ry1, rx2, ry2)
+                if self.crop_before_infer:
+                    infer_img = frame[ry1:ry2, rx1:rx2]
+                    offset_x, offset_y = rx1, ry1
 
         # Jalankan Inferensi YOLO dengan Agnostic NMS untuk mencegah bounding box ganda
         try:
@@ -206,6 +216,20 @@ class BoltPinDetector:
                 gy2 = int(xyxy[3] + offset_y)
                 cx = int((gx1 + gx2) / 2)
                 cy = int((gy1 + gy2) / 2)
+                bw = abs(gx2 - gx1)
+                bh = abs(gy2 - gy1)
+
+                # Filter spasial ROI (jika mode full frame aktif dan ROI ditentukan)
+                if roi_bounds is not None and not self.crop_before_infer:
+                    bx1, by1, bx2, by2 = roi_bounds
+                    if cx < bx1 or cx > bx2 or cy < by1 or cy > by2:
+                        continue
+
+                # Filter noise bentuk abnormal (kepala baut & pin tidak berbentuk garis gepeng ekstrem)
+                if bh > 0 and bw > 0:
+                    aspect_ratio = bw / float(bh)
+                    if aspect_ratio > 3.2 or aspect_ratio < 0.28:
+                        continue
 
                 item_data = {
                     "box": [gx1, gy1, gx2, gy2],
@@ -221,7 +245,7 @@ class BoltPinDetector:
                     detected_pins.append(item_data)
 
         # Pasangkan Baut dengan Pin terdekat untuk validasi integritas
-        pairs = self._pair_bolts_and_pins(detected_bolts, detected_pins)
+        pairs = self._pair_bolts_and_pins(detected_bolts, detected_pins, roi_bounds=roi_bounds)
 
         # Evaluasi status keseluruhan deteksi pada frame ini
         overall_status = "OK"
@@ -240,55 +264,86 @@ class BoltPinDetector:
             "status": overall_status
         }
 
-    def _pair_bolts_and_pins(self, bolts, pins):
+    def _pair_bolts_and_pins(self, bolts, pins, roi_bounds=None):
         """
-        Memasangkan setiap baut ke pin terdekat untuk memastikan
-        tidak ada baut tanpa pin atau pin bergeser.
+        Memasangkan setiap baut ke pin terdekat (Greedy Bipartite Matching)
+        untuk memastikan tidak ada baut tanpa pin atau pin bergeser.
+        Mendukung proteksi boundary-transit agar plat yang baru masuk/keluar tidak divonis salah.
         """
         pairs = []
-        used_pins = set()
+        if not bolts and not pins:
+            return pairs
 
+        # 1. Hitung seluruh kemungkinan kombinasi jarak Baut - Pin
+        cand_pairs = []
         for b_idx, bolt in enumerate(bolts):
             bcx, bcy = bolt["centroid"]
-            best_pin = None
-            min_dist = float("inf")
-            best_pin_idx = -1
-
             for p_idx, pin in enumerate(pins):
-                if p_idx in used_pins:
-                    continue
                 pcx, pcy = pin["centroid"]
                 dist = np.sqrt((bcx - pcx) ** 2 + (bcy - pcy) ** 2)
-                if dist < min_dist:
-                    min_dist = dist
-                    best_pin = pin
-                    best_pin_idx = p_idx
+                cand_pairs.append((dist, b_idx, p_idx))
 
-            # Evaluasi status pasangan
-            pair_status = "OK"
-            reasons = []
+        # 2. Urutkan berdasarkan jarak terdekat (Greedy Matching optimal)
+        cand_pairs.sort(key=lambda x: x[0])
 
-            if bolt["is_ng"]:
+        matched_bolts = set()
+        matched_pins = set()
+
+        for dist, b_idx, p_idx in cand_pairs:
+            if b_idx not in matched_bolts and p_idx not in matched_pins:
+                if dist <= self.max_pin_distance:
+                    matched_bolts.add(b_idx)
+                    matched_pins.add(p_idx)
+                    b = bolts[b_idx]
+                    p = pins[p_idx]
+                    pair_status = "OK"
+                    reasons = []
+                    if b["is_ng"]:
+                        pair_status = "NG"
+                        reasons.append("BOLT_NG")
+                    if p["is_ng"]:
+                        pair_status = "NG"
+                        reasons.append("PIN_NG")
+
+                    pairs.append({
+                        "bolt": b,
+                        "pin": p,
+                        "distance": dist,
+                        "status": pair_status,
+                        "reasons": reasons
+                    })
+
+        # 3. Evaluasi baut yang tidak memiliki pasangan pin
+        border_margin = self.max_pin_distance * 1.1
+        for b_idx, bolt in enumerate(bolts):
+            if b_idx not in matched_bolts:
+                bcy = bolt["centroid"][1]
+                is_near_border = False
+                if roi_bounds is not None:
+                    rx1, ry1, rx2, ry2 = roi_bounds
+                    if (bcy - ry1 < border_margin) or (ry2 - bcy < border_margin):
+                        is_near_border = True
+
                 pair_status = "NG"
-                reasons.append("BOLT_NG")
+                reasons = []
+                if bolt["is_ng"]:
+                    reasons.append("BOLT_NG")
 
-            if best_pin is not None and min_dist <= self.max_pin_distance:
-                used_pins.add(best_pin_idx)
-                if best_pin["is_ng"]:
+                if is_near_border:
+                    # Baut berada di tepi gerbang masuk/keluar ROI, pasangan pin masih berada di luar pandangan kamera
+                    pair_status = "TRANSIT"
+                    reasons.append("BORDER_TRANSIT")
+                else:
                     pair_status = "NG"
-                    reasons.append("PIN_NG")
-            else:
-                # Pin tidak ditemukan atau jaraknya terlalu jauh (bergeser/lepas)
-                pair_status = "NG"
-                reasons.append("PIN_MISSING_OR_DISPLACED")
+                    reasons.append("PIN_MISSING_OR_DISPLACED")
 
-            pairs.append({
-                "bolt": bolt,
-                "pin": best_pin,
-                "distance": min_dist if best_pin else None,
-                "status": pair_status,
-                "reasons": reasons
-            })
+                pairs.append({
+                    "bolt": bolt,
+                    "pin": None,
+                    "distance": None,
+                    "status": pair_status,
+                    "reasons": reasons
+                })
 
         return pairs
 
@@ -305,7 +360,10 @@ if __name__ == "__main__":
     parser.add_argument("--cam", type=int, default=None, help="Indeks kamera webcam (misal: 0)")
     parser.add_argument("--video", type=str, default=None, help="Path ke file video pengujian")
     parser.add_argument("--model", type=str, default=None, help="Path ke model YOLO best.pt")
-    parser.add_argument("--conf", type=float, default=0.35, help="Confidence threshold YOLO (default: 0.35)")
+    parser.add_argument("--conf", type=float, default=0.55, help="Confidence threshold YOLO (default: 0.55)")
+    parser.add_argument("--iou", type=float, default=0.35, help="NMS IoU threshold (default: 0.35)")
+    parser.add_argument("--max-pin-dist", type=float, default=140.0, help="Jarak toleransi maksimum baut ke pin (px, default: 140.0)")
+    parser.add_argument("--crop-roi", action="store_true", help="Gunakan pre-crop ROI sebelum inferensi (default: False/Full-Frame)")
     args = parser.parse_args()
 
     cur_dir = os.path.dirname(os.path.abspath(__file__))
@@ -314,6 +372,7 @@ if __name__ == "__main__":
     # 1. Cari path model YOLO
     model_candidates = [
         args.model,
+        os.path.join(parent_dir, "models", "best_v26n.pt"),
         os.path.join(parent_dir, "models", "best_v2.pt"),
         os.path.join(parent_dir, "models", "best_v3.pt"),
         os.path.join(parent_dir, "..", "..", "Program AI", "1. Inspeksi Bolt & Pin", "3. Model Hybrid (YOLO + PatchCore)", "best_v2.pt")
@@ -327,7 +386,13 @@ if __name__ == "__main__":
     print("🔩 INSPEKSI BAUT & PIN KONVEYOR (YOLO ONLY - VISION ENGINE CORE)")
     print("=" * 70)
     print(f"[*] Model: {os.path.basename(model_path)}")
-    detector = BoltPinDetector(model_path, conf_threshold=args.conf)
+    detector = BoltPinDetector(
+        model_path,
+        conf_threshold=args.conf,
+        iou_threshold=args.iou,
+        max_pin_distance=args.max_pin_dist,
+        crop_before_infer=args.crop_roi
+    )
 
     # 2. Inisialisasi Sumber Kamera / Video
     backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY
@@ -367,28 +432,28 @@ if __name__ == "__main__":
         res = detector.detect(vis)
         pairs = res.get("pairs", [])
 
-        # Visualisasi Baut & Pin
+        # Visualisasi Baut & Pin (Seragam Warna Hijau)
+        box_col = (0, 255, 0)
         for pair in pairs:
             b = pair["bolt"]
             p = pair["pin"]
             bx1, by1, bx2, by2 = b["box"]
-            b_col = (0, 0, 255) if b["is_ng"] else (0, 255, 0)
-            cv2.rectangle(vis, (bx1, by1), (bx2, by2), b_col, 2)
+
+            cv2.rectangle(vis, (bx1, by1), (bx2, by2), box_col, 2)
             cv2.putText(vis, f"{b['class_name']} {b['confidence']:.2f}", (bx1, max(18, by1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, b_col, 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_col, 2)
 
             if p:
                 px1, py1, px2, py2 = p["box"]
-                p_col = (0, 0, 255) if p["is_ng"] else (0, 255, 200)
-                cv2.rectangle(vis, (px1, py1), (px2, py2), p_col, 2)
+                cv2.rectangle(vis, (px1, py1), (px2, py2), box_col, 2)
                 cv2.putText(vis, f"{p['class_name']} {p['confidence']:.2f}", (px1, max(18, py1 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, p_col, 1)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, box_col, 1)
                 # Garis penghubung baut ke pin
-                cv2.line(vis, b["centroid"], p["centroid"], (255, 255, 0), 2)
+                cv2.line(vis, b["centroid"], p["centroid"], (0, 255, 180), 2)
                 dist = pair.get("distance")
                 if dist:
                     mx, my = (b["centroid"][0] + p["centroid"][0]) // 2, (b["centroid"][1] + p["centroid"][1]) // 2
-                    cv2.putText(vis, f"{dist:.1f}px", (mx, my - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                    cv2.putText(vis, f"{dist:.1f}px", (mx, my - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 180), 1)
 
         # Hitung FPS
         now = time.time()

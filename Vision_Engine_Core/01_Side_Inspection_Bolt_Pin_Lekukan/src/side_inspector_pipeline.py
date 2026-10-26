@@ -87,7 +87,8 @@ class SideConveyorInspector:
         patchcore_model_path=None,
         master_roi_config=None,
         polygon_config=None,
-        conf_thresh=0.35,
+        conf_thresh=None,
+        iou_thresh=None,
         patchcore_thresh=None,
         enable_db=False,
         device=None
@@ -106,6 +107,20 @@ class SideConveyorInspector:
         self.side = side_norm
         self.device = device
 
+        # Ambang batas deteksi Baut & Pin (Prioritaskan argumen -> .env -> default 0.55 / 0.35)
+        if conf_thresh is None:
+            try:
+                conf_thresh = float(os.environ.get("BOLT_CONF_THRESHOLD", "0.55"))
+            except ValueError:
+                conf_thresh = 0.55
+        if iou_thresh is None:
+            try:
+                iou_thresh = float(os.environ.get("BOLT_IOU_THRESHOLD", "0.35"))
+            except ValueError:
+                iou_thresh = 0.35
+        self.conf_thresh = conf_thresh
+        self.iou_thresh = iou_thresh
+
         # Inisialisasi Database Bridge (SQLite, Captures & MS Teams)
         self.db_bridge = None
         if InspectionDBBridge is not None:
@@ -117,7 +132,22 @@ class SideConveyorInspector:
         # Path default jika tidak ditentukan
         base_dir = os.path.dirname(CURRENT_DIR)
         if yolo_model_path is None:
-            yolo_model_path = os.path.join(base_dir, "models", "best_v2.pt")
+            # 1. Cek environment variable MODEL_SIDE_PATH jika didefinisikan di .env
+            env_side_model = os.environ.get("MODEL_SIDE_PATH")
+            if env_side_model and os.path.exists(env_side_model):
+                yolo_model_path = env_side_model
+            else:
+                # 2. Prioritaskan kandidat model terbaru (best_v26n -> best_v2)
+                for cand_name in [
+                    "best_v26n.engine", "best_v26n.onnx", "best_v26n.pt",
+                    "best_v2.engine", "best_v2.onnx", "best_v2.pt"
+                ]:
+                    cand_p = os.path.join(base_dir, "models", cand_name)
+                    if os.path.exists(cand_p):
+                        yolo_model_path = cand_p
+                        break
+                if yolo_model_path is None:
+                    yolo_model_path = os.path.join(base_dir, "models", "best_v26n.pt")
         if patchcore_model_path is None:
             patchcore_model_path = os.path.join(base_dir, "models", "patchcore_bracket_model.pkl")
         if master_roi_config is None:
@@ -147,8 +177,8 @@ class SideConveyorInspector:
         # 1. Inisialisasi Detektor Baut & Pin (YOLO)
         self.bolt_pin_detector = BoltPinDetector(
             yolo_model_path,
-            conf_threshold=conf_thresh,
-            iou_threshold=0.45,
+            conf_threshold=self.conf_thresh,
+            iou_threshold=self.iou_thresh,
             max_pin_distance=140.0,
             agnostic_nms=True,
             device=device
@@ -479,7 +509,7 @@ class SideConveyorInspector:
         bolt_verdict = "OK" if any(not b["is_ng"] for b in bolts) else ("NG" if any(b["is_ng"] for b in bolts) else "EMPTY")
         pin_verdict = "OK" if any(not p["is_ng"] for p in pins) else ("NG" if any(p["is_ng"] for p in pins) else "EMPTY")
 
-        # Cek jika ada komponen yang eksplisit cacat
+        # Cek jika ada komponen yang eksplisit cacat atau anomali pasangan
         for b in bolts:
             if b["is_ng"]:
                 bolt_verdict = "NG"
@@ -492,35 +522,33 @@ class SideConveyorInspector:
             if pair["pin"] is not None and pair["pin"]["is_ng"]:
                 pin_verdict = "NG"
 
-        # Visualisasi Baut & Pin
+        # Visualisasi Baut & Pin (Seragam Warna Hijau, Status Evaluasi di Panel HUD Atas)
+        box_color = (0, 255, 0)
         drawn_pins = set()
         for pair in pairs:
             b = pair["bolt"]
             p = pair["pin"]
             bx_1, by_1, bx_2, by_2 = b["box"]
 
-            b_color = (0, 0, 255) if b["is_ng"] else (255, 180, 0)
-            cv2.rectangle(display_frame, (bx_1, by_1), (bx_2, by_2), b_color, 2)
+            cv2.rectangle(display_frame, (bx_1, by_1), (bx_2, by_2), box_color, 2)
             cv2.putText(display_frame, f"{b['class_name']} {b['confidence']:.2f}",
-                        (bx_1, max(15, by_1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, b_color, 2)
+                        (bx_1, max(15, by_1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, box_color, 2)
 
             if p is not None:
                 drawn_pins.add(id(p))
                 px1, py1, px2, py2 = p["box"]
-                p_color = (0, 0, 255) if p["is_ng"] else (0, 255, 128)
-                cv2.rectangle(display_frame, (px1, py1), (px2, py2), p_color, 2)
+                cv2.rectangle(display_frame, (px1, py1), (px2, py2), box_color, 2)
                 cv2.putText(display_frame, f"{p['class_name']} {p['confidence']:.2f}",
-                            (px1, max(15, py1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.44, p_color, 2)
-                cv2.line(display_frame, b["centroid"], p["centroid"], (255, 255, 0), 1)
+                            (px1, max(15, py1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.44, box_color, 2)
+                cv2.line(display_frame, b["centroid"], p["centroid"], (0, 255, 180), 1)
 
         # Gambar pin yang belum berpasangan (jika ada)
         for p in pins:
             if id(p) not in drawn_pins:
                 px1, py1, px2, py2 = p["box"]
-                p_color = (0, 0, 255) if p["is_ng"] else (0, 255, 128)
-                cv2.rectangle(display_frame, (px1, py1), (px2, py2), p_color, 2)
+                cv2.rectangle(display_frame, (px1, py1), (px2, py2), box_color, 2)
                 cv2.putText(display_frame, f"{p['class_name']} {p['confidence']:.2f}",
-                            (px1, max(15, py1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.44, p_color, 2)
+                            (px1, max(15, py1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.44, box_color, 2)
 
         # 3. Virtual Photocell / Optical Probe (Sensor Kehadiran Pelat Slat di Gerbang Masuk Poligon)
         # Menghitung koordinat adaptif sensor probe tepat di area masuk / leher poligon braket

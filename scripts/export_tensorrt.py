@@ -28,6 +28,7 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
 DEFAULT_MODELS = [
     os.path.join(PROJECT_ROOT, "Vision_Engine_Core", "02_Top_Inspection_Slat_Rib", "models", "best_rib_v5.pt"),
+    os.path.join(PROJECT_ROOT, "Vision_Engine_Core", "01_Side_Inspection_Bolt_Pin_Lekukan", "models", "best_v26n.pt"),
     os.path.join(PROJECT_ROOT, "Vision_Engine_Core", "01_Side_Inspection_Bolt_Pin_Lekukan", "models", "best_v2.pt"),
 ]
 
