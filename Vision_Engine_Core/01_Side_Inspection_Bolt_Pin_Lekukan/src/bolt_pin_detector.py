@@ -94,6 +94,9 @@ class BoltPinDetector:
             cur_d = os.path.dirname(os.path.abspath(__file__))
             p_d = os.path.dirname(cur_d)
             bolt_cands = [
+                os.path.join(p_d, "models", "best_v26_ok.engine"),
+                os.path.join(p_d, "models", "best_v26_ok.onnx"),
+                os.path.join(p_d, "models", "best_v26_ok.pt"),
                 os.path.join(p_d, "models", "best_v26n.engine"),
                 os.path.join(p_d, "models", "best_v26n.onnx"),
                 os.path.join(p_d, "models", "best_v26n.pt"),

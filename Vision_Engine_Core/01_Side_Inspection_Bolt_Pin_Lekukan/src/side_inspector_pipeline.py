@@ -137,8 +137,9 @@ class SideConveyorInspector:
             if env_side_model and os.path.exists(env_side_model):
                 yolo_model_path = env_side_model
             else:
-                # 2. Prioritaskan kandidat model terbaru (best_v26n -> best_v2)
+                # 2. Prioritaskan kandidat model terbaru (best_v26_ok -> best_v26n -> best_v2)
                 for cand_name in [
+                    "best_v26_ok.engine", "best_v26_ok.onnx", "best_v26_ok.pt",
                     "best_v26n.engine", "best_v26n.onnx", "best_v26n.pt",
                     "best_v2.engine", "best_v2.onnx", "best_v2.pt"
                 ]:
@@ -147,7 +148,7 @@ class SideConveyorInspector:
                         yolo_model_path = cand_p
                         break
                 if yolo_model_path is None:
-                    yolo_model_path = os.path.join(base_dir, "models", "best_v26n.pt")
+                    yolo_model_path = os.path.join(base_dir, "models", "best_v26_ok.pt")
         if patchcore_model_path is None:
             patchcore_model_path = os.path.join(base_dir, "models", "patchcore_bracket_model.pkl")
         if master_roi_config is None:
