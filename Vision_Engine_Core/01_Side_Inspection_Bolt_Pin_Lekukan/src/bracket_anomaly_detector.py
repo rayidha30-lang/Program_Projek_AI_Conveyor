@@ -27,7 +27,8 @@ except ImportError:
 
 class PatchCoreFeatureExtractor:
     """
-    Ekstraktor fitur spasial tingkat menengah (Layer 2 & Layer 3) ResNet-18.
+    Ekstraktor fitur spasial tingkat menengah (Layer 2 & Layer 3) ResNet-18
+    dengan akselerasi penuh GPU FP16 dan preprocessing cepat OpenCV.
     """
     def __init__(self, input_size=(224, 224), device=None):
         if not TORCH_AVAILABLE:
@@ -38,34 +39,43 @@ class PatchCoreFeatureExtractor:
 
         self.input_h, self.input_w = input_size
         self.device = torch.device(device)
+        self.half_precision = (self.device.type == "cuda")
 
         weights = ResNet18_Weights.DEFAULT
         self.model = resnet18(weights=weights)
         self.model.fc = nn.Identity()
         self.model.eval().to(self.device)
+        if self.half_precision:
+            self.model.half()
 
         self._features = {}
         self.model.layer2.register_forward_hook(lambda m, i, o: self._features.__setitem__("layer2", o.detach()))
         self.model.layer3.register_forward_hook(lambda m, i, o: self._features.__setitem__("layer3", o.detach()))
 
-        self.transform = T.Compose([
-            T.ToPILImage(),
-            T.Resize((self.input_h, self.input_w)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        # Pre-alokasi tensor mean & std ImageNet langsung di GPU untuk eliminasi overhead CPU transform
+        mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
+        self.mean_tensor = mean.half() if self.half_precision else mean.float()
+        self.std_tensor = std.half() if self.half_precision else std.float()
 
     def extract(self, bgr_image):
         """
-        Ekstraksi patch embeddings dari crop citra BGR.
-        Output: numpy array shape (N_patches, Feature_Dim)
+        Ekstraksi patch embeddings dari crop citra BGR langsung di GPU.
+        Output: (emb_tensor, (h_feat, w_feat))
         """
         if bgr_image is None or bgr_image.size == 0:
             return None
 
-        rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+        # Vektor C++ OpenCV resize + BGR2RGB jauh lebih kencang dibanding PIL Image
+        resized_bgr = cv2.resize(bgr_image, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
+
         with torch.inference_mode():
-            x = self.transform(rgb).unsqueeze(0).to(self.device)
+            t = torch.from_numpy(rgb).to(self.device)
+            t = t.half() if self.half_precision else t.float()
+            # [H, W, C] -> [1, C, H, W], skala 0..1 dan normalisasi langsung di GPU
+            x = (t.permute(2, 0, 1).unsqueeze(0) / 255.0 - self.mean_tensor) / self.std_tensor
+
             self._features.clear()
             self.model(x)
 
@@ -84,12 +94,12 @@ class PatchCoreFeatureExtractor:
             emb = nn.functional.normalize(emb, p=2, dim=1)
 
             h_feat, w_feat = f3.shape[-2:]
-            return emb.cpu().numpy().astype(np.float32), (h_feat, w_feat)
+            return emb, (h_feat, w_feat)
 
 
 class BracketAnomalyDetector:
     """
-    Detektor anomali lekukan plat menggunakan model PatchCore Memory Bank.
+    Detektor anomali lekukan plat menggunakan model PatchCore Memory Bank dengan akselerasi GPU.
     """
     def __init__(self, model_path, default_thresh=0.8650, device=None):
         """
@@ -118,12 +128,20 @@ class BracketAnomalyDetector:
         print(f"    - Memory Bank Patches : {len(self.memory_bank)}")
         print(f"    - Calibrated Threshold: {self.calibrated_threshold:.4f}")
 
-        # Inisialisasi Nearest Neighbors Search (1-NN)
-        self.nn_searcher = NearestNeighbors(n_neighbors=1, algorithm="auto", metric="minkowski", p=2)
-        self.nn_searcher.fit(self.memory_bank)
-
         # Inisialisasi Feature Extractor
         self.extractor = PatchCoreFeatureExtractor(input_size=(224, 224), device=device)
+        self.device = self.extractor.device
+        self.use_gpu = (self.device.type == "cuda")
+
+        if self.use_gpu:
+            # Simpan memory bank langsung di GPU VRAM untuk pencarian k-NN sub-milidetik (torch.cdist FP16)
+            mb_tensor = torch.from_numpy(self.memory_bank).to(self.device)
+            self.memory_bank_gpu = mb_tensor.half() if self.extractor.half_precision else mb_tensor.float()
+            self.nn_searcher = None
+        else:
+            self.memory_bank_gpu = None
+            self.nn_searcher = NearestNeighbors(n_neighbors=1, algorithm="auto", metric="minkowski", p=2)
+            self.nn_searcher.fit(self.memory_bank)
 
     def inspect_crop(self, crop_bgr, custom_thresh=None):
         """
@@ -150,14 +168,27 @@ class BracketAnomalyDetector:
 
             embeddings, (h_feat, w_feat) = res
 
-            # Hitung jarak terdekat setiap patch ke Memory Bank (1-NN)
-            distances, _ = self.nn_searcher.kneighbors(embeddings)
-            dists_flat = distances[:, 0].astype(np.float32)
+            if self.use_gpu and self.memory_bank_gpu is not None:
+                with torch.inference_mode():
+                    # Akselerasi GPU CUDA: Hitung jarak terdekat setiap patch ke Memory Bank (sub-milidetik)
+                    dists_matrix = torch.cdist(embeddings, self.memory_bank_gpu, p=2.0)
+                    min_dists, _ = torch.min(dists_matrix, dim=1)  # (N_patches,)
 
-            # Skor Anomali Global = Rata-rata dari top 3% patch jarak terbesar (sesuai standar PatchCore)
-            n_top = max(1, int(len(dists_flat) * 0.03))
-            top_dists = np.sort(dists_flat)[-n_top:]
-            anomaly_score = float(np.mean(top_dists))
+                    # Skor Anomali Global = Rata-rata dari top 3% patch jarak terbesar
+                    n_top = max(1, int(len(min_dists) * 0.03))
+                    top_dists, _ = torch.topk(min_dists, k=n_top)
+                    anomaly_score = float(torch.mean(top_dists.float()).item())
+
+                    # Pindahkan ke CPU numpy hanya untuk rendering visual heatmap
+                    dists_flat = min_dists.cpu().float().numpy()
+            else:
+                emb_np = embeddings.cpu().float().numpy() if isinstance(embeddings, torch.Tensor) else embeddings
+                distances, _ = self.nn_searcher.kneighbors(emb_np)
+                dists_flat = distances[:, 0].astype(np.float32)
+
+                n_top = max(1, int(len(dists_flat) * 0.03))
+                top_dists = np.sort(dists_flat)[-n_top:]
+                anomaly_score = float(np.mean(top_dists))
 
             # Bangun Heatmap Anomali
             h_orig, w_orig = crop_bgr.shape[:2]
@@ -190,3 +221,4 @@ class BracketAnomalyDetector:
                 "heatmap": None,
                 "overlay": crop_bgr
             }
+
