@@ -1398,30 +1398,30 @@ function Abnormality({
 
   return (
     <Panel className="overflow-hidden">
-      <div className="p-4 pb-3 space-y-3">
+      <div className="p-3.5 pb-2.5 space-y-3">
         {/* Filter Bar Multi-Parameter & Aksi Cepat */}
-        <div className="flex flex-wrap items-center justify-between gap-2.5">
-          <div className="flex flex-wrap items-center gap-2 flex-1">
+        <div className="flex items-center justify-between gap-2 overflow-x-auto custom-scrollbar pb-1">
+          <div className="flex items-center gap-1.5 shrink-0">
             {/* 1. Pencarian Kata Kunci */}
-            <div className="relative inline-flex items-center min-w-[180px] flex-1 sm:flex-initial">
+            <div className="relative inline-flex items-center w-36 sm:w-40 xl:w-44 shrink-0">
               <Search className="absolute left-2.5 pointer-events-none size-3 text-muted-foreground" />
               <input
                 type="text"
                 placeholder="Cari ID, objek, tipe..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="h-8 w-full rounded-lg border bg-secondary/70 py-1 pl-7.5 pr-3 text-[10px] placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary text-foreground transition-all hover:bg-secondary"
+                className="h-8 w-full rounded-lg border bg-secondary/70 py-1 pl-7 pr-2 text-[9.5px] placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary text-foreground transition-all hover:bg-secondary"
               />
             </div>
 
             {/* 2. Filter Tanggal Spesifik (Date Picker) */}
-            <div className="relative inline-flex items-center">
+            <div className="relative inline-flex items-center shrink-0">
               <Calendar className="absolute left-2.5 pointer-events-none size-3 text-muted-foreground" />
               <input
                 type="date"
                 value={selectedDate}
                 onChange={(e) => setSelectedDate(e.target.value)}
-                className="h-8 rounded-lg border bg-secondary/70 py-1 pl-7.5 pr-2.5 text-[10px] font-semibold outline-none focus:ring-1 focus:ring-primary text-foreground transition-all hover:bg-secondary cursor-pointer"
+                className="h-8 w-[118px] rounded-lg border bg-secondary/70 py-1 pl-7 pr-1 text-[9.5px] font-semibold outline-none focus:ring-1 focus:ring-primary text-foreground transition-all hover:bg-secondary cursor-pointer"
                 title="Filter tanggal spesifik (YYYY-MM-DD)"
               />
             </div>
@@ -1472,21 +1472,21 @@ function Abnormality({
                 size="sm"
                 variant="ghost"
                 onClick={handleResetFilters}
-                className="h-8 text-[10px] text-muted-foreground hover:text-foreground gap-1 px-2.5 cursor-pointer"
+                className="h-8 text-[9.5px] text-muted-foreground hover:text-foreground gap-1 px-2 shrink-0 cursor-pointer"
                 title="Reset semua filter ke kondisi awal"
               >
                 <RotateCcw className="size-3" />
-                Reset Filter
+                Reset
               </Button>
             )}
           </div>
 
           {/* Sisi Kanan: Total Counter & Tombol Export CSV */}
-          <div className="flex items-center gap-2 shrink-0">
-            <span className="text-[10px] font-mono text-muted-foreground hidden lg:inline">
+          <div className="flex items-center gap-2 shrink-0 ml-2">
+            <span className="text-[9.5px] font-mono text-muted-foreground hidden lg:inline whitespace-nowrap">
               Total: <b className="text-foreground">{filtered.length}</b> dari {allRecords.length}
             </span>
-            <Button size="sm" onClick={exportCsv} className="h-8 text-xs gap-1.5 cursor-pointer">
+            <Button size="sm" onClick={exportCsv} className="h-8 text-[11px] gap-1.5 px-3 shrink-0 cursor-pointer whitespace-nowrap font-bold">
               <Download className="size-3.5" />
               Export CSV
             </Button>
@@ -1637,12 +1637,12 @@ function Filter({
   options: (string | { value: string; label: string })[] | readonly string[];
 }) {
   return (
-    <label className="relative inline-block">
+    <label className="relative inline-block shrink-0">
       <span className="sr-only">{label}</span>
       <select
         value={value}
         onChange={(e) => setValue(e.target.value)}
-        className="h-8 appearance-none rounded-lg border bg-secondary/70 py-1 pl-3 pr-7.5 text-[10px] font-semibold outline-none focus:ring-1 focus:ring-primary text-foreground transition-all hover:bg-secondary cursor-pointer"
+        className="h-8 appearance-none rounded-lg border bg-secondary/70 py-1 pl-2.5 pr-6 text-[9.5px] font-semibold outline-none focus:ring-1 focus:ring-primary text-foreground transition-all hover:bg-secondary cursor-pointer"
       >
         <option value="ALL">{label}</option>
         {options.map((opt) => {
@@ -1655,7 +1655,7 @@ function Filter({
           );
         })}
       </select>
-      <ChevronDown className="pointer-events-none absolute top-2.5 right-2 size-3 text-muted-foreground" />
+      <ChevronDown className="pointer-events-none absolute top-2.5 right-1.5 size-3 text-muted-foreground" />
     </label>
   );
 }
@@ -2154,7 +2154,7 @@ function Evidence({
         </div>
       )}
       <div className="grid gap-5 xl:grid-cols-[320px_1fr] items-start">
-        <Panel className="overflow-hidden xl:sticky xl:top-4 self-start">
+        <Panel className="overflow-hidden">
           <div className="border-b p-4">
             <h3 className="text-xs font-extrabold">Camera Area Explorer</h3>
             <p className="text-[9px] text-muted-foreground">
@@ -2345,7 +2345,7 @@ function Evidence({
               </div>
               <Badge text={selected.severity} />
             </div>
-            <div className="camera-grid relative flex aspect-video max-h-[410px] items-center justify-center overflow-hidden bg-black/90">
+            <div className="camera-grid relative flex w-full aspect-video items-center justify-center overflow-hidden bg-black/95">
               {imgUrl ? (
                 <img
                   src={imgUrl}

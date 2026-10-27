@@ -22,6 +22,15 @@ graphify-out/
 *.mkv
 *.mov
 *.wmv
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.ico
+*.svg
 
 # Archives, Backup & Scratch
 *.zip

@@ -1003,6 +1003,9 @@ def _run_side_worker(
         cap = cv2.VideoCapture(side_video_path)
         is_cam = False
         print(f"[*] Worker {camera_id} Side Inspection memuat video: {os.path.basename(side_video_path)}")
+        if inspector.auto_preset_mode:
+            det_p = inspector.resolve_preset_from_source(side_video_path)
+            inspector.set_preset(det_p, verbose=True)
     elif source_path is None or source_path == "" or str(source_path).isdigit():
         cam_idx = int(source_path) if str(source_path).isdigit() else 0
         # Gunakan DirectShow (CAP_DSHOW) di Windows untuk bypass bug MSMF Error -1072873822
@@ -1021,8 +1024,11 @@ def _run_side_worker(
                 cap = cv2.VideoCapture(side_video_path)
                 is_cam = False
                 print(f"[INFO SIDE WORKER] Webcam #{cam_idx} tidak terdeteksi. Beralih otomatis ke video testing: {os.path.basename(DEFAULT_SIDE_VIDEO)}")
+                if inspector.auto_preset_mode:
+                    det_p = inspector.resolve_preset_from_source(side_video_path)
+                    inspector.set_preset(det_p, verbose=True)
 
-    win_name = f"{camera_id} SIDE [{camera_id} {side}] | [2]/[O]: Ganti Video SIDE | [W]: Dual Setup | [D]: DB | [Q]: Keluar"
+    win_name = f"{camera_id} SIDE [{camera_id} {side}] | [2]/[O]: Video | [W]: Setup | [M]: Preset | [D]: DB | [Q]: Keluar"
     if mode == "dual":
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win_name, 920, 518)
@@ -1121,7 +1127,8 @@ def _run_side_worker(
                 c_ng = getattr(inspector, 'crack_ng_count', 0)
                 s_cyc = getattr(inspector, 'slat_cycle_count', 0)
                 qc_txt = f"Slat #{s_cyc} [OK:{s_ok} NG:{s_ng}]"
-                banner = f"FPS: {avg_fps:4.1f} | Lat: {latency_ms:4.1f}ms | [1/V]: Video Top | [2/O]: Video Side | {qc_txt} | [Q]: Keluar"
+                cur_p_label = getattr(inspector, 'preset', 'opsi_1').upper() if inspector else 'OPSI_1'
+                banner = f"FPS: {avg_fps:4.1f} | Lat: {latency_ms:4.1f}ms | [W]: Setup | [2/O]: Video | [M]: {cur_p_label} | {qc_txt} | [Q]: Keluar"
                 cv2.rectangle(display_frame, (10, h_d - 65), (w_d - 10, h_d - 10), (18, 18, 18), -1)
                 cv2.rectangle(display_frame, (10, h_d - 65), (w_d - 10, h_d - 10), (0, 220, 255), 2, cv2.LINE_AA)
                 cv2.putText(display_frame, banner, (25, h_d - 24),
@@ -1138,6 +1145,13 @@ def _run_side_worker(
                         st = db_bridge.toggle()
                         status_str = "AKTIF (RECORDING & NOTIFIKASI TEAMS)" if st else "MATI (DRY-RUN BENCHMARK)"
                         print(f"\n[*] [{camera_id} SIDE] SAKLAR DATABASE & TEAMS: {status_str}\n")
+                elif key in [ord("m"), ord("M")]:
+                    if inspector is not None:
+                        cur_p = getattr(inspector, "preset", "opsi_1")
+                        next_p = "opsi_2" if cur_p == "opsi_1" else "opsi_1"
+                        inspector.set_preset(next_p, verbose=True)
+                        inspector.reset_session()
+                        print(f"\n[*] [{camera_id} SIDE] Manual Switch Preset: {cur_p.upper()} -> {next_p.upper()}\n")
                 elif key in [ord("v"), ord("V")]:
                     new_src = cycle_next_video(side_video_path)
                     if new_src and str(new_src) != str(side_video_path):
@@ -1150,6 +1164,9 @@ def _run_side_worker(
                             consecutive_cam_fails = 0
                             fps_history.clear()
                             if inspector is not None:
+                                if getattr(inspector, "auto_preset_mode", True):
+                                    det_p = inspector.resolve_preset_from_source(side_video_path)
+                                    inspector.set_preset(det_p, verbose=True)
                                 inspector.reset_session()
                 elif key in [ord("c"), ord("C")]:
                     new_src = cycle_next_camera(side_video_path)
@@ -1163,6 +1180,9 @@ def _run_side_worker(
                             consecutive_cam_fails = 0
                             fps_history.clear()
                             if inspector is not None:
+                                if getattr(inspector, "auto_preset_mode", True):
+                                    det_p = inspector.resolve_preset_from_source(side_video_path)
+                                    inspector.set_preset(det_p, verbose=True)
                                 inspector.reset_session()
                 elif key in [ord("w"), ord("W")]:
                     print(f"\n[*] [{camera_id} SIDE] Membuka Dialog Pemilihan Sumber (Webcam / File Video)...")
@@ -1182,6 +1202,9 @@ def _run_side_worker(
                             consecutive_cam_fails = 0
                             fps_history.clear()
                             if inspector is not None:
+                                if getattr(inspector, "auto_preset_mode", True):
+                                    det_p = inspector.resolve_preset_from_source(side_video_path)
+                                    inspector.set_preset(det_p, verbose=True)
                                 inspector.reset_session()
                             s_desc = f"Webcam #{side_video_path}" if is_cam else os.path.basename(str(side_video_path))
                             print(f"[*] [{camera_id} SIDE] Sumber input dialihkan ke: {s_desc}")
@@ -1206,6 +1229,9 @@ def _run_side_worker(
                             consecutive_cam_fails = 0
                             fps_history.clear()
                             if inspector is not None:
+                                if getattr(inspector, "auto_preset_mode", True):
+                                    det_p = inspector.resolve_preset_from_source(side_video_path)
+                                    inspector.set_preset(det_p, verbose=True)
                                 inspector.reset_session()
                             print(f"[*] [{camera_id} SIDE] Video berhasil dialihkan ke: {os.path.basename(new_side)}")
     except KeyboardInterrupt:
@@ -1337,6 +1363,12 @@ def _run_threaded_engine(args):
                 print(f"[*] Worker {args.side_cam_id} Side memuat video default: {os.path.basename(side_source_path)}")
             else:
                 print(f"[!] Gagal membuka sumber video {args.side_cam_id} Side: {side_source_path}")
+
+        # Sinkronkan preset side inspector secara otomatis dengan sumber video awal
+        if side_inspector is not None and side_source_path:
+            if getattr(side_inspector, "auto_preset_mode", True):
+                det_p = side_inspector.resolve_preset_from_source(side_source_path)
+                side_inspector.set_preset(det_p, verbose=True)
 
     # Shared thread states & locks
     stop_event = threading.Event()
@@ -1530,7 +1562,8 @@ def _run_threaded_engine(args):
                     c_ng = getattr(side_inspector, 'crack_ng_count', 0)
                     s_cyc = getattr(side_inspector, 'slat_cycle_count', 0)
                     qc_txt = f"Slat #{s_cyc} [OK:{s_ok} NG:{s_ng}]"
-                    banner = f"FPS: {avg_f:4.1f} | Lat: {lat:4.1f}ms | [1/V]: Video Top | [2/O]: Video Side | {qc_txt} | [Q]: Keluar"
+                    cur_p_label = getattr(side_inspector, 'preset', 'opsi_1').upper() if side_inspector else 'OPSI_1'
+                    banner = f"FPS: {avg_f:4.1f} | Lat: {lat:4.1f}ms | [W]: Setup | [2/O]: Video | [M]: {cur_p_label} | {qc_txt} | [Q]: Keluar"
                     cv2.rectangle(display_frame, (10, h_d - 65), (w_d - 10, h_d - 10), (18, 18, 18), -1)
                     cv2.rectangle(display_frame, (10, h_d - 65), (w_d - 10, h_d - 10), (0, 220, 255), 2, cv2.LINE_AA)
                     cv2.putText(display_frame, banner, (25, h_d - 24),
@@ -1562,7 +1595,7 @@ def _run_threaded_engine(args):
 
     # Windows GUI Setup
     win_top = "CAM-01 TOP (SLAT & RIB) | [1]/[V]: Ganti Video TOP | [W]: Dual Setup | [D]: DB | [Q]: Keluar"
-    win_side = f"{args.side_cam_id} SIDE [{args.side_cam_id} {args.side_name}] | [2]/[O]: Ganti Video SIDE | [W]: Dual Setup | [D]: DB | [Q]: Keluar"
+    win_side = f"{args.side_cam_id} SIDE [{args.side_cam_id} {args.side_name}] | [2]/[O]: Video | [W]: Setup | [M]: Preset | [D]: DB | [Q]: Keluar"
     if args.mode == "dual":
         if top_inspector is not None:
             cv2.namedWindow(win_top, cv2.WINDOW_NORMAL)
@@ -1667,6 +1700,13 @@ def _run_threaded_engine(args):
                         cap_top, is_cam_top, top_source_path = create_capture(new_top)
                     if top_inspector:
                         top_inspector.reset_counters()
+            elif key in [ord("m"), ord("M")]:
+                if side_inspector:
+                    cur_p = getattr(side_inspector, "preset", "opsi_1")
+                    next_p = "opsi_2" if cur_p == "opsi_1" else "opsi_1"
+                    side_inspector.set_preset(next_p, verbose=True)
+                    side_inspector.reset_session()
+                    print(f"\n[*] [{args.side_cam_id} SIDE] Manual Switch Preset: {cur_p.upper()} -> {next_p.upper()}\n")
             elif key in [ord("b"), ord("B")]:
                 new_side = cycle_next_video(side_source_path)
                 if new_side and str(new_side) != str(side_source_path):
@@ -1675,6 +1715,9 @@ def _run_threaded_engine(args):
                             cap_side.release()
                         cap_side, is_cam_side, side_source_path = create_capture(new_side)
                     if side_inspector:
+                        if getattr(side_inspector, "auto_preset_mode", True):
+                            det_p = side_inspector.resolve_preset_from_source(side_source_path)
+                            side_inspector.set_preset(det_p, verbose=True)
                         side_inspector.reset_session()
             elif key in [ord("c"), ord("C")]:
                 new_cam = cycle_next_camera(top_source_path)
@@ -1713,6 +1756,9 @@ def _run_threaded_engine(args):
                             cap_side.release()
                         cap_side, is_cam_side, side_source_path = create_capture(new_side)
                     if side_inspector:
+                        if getattr(side_inspector, "auto_preset_mode", True):
+                            det_p = side_inspector.resolve_preset_from_source(side_source_path)
+                            side_inspector.set_preset(det_p, verbose=True)
                         side_inspector.reset_session()
                     print(f"[*] {args.side_cam_id} Side berhasil beralih ke video: {os.path.basename(str(side_source_path))}")
             elif key in [ord("w"), ord("W")]:
@@ -1738,6 +1784,9 @@ def _run_threaded_engine(args):
                             cap_side.release()
                         cap_side, is_cam_side, side_source_path = create_capture(new_side)
                     if side_inspector:
+                        if getattr(side_inspector, "auto_preset_mode", True):
+                            det_p = side_inspector.resolve_preset_from_source(side_source_path)
+                            side_inspector.set_preset(det_p, verbose=True)
                         side_inspector.reset_session()
                     s_label = f"Webcam #{side_source_path}" if is_cam_side else os.path.basename(str(side_source_path))
                     print(f"[*] {args.side_cam_id} Side beralih ke: {s_label}")

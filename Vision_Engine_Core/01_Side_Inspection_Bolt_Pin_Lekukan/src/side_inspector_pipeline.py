@@ -83,6 +83,7 @@ class SideConveyorInspector:
         self,
         camera_id="CAM-01",
         side="RIGHT",
+        preset="auto",
         yolo_model_path=None,
         patchcore_model_path=None,
         master_roi_config=None,
@@ -106,6 +107,31 @@ class SideConveyorInspector:
         self.camera_id = camera_id
         self.side = side_norm
         self.device = device
+
+        # Resolusi Preset Lingkungan Kamera (opsi_1 / opsi_2 / auto)
+        # Prioritas: Argumen konstruktor eksplisit > Environment variable .env > Default auto
+        env_preset = (os.environ.get("SIDE_POSITION_PRESET") or os.environ.get("SIDE_CAMERA_PRESET") or "").strip().lower()
+        if preset and str(preset).strip().lower() not in ["auto", ""]:
+            preset_raw = str(preset).strip().lower()
+        elif env_preset:
+            preset_raw = env_preset
+        else:
+            preset_raw = "auto"
+
+        if preset_raw in ["1", "opsi1", "opsi_1", "posisi1", "posisi_1"]:
+            preset_clean = "opsi_1"
+            is_auto = False
+        elif preset_raw in ["2", "opsi2", "opsi_2", "posisi2", "posisi_2"]:
+            preset_clean = "opsi_2"
+            is_auto = False
+        elif preset_raw == "auto":
+            preset_clean = "opsi_1"
+            is_auto = True
+        else:
+            preset_clean = "opsi_1"
+            is_auto = False
+        self.preset = preset_clean
+        self.auto_preset_mode = is_auto
 
         # Ambang batas deteksi Baut & Pin (Prioritaskan argumen -> .env -> default 0.55 / 0.35)
         if conf_thresh is None:
@@ -131,6 +157,8 @@ class SideConveyorInspector:
 
         # Path default jika tidak ditentukan
         base_dir = os.path.dirname(CURRENT_DIR)
+        self.base_dir = base_dir
+
         if yolo_model_path is None:
             # 1. Cek environment variable MODEL_SIDE_PATH jika didefinisikan di .env
             env_side_model = os.environ.get("MODEL_SIDE_PATH")
@@ -149,16 +177,25 @@ class SideConveyorInspector:
                         break
                 if yolo_model_path is None:
                     yolo_model_path = os.path.join(base_dir, "models", "best_v26_ok.pt")
-        if patchcore_model_path is None:
-            patchcore_model_path = os.path.join(base_dir, "models", "patchcore_bracket_model.pkl")
-        if master_roi_config is None:
-            master_roi_config = os.path.join(base_dir, "configs", "hybrid_master_roi_config.json")
-        if polygon_config is None:
-            polygon_config = os.path.join(base_dir, "configs", "bracket_polygon_config.json")
+        self.yolo_model_path = yolo_model_path
 
-        print("=" * 60)
-        print(f"[*] Menginisialisasi Side Conveyor Inspector: [{self.camera_id} - {self.side}]")
-        print("=" * 60)
+        # Konfigurasi Master ROI (Zona YOLO)
+        self.master_roi_config_path = master_roi_config or os.path.join(base_dir, "configs", "hybrid_master_roi_config.json")
+        self.default_master_roi = [0.351, 0.134, 0.541, 0.747]
+        self.master_roi = self._load_master_roi()
+
+        # Nilai override eksplisit jika pengguna menentukan argumen khusus
+        self._user_polygon_config = polygon_config
+        self._user_patchcore_model = patchcore_model_path
+        self._user_patchcore_thresh = patchcore_thresh
+
+        # Nilai default poligon dasar (Fallback)
+        self.default_polygon = [
+            [0.452, 0.303],
+            [0.499, 0.340],
+            [0.493, 0.467],
+            [0.444, 0.446]
+        ]
 
         if device == "cuda":
             try:
@@ -174,43 +211,26 @@ class SideConveyorInspector:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
             except Exception:
                 device = "cpu"
+        self.device = device
+
+        print("=" * 60)
+        print(f"[*] Menginisialisasi Side Conveyor Inspector: [{self.camera_id} - {self.side}]")
+        print("=" * 60)
 
         # 1. Inisialisasi Detektor Baut & Pin (YOLO)
         self.bolt_pin_detector = BoltPinDetector(
-            yolo_model_path,
+            self.yolo_model_path,
             conf_threshold=self.conf_thresh,
             iou_threshold=self.iou_thresh,
             max_pin_distance=140.0,
             agnostic_nms=True,
-            device=device
+            device=self.device
         )
 
-        # 2. Inisialisasi Detektor Lekukan (PatchCore) dengan akselerasi GPU CUDA
-        self.custom_patchcore_thresh = patchcore_thresh or 0.8650
-        self.bracket_detector = BracketAnomalyDetector(
-            patchcore_model_path,
-            default_thresh=self.custom_patchcore_thresh,
-            device=device
-        )
-
-        # 3. Muat Konfigurasi Master ROI (Zona YOLO)
-        self.master_roi_config_path = master_roi_config
-        self.default_master_roi = [0.351, 0.134, 0.541, 0.747]
-        self.master_roi = self._load_master_roi()
-
-        # 4. Muat Konfigurasi Poligon Diam (Zona PatchCore)
-        self.polygon_config_path = polygon_config
-        self.default_polygon = [
-            [0.452, 0.303],
-            [0.499, 0.340],
-            [0.493, 0.467],
-            [0.444, 0.446]
-        ]
-        self.polygon_pts = self._load_polygon_config()
+        # 2. Inisialisasi Preset (Polygon, PatchCore Model, & Photocell Thresh)
+        self.set_preset(self.preset, verbose=True)
 
         # 5. Sensor Virtual Photocell (Hysteresis Schmitt Trigger & Debounce Persistence Filter)
-        self.photocell_thresh_high = 72.0      # Ambang batas Rising Edge (Plat masuk konveyor >= 72)
-        self.photocell_thresh_low = 62.0       # Ambang batas Falling Edge (Celah antar plat < 62)
         self.gap_debounce_frames = 2           # Debounce gap: intensitas celah bertahan minimal 2 frame
         self.plat_debounce_frames = 2          # Debounce plat: intensitas plat masuk bertahan minimal 2 frame
         self.max_slat_duration_frames = 45     # Watchdog anti-stuck: auto-release ke GAP jika plat tertahan >= 45 frame
@@ -416,6 +436,76 @@ class SideConveyorInspector:
                 pass
 
 
+
+    def resolve_preset_from_source(self, video_source):
+        """Mendeteksi preset posisi (opsi_1 / opsi_2) dari nama/path video atau input camera."""
+        if not video_source:
+            return self.preset
+        src_str = str(video_source).lower()
+        if any(term in src_str for term in ["posisi 2", "posisi_2", "opsi 2", "opsi_2", "pos2"]):
+            return "opsi_2"
+        elif any(term in src_str for term in ["posisi 1", "posisi_1", "opsi 1", "opsi_1", "pos1"]):
+            return "opsi_1"
+        return self.preset
+
+    def set_preset(self, preset_name, verbose=False):
+        """
+        Beralih preset posisi kamera (opsi_1 <-> opsi_2) secara dinamis.
+        Menyesuaikan file konfigurasi poligon, bobot PatchCore, dan ambang photocell otomatis.
+        """
+        norm_p = "opsi_2" if str(preset_name).lower() in ["2", "opsi2", "posisi2", "posisi_2", "opsi_2"] else "opsi_1"
+        self.preset = norm_p
+
+        # 1. Tentukan Path Poligon ROI Sesuai Preset
+        if self._user_polygon_config:
+            self.polygon_config_path = self._user_polygon_config
+        else:
+            if norm_p == "opsi_2":
+                self.polygon_config_path = os.path.join(self.base_dir, "configs", "bracket_polygon_config_pos2.json")
+            else:
+                self.polygon_config_path = os.path.join(self.base_dir, "configs", "bracket_polygon_config_pos1.json")
+                if not os.path.exists(self.polygon_config_path):
+                    self.polygon_config_path = os.path.join(self.base_dir, "configs", "bracket_polygon_config.json")
+        self.polygon_pts = self._load_polygon_config()
+
+        # 2. Tentukan Ambang Photocell Sesuai Pencahayaan Preset
+        if norm_p == "opsi_2":
+            th_h = os.environ.get("PHOTOCELL_POS2_HIGH") or os.environ.get("PHOTOCELL_THRESH_HIGH")
+            th_l = os.environ.get("PHOTOCELL_POS2_LOW") or os.environ.get("PHOTOCELL_THRESH_LOW")
+            self.photocell_thresh_high = float(th_h) if th_h else 140.0
+            self.photocell_thresh_low = float(th_l) if th_l else 118.0
+            default_patch_th = 0.8500
+        else:
+            th_h = os.environ.get("PHOTOCELL_POS1_HIGH") or os.environ.get("PHOTOCELL_THRESH_HIGH")
+            th_l = os.environ.get("PHOTOCELL_POS1_LOW") or os.environ.get("PHOTOCELL_THRESH_LOW")
+            self.photocell_thresh_high = float(th_h) if th_h else 72.0
+            self.photocell_thresh_low = float(th_l) if th_l else 62.0
+            default_patch_th = 0.8650
+
+        # 3. Tentukan Model PatchCore & Anomaly Threshold
+        self.custom_patchcore_thresh = self._user_patchcore_thresh or default_patch_th
+        if self._user_patchcore_model:
+            model_path = self._user_patchcore_model
+        else:
+            if norm_p == "opsi_2":
+                cand_pos2 = os.path.join(self.base_dir, "models", "patchcore_bracket_model_pos2.pkl")
+                model_path = cand_pos2 if os.path.exists(cand_pos2) else os.path.join(self.base_dir, "models", "patchcore_bracket_model.pkl")
+            else:
+                model_path = os.path.join(self.base_dir, "models", "patchcore_bracket_model.pkl")
+
+        # Inisialisasi Bracket Detector
+        self.bracket_detector = BracketAnomalyDetector(
+            model_path,
+            default_thresh=self.custom_patchcore_thresh,
+            device=self.device
+        )
+
+        if verbose:
+            print(f"[*] [SideConveyorInspector] Preset Aktif: [{self.preset.upper()}]")
+            print(f"    - Polygon Config   : {os.path.basename(self.polygon_config_path)}")
+            print(f"    - PatchCore Model  : {os.path.basename(model_path)}")
+            print(f"    - Photocell Thresh : High={self.photocell_thresh_high:.1f}, Low={self.photocell_thresh_low:.1f}")
+            print(f"    - PatchCore Thresh : {self.custom_patchcore_thresh:.4f}")
 
     def _load_master_roi(self):
         """Memuat koordinat Master ROI dari file JSON."""
@@ -666,7 +756,7 @@ class SideConveyorInspector:
         cv2.line(display_frame, (px1, py), (px2, py), beam_color, 2)
         cv2.circle(display_frame, (px1, py), 4, beam_color, -1)
         cv2.circle(display_frame, (px2, py), 4, beam_color, -1)
-        sensor_status_text = f"PHOTOCELL: {'ON [PLAT]' if is_plate_present else 'OFF [GAP]'} ({beam_val:.1f})"
+        sensor_status_text = f"PHOTOCELL: {'ON [PLAT]' if is_plate_present else 'OFF [GAP]'} ({beam_val:.1f} | Th:{self.photocell_thresh_high:.0f}/{self.photocell_thresh_low:.0f})"
         cv2.putText(display_frame, sensor_status_text, (px1 - 20, max(15, py - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, beam_color, 1)
 
@@ -890,8 +980,9 @@ class SideConveyorInspector:
         res_color = (0, 255, 0) if res == "OK" else ((0, 0, 255) if res == "NG" else (0, 200, 255))
 
         # Judul & Status Utama
-        cv2.putText(img, f"CONVEYOR SIDE INSPECTION [{self.camera_id} - {self.side}]",
-                    (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+        preset_badge = f"[{self.preset.upper()}]" if hasattr(self, "preset") else ""
+        cv2.putText(img, f"CONVEYOR SIDE INSPECTION [{self.camera_id} - {self.side}] {preset_badge}",
+                    (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
         cv2.putText(img, f"STATUS: {res}", (15, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.85, res_color, 2)
 
@@ -961,15 +1052,16 @@ def select_video_file(initial_dir=None, title="Pilih File Video Inspeksi"):
         return None
 
 
-def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", enable_db=False):
+def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", preset="auto", enable_db=False):
     """
     Fungsi demo interaktif untuk menguji video konveyor sisi samping.
     Mendukung:
     - Saklar Database SQLite & Notifikasi MS Teams via shortcut [D] atau flag --db
     - Pemilihan file video baru kapan saja via shortcut keyboard [O] / [F]
+    - Toggle Preset Posisi Kamera (Opsi 1 / Opsi 2) via shortcut [M]
     - Penyesuaian titik sudut Poligon Diam & Master ROI menggunakan Mouse Drag
     """
-    inspector = SideConveyorInspector(camera_id=camera_id, side=side, enable_db=enable_db)
+    inspector = SideConveyorInspector(camera_id=camera_id, side=side, preset=preset, enable_db=enable_db)
 
     # Validasi path video, jika belum ada / salah, buka dialog pemilih file
     if not video_path or not os.path.exists(video_path):
@@ -978,6 +1070,11 @@ def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", e
         if not video_path:
             print("[ERROR] Tidak ada video yang dipilih. Demo dihentikan.")
             return
+
+    # Auto-resolusi preset dari nama video jika mode auto aktif
+    if inspector.auto_preset_mode and video_path:
+        det_p = inspector.resolve_preset_from_source(video_path)
+        inspector.set_preset(det_p, verbose=True)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -1145,7 +1242,7 @@ def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", e
 
             # Petunjuk shortcut di bagian bawah frame
             db_state = "ON" if inspector.is_db_enabled() else "OFF"
-            help_bar = f"[SPACE]: Pause | [D]: DB({db_state}) | [W]/[O]: Media | [N/P]: Step | [R]: Reset | [Q]: Keluar"
+            help_bar = f"[SPACE]: Pause | [M]: Preset({inspector.preset.upper()}) | [D]: DB({db_state}) | [W]/[O]: Media | [R]: Reset | [Q]: Keluar"
             banner_color = (0, 255, 255) if inspector.is_db_enabled() else (220, 220, 220)
             cv2.putText(display_frame, help_bar, (15, h_f - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.44, banner_color, 1)
 
@@ -1156,6 +1253,13 @@ def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", e
                 break
             elif key == ord(' '):
                 is_paused = not is_paused
+            elif key in [ord('m'), ord('M')]:
+                next_p = "opsi_2" if inspector.preset == "opsi_1" else "opsi_1"
+                inspector.set_preset(next_p, verbose=True)
+                init_th = int(inspector.bracket_detector.calibrated_threshold * 1000)
+                cv2.setTrackbarPos("PatchCore Thresh (x1000)", win_name, init_th)
+                inspector.reset_session()
+                print(f"\n[✓] Preset kamera dialihkan ke: {inspector.preset.upper()}\n")
             elif key in [ord('d'), ord('D')]:
                 st = inspector.toggle_db()
                 status_str = "AKTIF (RECORDING & NOTIFIKASI TEAMS)" if st else "MATI (DRY-RUN BENCHMARK)"
@@ -1175,6 +1279,13 @@ def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", e
                         delay_ms = max(1, int(1000 / fps))
                         cv2.setTrackbarMax("Timeline", win_name, max(1, total_frames - 1))
                         cv2.setTrackbarPos("Timeline", win_name, 0)
+
+                        if inspector.auto_preset_mode:
+                            det_p = inspector.resolve_preset_from_source(video_path)
+                            inspector.set_preset(det_p, verbose=True)
+                            init_th = int(inspector.bracket_detector.calibrated_threshold * 1000)
+                            cv2.setTrackbarPos("PatchCore Thresh (x1000)", win_name, init_th)
+
                         inspector.reset_session()
                         print(f"\n[✓] Berhasil memuat video baru: {os.path.basename(video_path)} ({total_frames} frame, {fps:.1f} FPS)")
                     else:
@@ -1206,6 +1317,7 @@ if __name__ == "__main__":
     parser.add_argument("video", nargs="?", default=None, help="Path ke file video inspeksi (opsional)")
     parser.add_argument("--side", default="RIGHT", choices=["LEFT", "RIGHT"], help="Sisi kamera (LEFT / RIGHT)")
     parser.add_argument("--cam", default="CAM-01", help="ID Kamera (default: CAM-01)")
+    parser.add_argument("--preset", default="auto", choices=["auto", "opsi_1", "opsi_2", "1", "2"], help="Preset posisi kamera (opsi_1 / opsi_2 / auto)")
     parser.add_argument("--db", action="store_true", help="Aktifkan pencatatan Database SQLite & Notifikasi MS Teams")
     args = parser.parse_args()
 
@@ -1234,7 +1346,7 @@ if __name__ == "__main__":
             video_input = select_video_file(title="Pilih File Video untuk Inspeksi Samping")
 
     if video_input and (os.path.exists(video_input) or str(video_input).isdigit() or str(video_input).startswith(("rtsp://", "http://"))):
-        run_side_inspector_demo(video_input, side=args.side, camera_id=args.cam, enable_db=args.db)
+        run_side_inspector_demo(video_input, side=args.side, camera_id=args.cam, preset=args.preset, enable_db=args.db)
     else:
         print("[!] Tidak ada video yang dipilih. Program dihentikan.")
 
