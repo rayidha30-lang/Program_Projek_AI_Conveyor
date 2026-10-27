@@ -721,7 +721,8 @@ def _run_top_worker(
     fps_val,
     frames_val,
     latency_val,
-    status_buf
+    status_buf,
+    gui_fps=22.0
 ):
     """Worker proses terisolasi untuk CAM-01 Top Inspection (Plat & Rib)."""
     # Bersihkan cache VRAM PyTorch sebelum proses inferensi dimulai
@@ -775,6 +776,8 @@ def _run_top_worker(
     fps_history = []
     t_start = time.time()
     t_prev = t_start
+    gui_interval = (1.0 / gui_fps) if (gui_fps and gui_fps > 0) else 0.0
+    last_gui_render = 0.0
 
     print("[*] Worker CAM-01 Top Inspection AKTIF dan mulai memproses...")
 
@@ -820,17 +823,22 @@ def _run_top_worker(
             curr_stat = inspect_res.get("status", "WAIT")
             status_buf.value = curr_stat.encode("utf-8")[:63]
 
-            # Render Visual jika mode dual
+            # Render Visual jika mode dual (Decoupled GUI Rendering)
             hud = None
+            is_ng = inspect_res.get("status") == "NG"
             if mode == "dual":
-                hud = inspector.render_combined_dashboard(
-                    frame=frame,
-                    inspect_result=inspect_res,
-                    fps=avg_fps,
-                    frame_idx=frame_count,
-                    total_frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
-                )
-                cv2.imshow(win_name, hud)
+                t_now = time.time()
+                should_render = ((t_now - last_gui_render) >= gui_interval) or is_ng
+                if should_render:
+                    hud = inspector.render_combined_dashboard(
+                        frame=frame,
+                        inspect_result=inspect_res,
+                        fps=avg_fps,
+                        frame_idx=frame_count,
+                        total_frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
+                    )
+                    cv2.imshow(win_name, hud)
+                    last_gui_render = t_now
                 key = cv2.waitKey(1) & 0xFF
                 if key in [ord("q"), ord("Q"), 27]:  # 27 = ESC
                     print("\n[*] Tombol keluar [Q] ditekan pada jendela CAM-01 Top.")
@@ -938,7 +946,8 @@ def _run_side_worker(
     fps_val,
     frames_val,
     latency_val,
-    status_buf
+    status_buf,
+    gui_fps=22.0
 ):
     """Worker proses terisolasi untuk Side Inspection (Bolt, Pin, & Bracket)."""
     # Bersihkan cache VRAM PyTorch sebelum proses inferensi dimulai
@@ -1039,6 +1048,8 @@ def _run_side_worker(
     fps_history = []
     t_start = time.time()
     t_prev = t_start
+    gui_interval = (1.0 / gui_fps) if (gui_fps and gui_fps > 0) else 0.0
+    last_gui_render_side = 0.0
 
     print(f"[*] Worker {camera_id} Side Inspection [{side}] AKTIF dan mulai memproses...")
 
@@ -1115,26 +1126,28 @@ def _run_side_worker(
                         side_payload=payload
                     )
 
-            # Render Visual jika mode dual
-            if mode == "dual":
-                # Tambahkan overlay benchmark banner di bagian bawah frame Side (Identik dengan Threaded Engine)
-                h_d, w_d = display_frame.shape[:2]
-                db_state = "ON" if (db_bridge and db_bridge.is_enabled()) else "OFF"
-                s_ok = getattr(inspector, 'slat_ok_count', getattr(inspector, 'stats', {}).get('ok_count', 0))
-                s_ng = getattr(inspector, 'slat_ng_count', getattr(inspector, 'stats', {}).get('ng_count', 0))
-                b_ng = getattr(inspector, 'bolt_ng_count', 0)
-                p_ng = getattr(inspector, 'pin_ng_count', 0)
-                c_ng = getattr(inspector, 'crack_ng_count', 0)
-                s_cyc = getattr(inspector, 'slat_cycle_count', 0)
-                qc_txt = f"Slat #{s_cyc} [OK:{s_ok} NG:{s_ng}]"
-                cur_p_label = getattr(inspector, 'preset', 'opsi_1').upper() if inspector else 'OPSI_1'
-                banner = f"FPS: {avg_fps:4.1f} | Lat: {latency_ms:4.1f}ms | [W]: Setup | [2/O]: Video | [M]: {cur_p_label} | {qc_txt} | [Q]: Keluar"
-                cv2.rectangle(display_frame, (10, h_d - 65), (w_d - 10, h_d - 10), (18, 18, 18), -1)
-                cv2.rectangle(display_frame, (10, h_d - 65), (w_d - 10, h_d - 10), (0, 220, 255), 2, cv2.LINE_AA)
-                cv2.putText(display_frame, banner, (25, h_d - 24),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.76, (0, 255, 255), 2, cv2.LINE_AA)
+            # Render Visual jika mode dual (Decoupled GUI Rendering)
+            is_side_ng = payload.get("overall_result") == "NG"
+            t_now = time.time()
+            should_render_side = ((t_now - last_gui_render_side) >= gui_interval) or is_side_ng
 
-                cv2.imshow(win_name, display_frame)
+            if mode == "dual":
+                if should_render_side and display_frame is not None:
+                    # Tambahkan overlay benchmark banner di bagian bawah frame Side (Identik dengan Threaded Engine)
+                    h_d, w_d = display_frame.shape[:2]
+                    s_ok = getattr(inspector, 'slat_ok_count', getattr(inspector, 'stats', {}).get('ok_count', 0))
+                    s_ng = getattr(inspector, 'slat_ng_count', getattr(inspector, 'stats', {}).get('ng_count', 0))
+                    s_cyc = getattr(inspector, 'slat_cycle_count', 0)
+                    qc_txt = f"Slat #{s_cyc} [OK:{s_ok} NG:{s_ng}]"
+                    cur_p_label = getattr(inspector, 'preset', 'opsi_1').upper() if inspector else 'OPSI_1'
+                    banner = f"FPS: {avg_fps:4.1f} | Lat: {latency_ms:4.1f}ms | [W]: Setup | [2/O]: Video | [M]: {cur_p_label} | {qc_txt} | [Q]: Keluar"
+                    cv2.rectangle(display_frame, (10, h_d - 65), (w_d - 10, h_d - 10), (18, 18, 18), -1)
+                    cv2.rectangle(display_frame, (10, h_d - 65), (w_d - 10, h_d - 10), (0, 220, 255), 2, cv2.LINE_AA)
+                    cv2.putText(display_frame, banner, (25, h_d - 24),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.76, (0, 255, 255), 2, cv2.LINE_AA)
+
+                    cv2.imshow(win_name, display_frame)
+                    last_gui_render_side = t_now
                 key = cv2.waitKey(1) & 0xFF
                 if key in [ord("q"), ord("Q"), 27]:
                     print(f"\n[*] Tombol keluar [Q] ditekan pada jendela {camera_id} Side.")
@@ -2202,7 +2215,8 @@ Shortcut Keyboard Saat Berjalan:
                 fps_top,
                 frames_top,
                 lat_top,
-                stat_top
+                stat_top,
+                args.gui_fps
             ),
             name="Worker-TopInspector"
         )
@@ -2223,7 +2237,8 @@ Shortcut Keyboard Saat Berjalan:
                 fps_side,
                 frames_side,
                 lat_side,
-                stat_side
+                stat_side,
+                args.gui_fps
             ),
             name="Worker-SideInspector"
         )
