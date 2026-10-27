@@ -57,6 +57,7 @@ Program AI/Temporary Penyimpanan/
 
 # Model Checkpoints & Serialization
 *.pkl
+!Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/*.pkl
 
 # Log & Benchmark Results
 *.csv
