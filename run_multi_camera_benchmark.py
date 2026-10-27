@@ -1420,8 +1420,10 @@ def _run_threaded_engine(args):
         print(f"[WARN] Pre-warmup skipped: {e_wm}")
 
     # Decoupled GUI Rendering Pacing: Pacing tampilan visual GUI desktop tanpa mencekik throughput AI
-    gui_fps = getattr(args, "gui_fps", 22.0)
+    gui_fps = getattr(args, "gui_fps", 15.0)
     gui_interval = (1.0 / gui_fps) if (gui_fps and gui_fps > 0) else 0.0
+
+    total_f_top = int(cap_top.get(cv2.CAP_PROP_FRAME_COUNT)) if (cap_top and not is_cam_top) else 0
 
     top_state = {
         "display": None,
@@ -1430,6 +1432,9 @@ def _run_threaded_engine(args):
         "latency": 0.0,
         "status": "STARTING",
         "frames": 0,
+        "raw_frame": None,
+        "inspect_res": None,
+        "has_new": False,
     }
     side_state = {
         "display": None,
@@ -1438,6 +1443,7 @@ def _run_threaded_engine(args):
         "latency": 0.0,
         "status": "STARTING",
         "frames": 0,
+        "has_new": False,
     }
 
     # Worker Thread 1: CAM-01 Top Inspector
@@ -1445,8 +1451,6 @@ def _run_threaded_engine(args):
         nonlocal cap_top, top_source_path, is_cam_top
         t_prev = time.time()
         fps_hist = []
-        total_f = int(cap_top.get(cv2.CAP_PROP_FRAME_COUNT)) if (cap_top and not is_cam_top) else 0
-        last_render_top = 0.0
 
         try:
             while not stop_event.is_set():
@@ -1484,40 +1488,34 @@ def _run_threaded_engine(args):
                     fps_hist.pop(0)
                 avg_f = sum(fps_hist) / len(fps_hist)
 
-                # Decoupled GUI Rendering: Gambar dashboard grafis hanya jika interval GUI tercapai atau terjadi NG
-                hud = None
+                # Rekam ke database SQLite dan kirim notifikasi MS Teams menggunakan Best-Shot Buffer jika DB aktif & NG
                 is_ng = inspect_res.get("status") == "NG"
-                if args.mode == "dual":
-                    t_now = time.time()
-                    should_render = ((t_now - last_render_top) >= gui_interval) or is_ng
-                    if should_render:
-                        hud = top_inspector.render_combined_dashboard(
-                            frame=frame,
-                            inspect_result=inspect_res,
-                            fps=avg_f,
-                            frame_idx=top_state["frames"] + 1,
-                            total_frames=total_f
-                        )
-                        last_render_top = t_now
-
-                # Rekam ke database SQLite dan kirim notifikasi MS Teams menggunakan Best-Shot Buffer jika DB aktif
-                if top_inspector and top_inspector.is_db_enabled():
+                if is_ng and top_inspector and top_inspector.is_db_enabled():
+                    ann_ng = top_inspector.render_combined_dashboard(
+                        frame=frame,
+                        inspect_result=inspect_res,
+                        fps=avg_f,
+                        frame_idx=top_state["frames"] + 1,
+                        total_frames=total_f_top
+                    )
                     top_inspector.record_if_ng(
                         frame_raw=frame,
-                        frame_ann=hud if hud is not None else frame,
+                        frame_ann=ann_ng,
                         inspect_res=inspect_res,
                         slat_no=getattr(top_inspector.slat_inspector, "slat_count", None),
                         rib_no=getattr(top_inspector.rib_inspector, "rib_count", None)
                     )
 
+                # Push data ke top_state untuk dirender asinkron oleh Main GUI Thread (Zero-Overhead di Thread AI)
                 with top_lock:
                     top_state["frames"] += 1
                     top_state["fps"] = avg_f
                     top_state["latency"] = lat
                     top_state["status"] = inspect_res.get("status", "WAIT")
-                    if hud is not None:
-                        top_state["display"] = hud
-                        top_state["disp_id"] += 1
+                    top_state["raw_frame"] = frame
+                    top_state["inspect_res"] = inspect_res
+                    top_state["disp_id"] += 1
+                    top_state["has_new"] = True
         except Exception as e:
             import traceback
             print(f"[ERROR Thread-TopInspector] {e}")
@@ -1570,8 +1568,9 @@ def _run_threaded_engine(args):
                 avg_f = sum(fps_hist) / len(fps_hist)
 
                 # Rekam ke database SQLite & notifikasi Teams jika terdeteksi Side NG (Single-Capture per Slat)
+                is_side_ng = payload.get("overall_result") == "NG"
                 if side_db_bridge and side_db_bridge.is_enabled():
-                    if payload.get("should_emit", False) and payload.get("overall_result") == "NG":
+                    if payload.get("should_emit", False) and is_side_ng:
                         emit_raw = payload.get("emit_raw_frame", frame)
                         emit_ann = payload.get("emit_ann_frame", display_frame)
                         side_db_bridge.emit_side_inspection(
@@ -1580,34 +1579,15 @@ def _run_threaded_engine(args):
                             side_payload=payload
                         )
 
-                # Decoupled GUI Rendering untuk Side Inspection:
-                # Banner benchmark bawah hanya di-draw dan display buffer hanya di-push ke main thread saat interval GUI tercapai / NG
-                t_now = time.time()
-                is_side_ng = payload.get("overall_result") == "NG"
-                should_render_side = ((t_now - last_render_side) >= gui_interval) or is_side_ng
-
-                if args.mode in ["dual", "side-only"] and display_frame is not None and should_render_side:
-                    h_d, w_d = display_frame.shape[:2]
-                    s_ok = getattr(side_inspector, 'slat_ok_count', getattr(side_inspector, 'stats', {}).get('ok_count', 0))
-                    s_ng = getattr(side_inspector, 'slat_ng_count', getattr(side_inspector, 'stats', {}).get('ng_count', 0))
-                    s_cyc = getattr(side_inspector, 'slat_cycle_count', 0)
-                    qc_txt = f"Slat #{s_cyc} [OK:{s_ok} NG:{s_ng}]"
-                    cur_p_label = getattr(side_inspector, 'preset', 'opsi_1').upper() if side_inspector else 'OPSI_1'
-                    banner = f"FPS: {avg_f:4.1f} | Lat: {lat:4.1f}ms | [W]: Setup | [2/O]: Video | [M]: {cur_p_label} | {qc_txt} | [Q]: Keluar"
-                    cv2.rectangle(display_frame, (10, h_d - 65), (w_d - 10, h_d - 10), (18, 18, 18), -1)
-                    cv2.rectangle(display_frame, (10, h_d - 65), (w_d - 10, h_d - 10), (0, 220, 255), 2, cv2.LINE_AA)
-                    cv2.putText(display_frame, banner, (25, h_d - 24),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.76, (0, 255, 255), 2, cv2.LINE_AA)
-
+                # Push data ke side_state untuk visualisasi asinkron oleh Main GUI Thread
                 with side_lock:
                     side_state["frames"] += 1
                     side_state["fps"] = avg_f
                     side_state["latency"] = lat
                     side_state["status"] = payload.get("overall_result", "WAIT")
-                    if should_render_side and display_frame is not None:
-                        side_state["display"] = display_frame
-                        side_state["disp_id"] += 1
-                        last_render_side = t_now
+                    side_state["display"] = display_frame
+                    side_state["disp_id"] += 1
+                    side_state["has_new"] = True
         except Exception as e:
             import traceback
             print(f"[ERROR Thread-SideInspector] {e}")
@@ -1656,8 +1636,7 @@ def _run_threaded_engine(args):
 
     t0 = None
     last_print = 0.0
-    last_disp_top_cnt = -1
-    last_disp_side_cnt = -1
+    last_gui_render = 0.0
 
     try:
         while not stop_event.is_set():
@@ -1675,34 +1654,58 @@ def _run_threaded_engine(args):
                 stop_event.set()
                 break
 
-            # Render GUI OpenCV di Main Thread (Hanya render saat frame baru tersedia dari worker thread)
+            # Render GUI OpenCV di Main Thread (Decoupled GUI Rendering Sejati - Bebas GIL dari Thread AI)
             key = -1
             if args.mode == "dual":
-                has_rendered = False
-                if top_inspector is not None:
-                    with top_lock:
-                        disp_top = top_state["display"]
-                        cnt_top = top_state["disp_id"]
-                    if disp_top is not None and cnt_top != last_disp_top_cnt:
-                        last_disp_top_cnt = cnt_top
-                        cv2.imshow(win_top, disp_top)
-                        has_rendered = True
+                if (now - last_gui_render) >= gui_interval:
+                    last_gui_render = now
+                    if top_inspector is not None:
+                        with top_lock:
+                            has_new_top = top_state.get("has_new", False)
+                            raw_top = top_state.get("raw_frame")
+                            res_top = top_state.get("inspect_res")
+                            fps_top = top_state.get("fps", 0.0)
+                            f_idx_top = top_state.get("frames", 0)
+                            top_state["has_new"] = False
 
-                if side_inspector is not None:
-                    with side_lock:
-                        disp_side = side_state["display"]
-                        cnt_side = side_state["disp_id"]
-                    if disp_side is not None and cnt_side != last_disp_side_cnt:
-                        last_disp_side_cnt = cnt_side
-                        cv2.imshow(win_side, disp_side)
-                        has_rendered = True
+                        if has_new_top and raw_top is not None and res_top is not None:
+                            hud_top = top_inspector.render_combined_dashboard(
+                                frame=raw_top,
+                                inspect_result=res_top,
+                                fps=fps_top,
+                                frame_idx=f_idx_top,
+                                total_frames=total_f_top
+                            )
+                            cv2.imshow(win_top, hud_top)
 
-                if has_rendered:
+                    if side_inspector is not None:
+                        with side_lock:
+                            has_new_side = side_state.get("has_new", False)
+                            disp_side = side_state.get("display")
+                            fps_side = side_state.get("fps", 0.0)
+                            lat_side = side_state.get("latency", 0.0)
+                            side_state["has_new"] = False
+
+                        if has_new_side and disp_side is not None:
+                            # Render banner pada disp_side di Main Thread
+                            h_d, w_d = disp_side.shape[:2]
+                            s_ok = getattr(side_inspector, 'slat_ok_count', getattr(side_inspector, 'stats', {}).get('ok_count', 0))
+                            s_ng = getattr(side_inspector, 'slat_ng_count', getattr(side_inspector, 'stats', {}).get('ng_count', 0))
+                            s_cyc = getattr(side_inspector, 'slat_cycle_count', 0)
+                            qc_txt = f"Slat #{s_cyc} [OK:{s_ok} NG:{s_ng}]"
+                            cur_p_label = getattr(side_inspector, 'preset', 'opsi_1').upper() if side_inspector else 'OPSI_1'
+                            banner = f"FPS: {fps_side:4.1f} | Lat: {lat_side:4.1f}ms | [W]: Setup | [2/O]: Video | [M]: {cur_p_label} | {qc_txt} | [Q]: Keluar"
+                            cv2.rectangle(disp_side, (10, h_d - 65), (w_d - 10, h_d - 10), (18, 18, 18), -1)
+                            cv2.rectangle(disp_side, (10, h_d - 65), (w_d - 10, h_d - 10), (0, 220, 255), 2, cv2.LINE_AA)
+                            cv2.putText(disp_side, banner, (25, h_d - 24),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.76, (0, 255, 255), 2, cv2.LINE_AA)
+                            cv2.imshow(win_side, disp_side)
+
                     key = cv2.waitKey(1) & 0xFF
                 else:
-                    # Tetap pompa Win32 window message queue agar jendela tidak dianggap hang / di-throttle oleh DWM
+                    # Pompa event loop window & tidur sejenak untuk melepaskan GIL sepenuhnya ke thread AI
                     key = cv2.waitKey(1) & 0xFF
-                    time.sleep(0.001)
+                    time.sleep(0.005)
             else:
                 time.sleep(0.005)
 
@@ -2074,9 +2077,9 @@ Shortcut Keyboard Saat Berjalan:
     parser.add_argument("--bolt-conf", type=float, default=env_bolt_conf, help=f"Ambang batas confidence deteksi baut/pin (default dari .env: {env_bolt_conf})")
     parser.add_argument("--bolt-iou", type=float, default=env_bolt_iou, help=f"Ambang batas NMS IoU deteksi baut/pin (default dari .env: {env_bolt_iou})")
     try:
-        env_gui_fps = float(os.environ.get("GUI_DISPLAY_FPS", "22.0"))
+        env_gui_fps = float(os.environ.get("GUI_DISPLAY_FPS", "15.0"))
     except ValueError:
-        env_gui_fps = 22.0
+        env_gui_fps = 15.0
     parser.add_argument(
         "--gui-fps",
         type=float,
