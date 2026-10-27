@@ -1406,8 +1406,13 @@ def _run_threaded_engine(args):
     except Exception as e_wm:
         print(f"[WARN] Pre-warmup skipped: {e_wm}")
 
+    # Decoupled GUI Rendering Pacing: Pacing tampilan visual GUI desktop tanpa mencekik throughput AI
+    gui_fps = getattr(args, "gui_fps", 22.0)
+    gui_interval = (1.0 / gui_fps) if (gui_fps and gui_fps > 0) else 0.0
+
     top_state = {
         "display": None,
+        "disp_id": 0,
         "fps": 0.0,
         "latency": 0.0,
         "status": "STARTING",
@@ -1415,6 +1420,7 @@ def _run_threaded_engine(args):
     }
     side_state = {
         "display": None,
+        "disp_id": 0,
         "fps": 0.0,
         "latency": 0.0,
         "status": "STARTING",
@@ -1427,6 +1433,7 @@ def _run_threaded_engine(args):
         t_prev = time.time()
         fps_hist = []
         total_f = int(cap_top.get(cv2.CAP_PROP_FRAME_COUNT)) if (cap_top and not is_cam_top) else 0
+        last_render_top = 0.0
 
         try:
             while not stop_event.is_set():
@@ -1464,15 +1471,21 @@ def _run_threaded_engine(args):
                     fps_hist.pop(0)
                 avg_f = sum(fps_hist) / len(fps_hist)
 
+                # Decoupled GUI Rendering: Gambar dashboard grafis hanya jika interval GUI tercapai atau terjadi NG
                 hud = None
+                is_ng = inspect_res.get("status") == "NG"
                 if args.mode == "dual":
-                    hud = top_inspector.render_combined_dashboard(
-                        frame=frame,
-                        inspect_result=inspect_res,
-                        fps=avg_f,
-                        frame_idx=top_state["frames"] + 1,
-                        total_frames=total_f
-                    )
+                    t_now = time.time()
+                    should_render = ((t_now - last_render_top) >= gui_interval) or is_ng
+                    if should_render:
+                        hud = top_inspector.render_combined_dashboard(
+                            frame=frame,
+                            inspect_result=inspect_res,
+                            fps=avg_f,
+                            frame_idx=top_state["frames"] + 1,
+                            total_frames=total_f
+                        )
+                        last_render_top = t_now
 
                 # Rekam ke database SQLite dan kirim notifikasi MS Teams menggunakan Best-Shot Buffer jika DB aktif
                 if top_inspector and top_inspector.is_db_enabled():
@@ -1489,7 +1502,9 @@ def _run_threaded_engine(args):
                     top_state["fps"] = avg_f
                     top_state["latency"] = lat
                     top_state["status"] = inspect_res.get("status", "WAIT")
-                    top_state["display"] = hud
+                    if hud is not None:
+                        top_state["display"] = hud
+                        top_state["disp_id"] += 1
         except Exception as e:
             import traceback
             print(f"[ERROR Thread-TopInspector] {e}")
@@ -1502,6 +1517,7 @@ def _run_threaded_engine(args):
         nonlocal cap_side, side_source_path, is_cam_side
         t_prev = time.time()
         fps_hist = []
+        last_render_side = 0.0
 
         try:
             while not stop_event.is_set():
@@ -1551,15 +1567,16 @@ def _run_threaded_engine(args):
                             side_payload=payload
                         )
 
-                # Gambar overlay banner benchmark di bagian bawah frame Side (DIBESARKAN)
-                if args.mode in ["dual", "side-only"] and display_frame is not None:
+                # Decoupled GUI Rendering untuk Side Inspection:
+                # Banner benchmark bawah hanya di-draw dan display buffer hanya di-push ke main thread saat interval GUI tercapai / NG
+                t_now = time.time()
+                is_side_ng = payload.get("overall_result") == "NG"
+                should_render_side = ((t_now - last_render_side) >= gui_interval) or is_side_ng
+
+                if args.mode in ["dual", "side-only"] and display_frame is not None and should_render_side:
                     h_d, w_d = display_frame.shape[:2]
-                    db_st = "ON" if (side_db_bridge and side_db_bridge.is_enabled()) else "OFF"
                     s_ok = getattr(side_inspector, 'slat_ok_count', getattr(side_inspector, 'stats', {}).get('ok_count', 0))
                     s_ng = getattr(side_inspector, 'slat_ng_count', getattr(side_inspector, 'stats', {}).get('ng_count', 0))
-                    b_ng = getattr(side_inspector, 'bolt_ng_count', 0)
-                    p_ng = getattr(side_inspector, 'pin_ng_count', 0)
-                    c_ng = getattr(side_inspector, 'crack_ng_count', 0)
                     s_cyc = getattr(side_inspector, 'slat_cycle_count', 0)
                     qc_txt = f"Slat #{s_cyc} [OK:{s_ok} NG:{s_ng}]"
                     cur_p_label = getattr(side_inspector, 'preset', 'opsi_1').upper() if side_inspector else 'OPSI_1'
@@ -1574,7 +1591,10 @@ def _run_threaded_engine(args):
                     side_state["fps"] = avg_f
                     side_state["latency"] = lat
                     side_state["status"] = payload.get("overall_result", "WAIT")
-                    side_state["display"] = display_frame
+                    if should_render_side and display_frame is not None:
+                        side_state["display"] = display_frame
+                        side_state["disp_id"] += 1
+                        last_render_side = t_now
         except Exception as e:
             import traceback
             print(f"[ERROR Thread-SideInspector] {e}")
@@ -1649,7 +1669,7 @@ def _run_threaded_engine(args):
                 if top_inspector is not None:
                     with top_lock:
                         disp_top = top_state["display"]
-                        cnt_top = top_state["frames"]
+                        cnt_top = top_state["disp_id"]
                     if disp_top is not None and cnt_top != last_disp_top_cnt:
                         last_disp_top_cnt = cnt_top
                         cv2.imshow(win_top, disp_top)
@@ -1658,7 +1678,7 @@ def _run_threaded_engine(args):
                 if side_inspector is not None:
                     with side_lock:
                         disp_side = side_state["display"]
-                        cnt_side = side_state["frames"]
+                        cnt_side = side_state["disp_id"]
                     if disp_side is not None and cnt_side != last_disp_side_cnt:
                         last_disp_side_cnt = cnt_side
                         cv2.imshow(win_side, disp_side)
@@ -2040,6 +2060,16 @@ Shortcut Keyboard Saat Berjalan:
         env_bolt_iou = 0.35
     parser.add_argument("--bolt-conf", type=float, default=env_bolt_conf, help=f"Ambang batas confidence deteksi baut/pin (default dari .env: {env_bolt_conf})")
     parser.add_argument("--bolt-iou", type=float, default=env_bolt_iou, help=f"Ambang batas NMS IoU deteksi baut/pin (default dari .env: {env_bolt_iou})")
+    try:
+        env_gui_fps = float(os.environ.get("GUI_DISPLAY_FPS", "22.0"))
+    except ValueError:
+        env_gui_fps = 22.0
+    parser.add_argument(
+        "--gui-fps",
+        type=float,
+        default=env_gui_fps,
+        help=f"Target refresh rate tampilan visual GUI desktop (default: {env_gui_fps} FPS). Thread AI tetap berjalan di kecepatan penuh hardware (35+ FPS)."
+    )
 
     args = parser.parse_args()
 
@@ -2125,6 +2155,8 @@ Shortcut Keyboard Saat Berjalan:
     print("=" * 86)
     print(f"[*] Engine Arsitektur  : {'THREADS (Hemat RAM 8GB, Berbagi VRAM Bersama)' if args.engine == 'threads' else 'PROCESS (Multiprocessing Terisolasi)'}")
     print(f"[*] Mode Operasional   : {args.mode.upper()}")
+    if args.mode == "dual":
+        print(f"[*] GUI Render Mode    : DECOUPLED ({args.gui_fps:.1f} FPS GUI Display Pacing, AI Full Speed 35+ FPS)")
     print(f"[*] CAM-01 Top Source  : {os.path.basename(str(args.top_source)) if os.path.exists(str(args.top_source)) else args.top_source}")
     print(f"[*] {args.side_cam_id} Side Source : {os.path.basename(str(args.side_source)) if os.path.exists(str(args.side_source)) else args.side_source} ({args.side_name})")
     print(f"[*] Rib Model Mode     : {args.rib_mode}")
