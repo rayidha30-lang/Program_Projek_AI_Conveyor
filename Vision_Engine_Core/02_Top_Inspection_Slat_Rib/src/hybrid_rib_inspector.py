@@ -363,9 +363,9 @@ class HybridRibInspector:
         self.absence_frames = 0
         self.max_absence_tolerance = 8
 
-        # Zona Prime Evaluasi Konveyor (Pusat optik planar bebas distorsi lensa Y: 360 - 430 px)
-        self.prime_min_y = 360
-        self.prime_max_y = 430
+        # Zona Prime Evaluasi Konveyor (Pusat optik planar bebas distorsi lensa Y: 340 - 460 px)
+        self.prime_min_y = 340
+        self.prime_max_y = 460
         self.prime_pv_samples = []
         self.prime_sagitta_samples = []
         self.prime_inner_dev_samples = []
@@ -396,14 +396,13 @@ class HybridRibInspector:
         # Telemetri Akselerasi Perangkat Keras
         self.telemetry = HardwareTelemetry(sample_interval_sec=0.25) if HAS_TELEMETRY else None
 
-    def reset_counters(self):
-        """Mereset seluruh statistik hitungan sirip (Total Rib, OK, NG)."""
-        self.rib_count = 0
-        self.ok_count = 0
-        self.ng_count = 0
+        # Tracking kontinuitas posisi fisik bilah antar frame (Anti-Jump & Multi-Rib Disambiguation)
+        self._last_active_box = None
+        self._last_active_cy = None
+
+    def _reset_rib_session(self):
+        """Mereset buffer sampel metrologi saat transisi ke sirip baru."""
         self.last_presence = False
-        self.current_rib_status = None
-        self.absence_frames = 0
         self.active_rib_frames = 0
         self.active_rib_ok_frames = 0
         self.active_rib_ng_frames = 0
@@ -416,7 +415,18 @@ class HybridRibInspector:
         self.prime_sagitta_samples.clear()
         self.prime_inner_dev_samples.clear()
         self.prime_tip_dev_samples.clear()
+        self.current_rib_status = None
         self.last_ng_reason = None
+
+    def reset_counters(self):
+        """Mereset seluruh statistik hitungan sirip (Total Rib, OK, NG)."""
+        self.rib_count = 0
+        self.ok_count = 0
+        self.ng_count = 0
+        self.absence_frames = 0
+        self._last_active_box = None
+        self._last_active_cy = None
+        self._reset_rib_session()
 
     def set_mode(self, new_mode):
         """Mengubah mode operasional detektor saat runtime."""
@@ -427,6 +437,11 @@ class HybridRibInspector:
             else:
                 self.mode = new_mode.upper()
                 print(f"[HybridRibInspector] Mode diubah ke: {self.mode}")
+
+    def set_prime_zone(self, min_y, max_y):
+        """Memperbarui batas zona prime evaluasi sirip secara dinamis saat runtime."""
+        self.prime_min_y = int(min_y)
+        self.prime_max_y = int(max_y)
 
     def _letterbox_gpu(self, img_bgr, target_size):
         """
@@ -618,24 +633,29 @@ class HybridRibInspector:
                         cy = (y1 + y2) // 2
                         ar = bw / max(1.0, float(bh))
 
-                        rib_boxes.append({
-                            "box": [x1, y1, x2, y2],
-                            "conf": conf,
-                            "centroid": (int((x1 + x2) / 2), cy)
-                        })
-
+                        # Filter validitas bilah sirip:
+                        # 1. Batasi CY maksimum ke 680 px untuk melenyapkan balok rangka bawah mesin konveyor (Y > 750 px)
+                        # 2. Pastikan lebar dan rasio aspek bilah wajar
                         is_valid = (
                             (min_bw <= bw <= max_bw) and
                             (x1 >= min_x1 and x2 <= max_x2) and
                             (min_bh <= bh <= max_bh) and
                             (5.5 <= ar <= 35.0) and
-                            (cy >= zy1 - 35) and (cy <= zy2 + 35)
+                            (cy >= zy1 - 35) and (cy <= min(zy2 + 15, int(0.64 * h_f))) and
+                            (y1 <= int(0.61 * h_f))
                         )
 
                         if is_valid:
-                            # Seleksi berbasis kemiripan lebar fisik nominal (~1220 px) & skor confidence
+                            rib_boxes.append({
+                                "box": [x1, y1, x2, y2],
+                                "conf": conf,
+                                "centroid": (int((x1 + x2) / 2), cy)
+                            })
+                            # Seleksi berbasis kombinasi skor deteksi, kemiripan lebar, dan kedekatan ke prime zone
+                            prime_mid = (self.prime_min_y + self.prime_max_y) // 2
+                            dist_to_prime = abs(cy - prime_mid)
                             w_dev = abs(bw - nominal_w) / float(nominal_w)
-                            match_score = conf * (1.0 - min(0.5, w_dev))
+                            match_score = conf * (1.0 - min(0.4, w_dev)) - (dist_to_prime / 1200.0)
                             if match_score > best_match_score:
                                 best_match_score = match_score
                                 best_box = [x1, y1, x2, y2]
@@ -757,12 +777,12 @@ class HybridRibInspector:
             zx2 = min(w_f - 1, int(np.max(pts[:, 0])))
             zy2 = min(h_f - 1, int(np.max(pts[:, 1])))
         else:
-            # Default Zona Konveyor Foreground: X [5%, 95%], Y [26%, 79%]
-            # Memungkinkan deteksi rib di puncak konveyor (Y~300) dan memotong balok dasar konveyor (Y>850)
+            # Default Zona Konveyor Foreground: X [5%, 95%], Y [26%, 65%]
+            # Memungkinkan deteksi rib di puncak konveyor (Y~300) dan memotong balok dasar konveyor (Y>700)
             zx1 = int(0.05 * w_f)
             zy1 = int(0.26 * h_f)
             zx2 = int(0.95 * w_f)
-            zy2 = int(0.79 * h_f)
+            zy2 = int(0.65 * h_f)
 
         zone_rect = (zx1, zy1, zx2, zy2)
         focus_zone = (zx1, zy1, zx2, zy2)
@@ -804,16 +824,48 @@ class HybridRibInspector:
             else:
                 dual_det, dual_box, dual_h, dual_ratio, _ = self._last_dual_det
 
-        # 2. Gating Keputusan Awal
-        if self.mode == "HYBRID":
-            # Di mode HYBRID: YOLO memicu deteksi, dan dual-polarity memastikan ada ketebalan fisik
+        # 2. Gating Keputusan Awal & Pemilihan Box Kontinu (Anti-Jump)
+        if self.mode in ["HYBRID", "YOLO_ONLY"]:
+            if all_yolo_boxes and len(all_yolo_boxes) > 0:
+                best_tracked_box = None
+                min_track_dist = float("inf")
+
+                # Prioritas 1: Lanjutkan pelacakan bilah yang sama jika masih ada di dekat posisi terakhir (|ΔY| <= 45 px)
+                if getattr(self, "_last_active_cy", None) is not None:
+                    for yb in all_yolo_boxes:
+                        b = yb.get("box") if isinstance(yb, dict) else yb
+                        if b is not None:
+                            cy_cand = (b[1] + b[3]) // 2
+                            dist = abs(cy_cand - self._last_active_cy)
+                            if dist <= 45 and dist < min_track_dist:
+                                min_track_dist = dist
+                                best_tracked_box = b
+                                yolo_conf = yb.get("conf", yolo_conf) if isinstance(yb, dict) else yolo_conf
+
+                if best_tracked_box is not None:
+                    active_box = best_tracked_box
+                    yolo_det = True
+                else:
+                    # Prioritas 2: Jika tidak ada box yang dekat posisi lama, pilih box terdekat ke Prime Zone
+                    prime_mid_y = (self.prime_min_y + self.prime_max_y) // 2
+                    best_prime_box = None
+                    min_prime_dist = float("inf")
+                    for yb in all_yolo_boxes:
+                        b = yb.get("box") if isinstance(yb, dict) else yb
+                        if b is not None:
+                            cy_cand = (b[1] + b[3]) // 2
+                            dist_p = abs(cy_cand - prime_mid_y)
+                            if dist_p < min_prime_dist:
+                                min_prime_dist = dist_p
+                                best_prime_box = b
+                                yolo_conf = yb.get("conf", yolo_conf) if isinstance(yb, dict) else yolo_conf
+                    active_box = best_prime_box if best_prime_box is not None else yolo_box
+                    yolo_det = (active_box is not None)
+            else:
+                active_box = yolo_box
+
             is_candidate = yolo_det
-            reason = f"HYBRID: YOLO({yolo_conf:.2f})"
-            active_box = yolo_box
-        elif self.mode == "YOLO_ONLY":
-            is_candidate = yolo_det
-            reason = f"YOLO ONLY: Conf={yolo_conf:.2f}"
-            active_box = yolo_box
+            reason = f"HYBRID: YOLO({yolo_conf:.2f})" if self.mode == "HYBRID" else f"YOLO ONLY: Conf={yolo_conf:.2f}"
         else:  # DUAL_POLARITY_ONLY
             is_candidate = dual_det
             reason = f"DUAL-POLARITY ONLY: Ratio={dual_ratio*100:.0f}%, H={dual_h:.0f}px"
@@ -824,6 +876,18 @@ class HybridRibInspector:
         if active_box is not None and active_box[1] < zy1:
             is_candidate = False
             active_box = None
+
+        # Deteksi Transisi Bilah Fisik Baru (Spatial Centroid Continuity)
+        if active_box is not None:
+            curr_cy = (active_box[1] + active_box[3]) // 2
+            if getattr(self, "_last_active_cy", None) is not None:
+                delta_y = abs(curr_cy - self._last_active_cy)
+                # Jika koordinat Y melompat lebih dari 45 px atau melompat ke bawah (> 30 px):
+                # Ini adalah BILAH SIRIP BARU yang terpisah secara fisik!
+                if delta_y > 45 or (curr_cy - self._last_active_cy) > 30:
+                    self._reset_rib_session()
+            self._last_active_cy = curr_cy
+            self._last_active_box = active_box
 
         # 3. KONDISI: PLAT DATAR MELINTAS (TIDAK ADA CANDIDATE RIB)
         if not is_candidate or active_box is None:
@@ -854,21 +918,9 @@ class HybridRibInspector:
                     }
 
             # Sesi transit benar-benar berakhir (> 8 frame kosong antar bilah)
-            self.last_presence = False
-            self.active_rib_frames = 0
-            self.active_rib_ok_frames = 0
-            self.active_rib_ng_frames = 0
-            self.active_consec_ng = 0
-            self.active_max_consec_ng = 0
-            self.active_consec_ok = 0
-            self.active_pv_history.clear()
-            self.active_sagitta_history.clear()
-            self.prime_pv_samples.clear()
-            self.prime_sagitta_samples.clear()
-            self.prime_inner_dev_samples.clear()
-            self.prime_tip_dev_samples.clear()
-            self.current_rib_status = None
-            self.last_ng_reason = None
+            self._last_active_cy = None
+            self._last_active_box = None
+            self._reset_rib_session()
             return {
                 "status": "WAIT",
                 "object_type": "PLAT_DATAR",
@@ -1127,20 +1179,9 @@ class HybridRibInspector:
                         "yolo_boxes": all_yolo_boxes,
                         "elapsed_ms": (time.time() - t0) * 1000
                     }
-            self.last_presence = False
-            self.active_rib_frames = 0
-            self.active_rib_ok_frames = 0
-            self.active_rib_ng_frames = 0
-            self.active_consec_ng = 0
-            self.active_max_consec_ng = 0
-            self.active_pv_history.clear()
-            self.active_sagitta_history.clear()
-            self.prime_pv_samples.clear()
-            self.prime_sagitta_samples.clear()
-            self.prime_inner_dev_samples.clear()
-            self.prime_tip_dev_samples.clear()
-            self.current_rib_status = None
-            self.last_ng_reason = None
+            self._last_active_cy = None
+            self._last_active_box = None
+            self._reset_rib_session()
             return {
                 "status": "WAIT",
                 "object_type": "PLAT_DATAR",
@@ -1182,9 +1223,9 @@ class HybridRibInspector:
         self.active_rib_frames += 1
 
         # FULL-SPAN ANTI-TRUNCATION GATING:
-        # Menolak fitting kelengkungan jika kontur belum terbentang tip-to-tip (lebar < 880px atau coverage < 70%).
-        # Memotong rentang horizontal (X) secara matematis melipatgandakan Sagitta semu parabola.
-        full_span_valid = (w_span >= 880.0 and coverage >= 0.70)
+        # Menolak fitting kelengkungan jika kontur belum terbentang memadai (lebar < 680px atau coverage < 55%).
+        # Batas 680px menjamin robust terhadap pergeseran sudut kamera dan pencahayaan dimmer tanpa memicu distorsi sagitta semu.
+        full_span_valid = (w_span >= 680.0 and coverage >= 0.55)
 
         # Baseline Estimator (Theil-Sen Subsampled)
         step_eval = max(1, n_pts // 30)
@@ -1268,15 +1309,15 @@ class HybridRibInspector:
         transit_is_ok = not (curv_defect or dev_defect or tip_defect or flat_defect)
 
         # Registrasi Objek & Pembaruan Status Berbasis Konsensus Transaksional
-        if sample_count < 5:
+        if sample_count < 3:
             # Belum cukup sampel prime zone -> Tetap WAIT agar tidak memicu False NG prematur
             if self.current_rib_status is not None:
                 status = self.current_rib_status
             else:
                 status = "WAIT"
-            eval_msg = f"Stabilisasi Prime Zone ({sample_count}/5 sampel | Span={w_span:.0f}px)"
+            eval_msg = f"Stabilisasi Prime Zone ({sample_count}/3 sampel | Span={w_span:.0f}px)"
         else:
-            # Sampel prime zone cukup (>= 5 sampel) -> Tentukan vonis pertama untuk sirip ini
+            # Sampel prime zone cukup (>= 3 sampel) -> Tentukan vonis definitif untuk sirip ini (Monotonik & Non-Flipping)
             if self.current_rib_status is None:
                 self.rib_count += 1
                 if transit_is_ok:
@@ -1285,16 +1326,6 @@ class HybridRibInspector:
                 else:
                     self.current_rib_status = "NG"
                     self.ng_count += 1
-            else:
-                # Revisi dinamis hanya jika didukung oleh sampel median jangka panjang (>= 8-10 sampel)
-                if self.current_rib_status == "OK" and not transit_is_ok and sample_count >= 8:
-                    self.current_rib_status = "NG"
-                    self.ok_count = max(0, self.ok_count - 1)
-                    self.ng_count += 1
-                elif self.current_rib_status == "NG" and transit_is_ok and sample_count >= 10:
-                    self.current_rib_status = "OK"
-                    self.ng_count = max(0, self.ng_count - 1)
-                    self.ok_count += 1
 
             status = self.current_rib_status
             if status == "OK":
@@ -1322,7 +1353,7 @@ class HybridRibInspector:
             "is_rib_present": True,
             "is_ok": (status == "OK"),
             "is_ng": (status == "NG"),
-            "final_consensus_ready": bool(sample_count >= 5),
+            "final_consensus_ready": bool(sample_count >= 3),
             "rib_count": self.rib_count,
             "mode": self.mode,
             "message": eval_msg,

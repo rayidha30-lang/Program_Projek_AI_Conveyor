@@ -851,6 +851,16 @@ def _run_top_worker(
                 elif key in [ord("r"), ord("R")]:
                     inspector.reset_counters()
                     print("\n[*] [CAM-01 TOP] Counter QC & Cache Deduplikasi di-reset ke 0.\n")
+                elif key in [ord("p"), ord("P")]:
+                    if hasattr(inspector, "toggle_profile"):
+                        inspector.toggle_profile()
+                elif key in [ord("u"), ord("U"), ord("0")]:
+                    if hasattr(inspector, "restore_default_profile"):
+                        inspector.restore_default_profile()
+                elif key in [ord("k"), ord("K")]:
+                    if hasattr(inspector, "start_calibration"):
+                        inspector.start_calibration(duration_frames=60)
+                        print("\n[*] [CAM-01 TOP] 🔄 Memulai Kalibrasi Otomatis Sudut & Lebar Konveyor (60 Frame / ~3 Detik)...\n")
                 elif key in [ord("v"), ord("V")]:
                     new_src = cycle_next_video(cap_src)
                     if new_src and str(new_src) != str(cap_src):
@@ -1452,8 +1462,8 @@ def _run_threaded_engine(args):
         t_prev = time.time()
         fps_hist = []
 
-        try:
-            while not stop_event.is_set():
+        while not stop_event.is_set():
+            try:
                 if cap_top is None or not cap_top.isOpened():
                     time.sleep(0.02)
                     continue
@@ -1516,12 +1526,11 @@ def _run_threaded_engine(args):
                     top_state["inspect_res"] = inspect_res
                     top_state["disp_id"] += 1
                     top_state["has_new"] = True
-        except Exception as e:
-            import traceback
-            print(f"[ERROR Thread-TopInspector] {e}")
-            traceback.print_exc()
-            with top_lock:
-                top_state["status"] = "ERROR"
+            except Exception as e:
+                import traceback
+                print(f"\n[WARN Thread-TopInspector] Transient exception caught (auto-recovered): {e}")
+                traceback.print_exc()
+                time.sleep(0.01)
 
     # Worker Thread 2: Side Inspector
     def _side_loop():
@@ -1530,8 +1539,8 @@ def _run_threaded_engine(args):
         fps_hist = []
         last_render_side = 0.0
 
-        try:
-            while not stop_event.is_set():
+        while not stop_event.is_set():
+            try:
                 if cap_side is None or not cap_side.isOpened():
                     time.sleep(0.02)
                     continue
@@ -1588,12 +1597,11 @@ def _run_threaded_engine(args):
                     side_state["display"] = display_frame
                     side_state["disp_id"] += 1
                     side_state["has_new"] = True
-        except Exception as e:
-            import traceback
-            print(f"[ERROR Thread-SideInspector] {e}")
-            traceback.print_exc()
-            with side_lock:
-                side_state["status"] = "ERROR"
+            except Exception as e:
+                import traceback
+                print(f"\n[WARN Thread-SideInspector] Transient exception caught (auto-recovered): {e}")
+                traceback.print_exc()
+                time.sleep(0.01)
 
     # Start Worker Threads
     threads = []
@@ -1727,6 +1735,19 @@ def _run_threaded_engine(args):
                 if side_inspector:
                     side_inspector.reset_session()
                 print("\n[*] Counter QC & Cache Deduplikasi kedua kamera di-reset ke 0.\n")
+            elif key in [ord("p"), ord("P")]:
+                if top_inspector and hasattr(top_inspector, "toggle_profile"):
+                    with top_lock:
+                        top_inspector.toggle_profile()
+            elif key in [ord("u"), ord("U"), ord("0")]:
+                if top_inspector and hasattr(top_inspector, "restore_default_profile"):
+                    with top_lock:
+                        top_inspector.restore_default_profile()
+            elif key in [ord("k"), ord("K")]:
+                if top_inspector and hasattr(top_inspector, "start_calibration"):
+                    with top_lock:
+                        top_inspector.start_calibration(duration_frames=60)
+                    print("\n[*] [CAM-01 TOP] 🔄 Memulai Kalibrasi Otomatis Sudut & Lebar Konveyor (60 Frame / ~3 Detik)...\n")
             elif key in [ord("v"), ord("V")]:
                 new_top = cycle_next_video(top_source_path)
                 if new_top and str(new_top) != str(top_source_path):
@@ -1976,6 +1997,9 @@ Shortcut Keyboard Saat Berjalan:
   [2] / [O]         : Buka File Explorer dialog untuk mengganti video CAM-02 SIDE
   [D]               : Saklar Database Logging & Notifikasi Teams (ON / OFF)
   [R]               : Reset counter QC & cache deduplikasi ke 0
+  [K]               : Jalankan Kalibrasi Otomatis Sudut & Lebar Konveyor (60 frame / ~3 detik)
+  [P]               : Beralih Profil Parameter (DEFAULT STABIL <-> HASIL KALIBRASI)
+  [U] / [0]         : Pulihkan seketika ke Profil Default Stabil (Golden Baseline)
         """
     )
     env_mode = os.environ.get("BENCHMARK_MODE", "dual")
@@ -2176,6 +2200,7 @@ Shortcut Keyboard Saat Berjalan:
     print(f"[*] CAM-01 Top Source  : {os.path.basename(str(args.top_source)) if os.path.exists(str(args.top_source)) else args.top_source}")
     print(f"[*] {args.side_cam_id} Side Source : {os.path.basename(str(args.side_source)) if os.path.exists(str(args.side_source)) else args.side_source} ({args.side_name})")
     print(f"[*] Rib Model Mode     : {args.rib_mode}")
+    print(f"[*] Profil Parameter   : DEFAULT_STABIL (Awal Pabrik - Tekan [P] untuk Kalibrasi)")
     print(f"[*] Durasi Uji Coba    : {'Tak Terbatas (Tekan [Q] / Ctrl+C)' if args.duration <= 0 else f'{args.duration} detik'}")
     print(f"[*] Database Logging   : {'AKTIF [RECORDING & TEAMS NOTIFIER]' if args.enable_db else 'OFF (DRY-RUN BENCHMARK - Tekan [D] di jendela untuk aktifkan)'}")
     print("=" * 86)

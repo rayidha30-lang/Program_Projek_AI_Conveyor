@@ -34,6 +34,8 @@ import threading
 import queue
 import cv2
 import numpy as np
+import math
+from datetime import datetime
 
 # Tambahkan direktori saat ini ke sys.path agar impor modul selalu berhasil
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -129,6 +131,7 @@ from hough_stitching_inspector import (
     HoughStitchingInspector,
     get_adaptive_slat_polygon
 )
+from conveyor_motion_calibrator import ConveyorMotionCalibrator
 
 # Impor Modul Jembatan Database SQLite
 DB_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", "..", "..", "Database"))
@@ -290,12 +293,20 @@ class CombinedTopInspector:
         rib_mode="HYBRID",
         rib_model_path=None,
         device=None,
-        enable_db=False
+        enable_db=False,
+        force_default_on_start=True
     ):
         base_dir = os.path.dirname(CURRENT_DIR)
         if config_path is None:
             config_path = os.path.join(base_dir, "configs", "top_inspection_config.json")
         self.config_path = config_path
+        self.default_config_path = os.path.join(os.path.dirname(config_path), "top_inspection_config.default.json")
+        self.calibrated_config_path = os.path.join(os.path.dirname(config_path), "top_inspection_config.calibrated.json")
+        self.active_profile_name = "DEFAULT_STABIL"
+        self.profile_banner_text = ""
+        self.profile_banner_timer = 0
+        self.rect_matrix = None
+        self.motion_calibrator = None
         self.device = device
 
         # Inisialisasi Database Bridge (Default: False / Dry Run)
@@ -322,11 +333,38 @@ class CombinedTopInspector:
         self.slat_polygon = None
         self.rib_zone = None
 
-        # Muat konfigurasi dari JSON jika tersedia
-        if config_path and os.path.exists(config_path):
+        # Muat konfigurasi awal: prioritaskan profil DEFAULT_STABIL saat startup fresh
+        cfg_to_load = None
+        loaded_path = config_path
+        if force_default_on_start and os.path.exists(self.default_config_path):
+            try:
+                with open(self.default_config_path, "r") as f:
+                    cfg_to_load = json.load(f)
+                loaded_path = self.default_config_path
+                self.active_profile_name = "DEFAULT_STABIL"
+            except Exception:
+                pass
+
+        if cfg_to_load is None and config_path and os.path.exists(config_path):
             try:
                 with open(config_path, "r") as f:
-                    cfg = json.load(f)
+                    cfg_to_load = json.load(f)
+                loaded_path = config_path
+                if "profile_name" in cfg_to_load:
+                    self.active_profile_name = cfg_to_load["profile_name"]
+            except Exception:
+                pass
+
+        if cfg_to_load is not None:
+            try:
+                cfg = cfg_to_load
+                if "profile_name" in cfg:
+                    self.active_profile_name = cfg["profile_name"]
+
+                if "rectification_matrix" in cfg and cfg["rectification_matrix"] is not None:
+                    self.rect_matrix = np.array(cfg["rectification_matrix"], dtype=np.float32)
+                else:
+                    self.rect_matrix = None
 
                 if "calibration_profile" in cfg:
                     cp = cfg["calibration_profile"]
@@ -345,6 +383,8 @@ class CombinedTopInspector:
                 rib_dev = float(th.get("rib_dev_threshold", th.get("rib_max_dev_threshold", rib_dev)))
                 rib_tip = float(th.get("rib_tip_threshold", rib_tip))
                 rib_conf = float(th.get("rib_conf_threshold", rib_conf))
+                self.config_rib_prime_min = th.get("rib_prime_min_y", None)
+                self.config_rib_prime_max = th.get("rib_prime_max_y", None)
 
                 if "rib_polygon" in cfg and len(cfg["rib_polygon"]) >= 4:
                     self.rib_zone = cfg["rib_polygon"]
@@ -352,7 +392,7 @@ class CombinedTopInspector:
                 if "slat_polygon" in cfg and len(cfg["slat_polygon"]) >= 4:
                     self.slat_polygon = cfg["slat_polygon"]
 
-                print(f"[*] Konfigurasi Terpadu dimuat dari: {os.path.basename(config_path)}")
+                print(f"[*] Konfigurasi Terpadu dimuat dari: {os.path.basename(loaded_path)} [PROFIL: {self.active_profile_name}]")
             except Exception as e:
                 print(f"[!] Gagal membaca file config: {e}")
 
@@ -409,6 +449,22 @@ class CombinedTopInspector:
         self.rib_inspector.scale_factor_mm_per_px = self.scale_factor_mm_per_px
         self.rib_inspector.scale_factor_y_mm_per_px = self.scale_factor_y_mm_per_px
 
+        # Konfigurasi Prime Zone Sirip (Adaptif & Fleksibel)
+        cfg_pmin = getattr(self, "config_rib_prime_min", None)
+        cfg_pmax = getattr(self, "config_rib_prime_max", None)
+        if cfg_pmin is not None and cfg_pmax is not None:
+            self.rib_inspector.set_prime_zone(cfg_pmin, cfg_pmax)
+        else:
+            self.rib_inspector.set_prime_zone(360, 430)
+
+        # Variabel State Kalibrasi Cepat Konveyor (Quick Re-Alignment)
+        self.is_calibrating = False
+        self.calib_frames_target = 60
+        self.calib_buffer = []
+        self.calib_banner_timer = 0
+        self.calib_status_msg = ""
+        self._last_fps = 30.0
+
         # State Early-Catch & Peak-Hold Latch (Proteksi Oklusi Plat Sebelum Sirip)
         self.slat_history_samples = []
         self.latched_slat_data = None
@@ -423,35 +479,299 @@ class CombinedTopInspector:
         self._last_emitted_slat_id = None
         self._last_emitted_rib_id = None
 
-        # Cache batas vertikal gerbang plat slat
-        self.slat_y_min = None
-        self.slat_y_max = None
+        # Thread synchronization locks untuk inspeksi & visualisasi aman (No Freeze)
+        self._inspect_lock = threading.RLock()
+        self._render_lock = threading.Lock()
+
+        # Resolusi citra nominal & cache batas vertikal gerbang plat slat (non-None float)
+        self._last_w_f = 1920
+        self._last_h_f = 1080
+        self.slat_y_min = 0.50 * 1080.0
+        self.slat_y_max = 0.70 * 1080.0
+        self._update_slat_y_bounds()
 
         # Pre-allocated zero-copy canvas buffer (1000 x 820 px: 520 view + 300 HUD)
         self._screen_buf = np.zeros((820, 1000, 3), dtype=np.uint8)
 
+    def _update_slat_y_bounds(self, w_f=None, h_f=None):
+        """Menghitung batas vertikal min/max gerbang slat secara aman tanpa pernah None."""
+        if w_f is not None and w_f > 0:
+            self._last_w_f = int(w_f)
+        if h_f is not None and h_f > 0:
+            self._last_h_f = int(h_f)
+        h = float(getattr(self, "_last_h_f", 1080))
+        if self.slat_polygon and len(self.slat_polygon) >= 4:
+            pts_y = [p[1] * h if p[1] <= 1.0 else p[1] for p in self.slat_polygon]
+            self.slat_y_min = float(min(pts_y))
+            self.slat_y_max = float(max(pts_y))
+        else:
+            self.slat_y_min = 0.50 * h
+            self.slat_y_max = 0.70 * h
+
     def reset_counters(self):
         """Mereset seluruh statistik QC (Slat dan Rib) ke nilai 0."""
-        self.slat_inspector.reset_counters()
-        self.rib_inspector.reset_counters()
-        self.slat_history_samples.clear()
-        self.latched_slat_data = None
-        self.latched_hold_frames = 0
-        self.logged_slat_id = None
-        self.logged_rib_id = None
-        self._best_top_candidate = None
-        self._current_slat_cycle_id = None
-        self._current_rib_cycle_id = None
-        self._last_emitted_slat_id = None
-        self._last_emitted_rib_id = None
-        if self.db_bridge is not None and hasattr(self.db_bridge, "reset_entity_cache"):
-            self.db_bridge.reset_entity_cache()
+        with self._inspect_lock:
+            self.slat_inspector.reset_counters()
+            self.rib_inspector.reset_counters()
+            self.slat_history_samples.clear()
+            self.latched_slat_data = None
+            self.latched_hold_frames = 0
+            self.logged_slat_id = None
+            self.logged_rib_id = None
+            self._best_top_candidate = None
+            self._current_slat_cycle_id = None
+            self._current_rib_cycle_id = None
+            self._last_emitted_slat_id = None
+            self._last_emitted_rib_id = None
+            if self.db_bridge is not None and hasattr(self.db_bridge, "reset_entity_cache"):
+                self.db_bridge.reset_entity_cache()
 
     def toggle_db(self):
         """Membalik status saklar database logging (ON <-> OFF)."""
         if self.db_bridge is not None:
             return self.db_bridge.toggle()
         return False
+
+    def apply_config_dict(self, cfg):
+        """Menerapkan konfigurasi dictionary ke Slat & Rib Inspector saat runtime."""
+        if not cfg or not isinstance(cfg, dict):
+            return False
+
+        with self._inspect_lock:
+            # Terapkan Matriks Rektifikasi Virtual Citra (Metode 4)
+            if "rectification_matrix" in cfg and cfg["rectification_matrix"] is not None:
+                self.rect_matrix = np.array(cfg["rectification_matrix"], dtype=np.float32)
+            else:
+                self.rect_matrix = None
+
+            th = cfg.get("thresholds", {})
+            if "max_flatness_pv" in th:
+                self.slat_inspector.max_flatness_pv = float(th["max_flatness_pv"])
+            if "max_sagitta" in th:
+                self.slat_inspector.max_sagitta = float(th["max_sagitta"])
+            if "max_center_void" in th:
+                self.slat_inspector.max_center_void = int(th["max_center_void"])
+
+            if "rib_pv_threshold" in th:
+                self.rib_inspector.pv_thresh = float(th["rib_pv_threshold"])
+            if "rib_sagitta_threshold" in th:
+                self.rib_inspector.sagitta_thresh = float(th["rib_sagitta_threshold"])
+            if "rib_dev_threshold" in th or "rib_max_dev_threshold" in th:
+                dev_val = th.get("rib_dev_threshold", th.get("rib_max_dev_threshold"))
+                self.rib_inspector.dev_thresh = float(dev_val)
+            if "rib_tip_threshold" in th:
+                self.rib_inspector.tip_thresh = float(th["rib_tip_threshold"])
+
+            pmin = th.get("rib_prime_min_y", 360)
+            pmax = th.get("rib_prime_max_y", 430)
+            self.rib_inspector.set_prime_zone(pmin, pmax)
+
+            if "slat_polygon" in cfg and len(cfg["slat_polygon"]) >= 4:
+                self.slat_polygon = cfg["slat_polygon"]
+                self._update_slat_y_bounds()
+
+            if "rib_polygon" in cfg and len(cfg["rib_polygon"]) >= 4:
+                self.rib_zone = cfg["rib_polygon"]
+
+            return True
+
+    def restore_default_profile(self):
+        """
+        Mengembalikan konfigurasi ke Profil Default Stabil (Baseline Terbukti).
+        Memulihkan file config aktif dan menerapkan langsung ke memory inspector.
+        """
+        if not os.path.exists(self.default_config_path):
+            print(f"[!] File default config tidak ditemukan: {self.default_config_path}")
+            return False
+
+        with self._inspect_lock:
+            try:
+                with open(self.default_config_path, "r") as f:
+                    cfg_default = json.load(f)
+
+                self.apply_config_dict(cfg_default)
+
+                with open(self.config_path, "w") as f:
+                    json.dump(cfg_default, f, indent=2)
+
+                self.active_profile_name = "DEFAULT_STABIL"
+                self.profile_banner_text = "PROFIL PULIH: DEFAULT STABIL (Tanpa Rektifikasi)"
+                self.profile_banner_timer = 90
+                print("\n" + "=" * 70)
+                print("[CombinedTopInspector] ✅ BERHASIL DIKEMBALIKAN KE PROFIL DEFAULT STABIL!")
+                print(f"[*] Config Aktif: {os.path.basename(self.config_path)} (Dipulihkan dari .default.json)")
+                print(f"[*] Rektifikasi : {'AKTIF' if self.rect_matrix is not None else 'NON-AKTIF (Asli)'}")
+                print(f"[*] Parameter   : Rib PV={self.rib_inspector.pv_thresh:.1f}px, Tip={self.rib_inspector.tip_thresh:.1f}px, Prime=[{self.rib_inspector.prime_min_y}, {self.rib_inspector.prime_max_y}]")
+                print("=" * 70 + "\n")
+                return True
+            except Exception as e:
+                print(f"[!] Gagal restore default profile: {e}")
+                return False
+
+    def load_calibrated_profile(self):
+        """
+        Memuat konfigurasi dari Profil Hasil Kalibrasi Otomatis ([K]).
+        """
+        if not os.path.exists(self.calibrated_config_path):
+            print(f"\n[!] File calibrated config belum ada: {self.calibrated_config_path}")
+            print("    Silakan jalankan kalibrasi konveyor [K] terlebih dahulu.\n")
+            return False
+
+        with self._inspect_lock:
+            try:
+                with open(self.calibrated_config_path, "r") as f:
+                    cfg_calib = json.load(f)
+
+                self.apply_config_dict(cfg_calib)
+
+                with open(self.config_path, "w") as f:
+                    json.dump(cfg_calib, f, indent=2)
+
+                self.active_profile_name = "HASIL_KALIBRASI"
+                self.profile_banner_text = "PROFIL AKTIF: HASIL KALIBRASI (Rektifikasi Aktif)"
+                self.profile_banner_timer = 90
+                print("\n" + "=" * 70)
+                print("[CombinedTopInspector] 🔄 BERALIH KE PROFIL HASIL KALIBRASI!")
+                print(f"[*] Config Aktif: {os.path.basename(self.config_path)} (Dimuat dari .calibrated.json)")
+                print(f"[*] Rektifikasi : {'AKTIF' if self.rect_matrix is not None else 'NON-AKTIF'}")
+                print(f"[*] Parameter   : Rib PV={self.rib_inspector.pv_thresh:.1f}px, Tip={self.rib_inspector.tip_thresh:.1f}px, Prime=[{self.rib_inspector.prime_min_y}, {self.rib_inspector.prime_max_y}]")
+                print("=" * 70 + "\n")
+                return True
+            except Exception as e:
+                print(f"[!] Gagal memuat calibrated profile: {e}")
+                return False
+
+    def toggle_profile(self):
+        """
+        Beralih bergantian antara profil DEFAULT_STABIL <-> HASIL_KALIBRASI.
+        """
+        with self._inspect_lock:
+            if self.active_profile_name == "DEFAULT_STABIL":
+                if os.path.exists(self.calibrated_config_path):
+                    return self.load_calibrated_profile()
+                else:
+                    print("\n[!] Profil Kalibrasi belum tersedia. Jalankan kalibrasi [K] terlebih dahulu.\n")
+                    return False
+            else:
+                return self.restore_default_profile()
+
+    def start_calibration(self, duration_frames=60):
+        """Memulai sesi kalibrasi konveyor multi-frame (default 60 frame / ~2-3 detik)."""
+        with self._inspect_lock:
+            if not hasattr(self, "motion_calibrator") or self.motion_calibrator is None:
+                self.motion_calibrator = ConveyorMotionCalibrator(target_tilt_deg=0.90, target_cx=960.0)
+            self.motion_calibrator.reset()
+            self.is_calibrating = True
+            self.calib_frames_target = max(30, int(duration_frames))
+            self.calib_buffer.clear()
+            self.calib_status_msg = f"Mengumpulkan frame konveyor (0/{self.calib_frames_target})..."
+            self.calib_banner_timer = 0
+            print(f"\n[*] [CombinedTopInspector] 🔄 Memulai Kalibrasi Konveyor ({self.calib_frames_target} frame)...")
+
+    def _process_calibration_frame(self, frame):
+        """Menampung frame citra untuk proses kalibrasi."""
+        if not self.is_calibrating:
+            return
+        if frame is not None and frame.size > 0:
+            self.calib_buffer.append(frame.copy())
+            self.calib_status_msg = f"Mengumpulkan frame konveyor ({len(self.calib_buffer)}/{self.calib_frames_target})..."
+
+        if len(self.calib_buffer) >= self.calib_frames_target:
+            self._finish_calibration()
+
+    def _finish_calibration(self):
+        """
+        Menganalisis frame kalibrasi menggunakan ConveyorMotionCalibrator (Metode 4: Hybrid Rectification).
+        Menghasilkan Matriks Affine Rektifikasi (M_rect), menyelaraskan kamera baru ke Golden Baseline,
+        dan menyimpan profil terkalibrasi ke top_inspection_config.calibrated.json.
+        """
+        if not self.calib_buffer:
+            self.is_calibrating = False
+            return
+
+        with self._inspect_lock:
+            try:
+                if not hasattr(self, "motion_calibrator") or self.motion_calibrator is None:
+                    self.motion_calibrator = ConveyorMotionCalibrator(target_tilt_deg=0.90, target_cx=960.0)
+
+                calib_res = self.motion_calibrator.calibrate(self.calib_buffer)
+                if not calib_res.get("success", False):
+                    raise RuntimeError(calib_res.get("error", "Gagal menghitung matriks kalibrasi."))
+
+                # Pasang matriks rektifikasi langsung ke memori runtime
+                m_rect_list = calib_res["rectification_matrix"]
+                self.rect_matrix = np.array(m_rect_list, dtype=np.float32)
+
+                # Muat struktur konfigurasi golden default untuk menjaga integritas seluruh batas QC
+                cfg_data = {}
+                if os.path.exists(self.default_config_path):
+                    try:
+                        with open(self.default_config_path, "r") as f:
+                            cfg_data = json.load(f)
+                    except Exception:
+                        pass
+                if not cfg_data and os.path.exists(self.config_path):
+                    try:
+                        with open(self.config_path, "r") as f:
+                            cfg_data = json.load(f)
+                    except Exception:
+                        pass
+
+                # Sisipkan matriks rektifikasi & metadata kalibrasi
+                cfg_data["profile_name"] = "HASIL_KALIBRASI"
+                cfg_data["description"] = "Profil Parameter Hasil Kalibrasi Otomatis Kamera Top (Virtual Rectification)"
+                cfg_data["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cfg_data["rectification_matrix"] = m_rect_list
+
+                if "thresholds" not in cfg_data:
+                    cfg_data["thresholds"] = {}
+                cfg_data["thresholds"]["bracket_tilt_deg"] = calib_res["measured_tilt_deg"]
+
+                if "calibration_profile" not in cfg_data:
+                    cfg_data["calibration_profile"] = {}
+                cfg_data["calibration_profile"].update({
+                    "calibrated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "measured_tilt_deg": calib_res["measured_tilt_deg"],
+                    "target_tilt_deg": calib_res["target_tilt_deg"],
+                    "angle_correction_deg": calib_res["angle_correction_deg"],
+                    "conveyor_center_x": calib_res["conveyor_center_x"],
+                    "lateral_offset_px": calib_res["lateral_offset_px"],
+                    "left_rail_px": calib_res["left_rail_px"],
+                    "right_rail_px": calib_res["right_rail_px"],
+                    "conveyor_width_px": calib_res["conveyor_width_px"],
+                    "motion_sample_count": calib_res["motion_sample_count"],
+                })
+
+                # Simpan ke config aktif dan file calibrated.json
+                with open(self.config_path, "w") as f:
+                    json.dump(cfg_data, f, indent=2)
+
+                if hasattr(self, "calibrated_config_path") and self.calibrated_config_path:
+                    with open(self.calibrated_config_path, "w") as f:
+                        json.dump(cfg_data, f, indent=2)
+
+                self.active_profile_name = "HASIL_KALIBRASI"
+                self.calib_status_msg = calib_res["status_message"]
+                self.calib_banner_timer = 150
+                self.profile_banner_text = f"KALIBRASI SUKSES: Koreksi {calib_res['angle_correction_deg']:+.2f} deg, Geser {calib_res['lateral_offset_px']:+.1f} px"
+                self.profile_banner_timer = 150
+
+                print("\n" + "=" * 70)
+                print("[CombinedTopInspector] ✅ KALIBRASI OTOMATIS KONVEYOR SELESAI!")
+                print(f"[*] Sudut Terukur    : {calib_res['measured_tilt_deg']:+.3f}° (Target Golden: {calib_res['target_tilt_deg']:+.3f}°)")
+                print(f"[*] Koreksi Rotasi  : {calib_res['angle_correction_deg']:+.3f}° (Affine Warp M_rect)")
+                print(f"[*] Pusat Konveyor  : X={calib_res['conveyor_center_x']:.1f} px (Offset: {calib_res['lateral_offset_px']:+.1f} px)")
+                print(f"[*] Lebar Rel       : {calib_res['conveyor_width_px']} px (Kiri: {calib_res['left_rail_px']} px, Kanan: {calib_res['right_rail_px']} px)")
+                print(f"[*] Sampel Gerak    : {calib_res['motion_sample_count']} vektor Optical Flow terverifikasi")
+                print(f"[*] Profil Tersimpan: {os.path.basename(self.calibrated_config_path)}")
+                print("=" * 70 + "\n")
+            except Exception as err:
+                self.calib_status_msg = f"Gagal kalibrasi: {err}"
+                self.calib_banner_timer = 90
+                print(f"\n[!] [CombinedTopInspector] Gagal kalibrasi konveyor: {err}\n")
+            finally:
+                self.calib_buffer.clear()
+                self.is_calibrating = False
 
     def is_db_enabled(self):
         """Mengecek apakah database logging aktif."""
@@ -466,7 +786,10 @@ class CombinedTopInspector:
         """
         if frame_raw is None:
             return None
-        ann = frame_raw.copy()
+        if getattr(self, "rect_matrix", None) is not None:
+            ann = cv2.warpAffine(frame_raw, self.rect_matrix, (frame_raw.shape[1], frame_raw.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        else:
+            ann = frame_raw.copy()
         h_f, w_f = ann.shape[:2]
 
         slat_res = inspect_res.get("slat_res", {}) if inspect_res else {}
@@ -711,10 +1034,11 @@ class CombinedTopInspector:
         is_slat_ng = bool(slat_res.get("is_ng", False)) and (slat_res.get("status") == "NG")
         is_rib_ng = bool(rib_res.get("is_ng", False)) and (rib_res.get("status") == "NG")
 
-        # Filter eliminasi false alarm: Abaikan vonis NG jika kontur garis sirip belum membentang penuh (tip-to-tip < 880px)
+        # Filter eliminasi false alarm: Abaikan vonis NG jika kontur garis sirip belum membentang penuh
         rib_xs = rib_res.get("xs_contour")
         rib_span = float(rib_xs[-1] - rib_xs[0]) if (rib_xs is not None and len(rib_xs) > 10) else 0.0
-        if is_rib_ng and rib_span < 880.0:
+        min_span_thresh = min(750.0, 0.45 * frame_raw.shape[1]) if (frame_raw is not None and frame_raw.ndim >= 2) else 750.0
+        if is_rib_ng and rib_span < min_span_thresh:
             is_rib_ng = False
 
         if not is_slat_ng and not is_rib_ng:
@@ -773,8 +1097,12 @@ class CombinedTopInspector:
         Menjalankan KEDUA inspeksi secara bebarengan (bersamaan pada setiap frame):
         1. HoughStitchingInspector memproses gerbang celah plat slat.
         2. HybridRibInspector memproses zona gerbang sirip.
-        Kedua hasil dikembalikan bersamaan sehingga tidak ada garis atau ROI yang hilang!
+        Kedua hasil dikembalikan bersamaan dengan thread-safety penuh (bebas race condition).
         """
+        with self._inspect_lock:
+            return self._inspect_internal(frame, simulate_bending=simulate_bending)
+
+    def _inspect_internal(self, frame, simulate_bending=False):
         t0 = time.time()
         if frame is None or frame.size == 0:
             return {
@@ -786,24 +1114,38 @@ class CombinedTopInspector:
 
         h_f, w_f = frame.shape[:2]
 
+        # Proses frame kalibrasi jika mode kalibrasi sedang aktif
+        if getattr(self, "is_calibrating", False):
+            self._process_calibration_frame(frame)
+        if getattr(self, "calib_banner_timer", 0) > 0:
+            self.calib_banner_timer -= 1
+        if getattr(self, "profile_banner_timer", 0) > 0:
+            self.profile_banner_timer -= 1
+
         # 1. Tentukan ROI Plat Slat adaptif jika belum diinisialisasi
         if self.slat_polygon is None:
             self.slat_polygon, trig_box, _ = get_adaptive_slat_polygon(w_f, h_f, self.config_path)
             self.slat_inspector.trigger_box = trig_box
+            self._update_slat_y_bounds(w_f, h_f)
 
         if not hasattr(self, "slat_y_min") or self.slat_y_min is None:
-            slat_pts = []
-            for p in self.slat_polygon:
-                px = p[0] * w_f if p[0] <= 1.0 else p[0]
-                py = p[1] * h_f if p[1] <= 1.0 else p[1]
-                slat_pts.append([px, py])
-            slat_pts = np.array(slat_pts)
-            self.slat_y_min = float(np.min(slat_pts[:, 1]))
-            self.slat_y_max = float(np.max(slat_pts[:, 1]))
+            self._update_slat_y_bounds(w_f, h_f)
+
+        # Virtual Image Rectification (Metode 4) jika profil terkalibrasi aktif
+        if getattr(self, "rect_matrix", None) is not None:
+            frame_inspected = cv2.warpAffine(
+                frame,
+                self.rect_matrix,
+                (w_f, h_f),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE
+            )
+        else:
+            frame_inspected = frame
 
         # 2. JALANKAN INSPEKSI SIRIP (HYBRID RIB PADA GPU) TERLEBIH DAHULU
         rib_res = self.rib_inspector.inspect_frame(
-            frame,
+            frame_inspected,
             zone_poly=self.rib_zone,
             simulate_bending=simulate_bending
         )
@@ -813,7 +1155,7 @@ class CombinedTopInspector:
         # 3. MASKING DINAMIS BILAH SIRIP DENGAN NEUTRAL SLAT TEXTURE FILL
         # Melenyapkan kontur bilah sirip & las kaki bilah secara absolut dari citra plat slat
         # dengan mengisi seluruh bounding box sirip menggunakan warna median plat slat sekitar.
-        frame_for_slat = frame
+        frame_for_slat = frame_inspected
         is_slat_occluded = False
 
         # Kumpulkan semua bounding box sirip (active_box + seluruh deteksi YOLO)
@@ -826,11 +1168,13 @@ class CombinedTopInspector:
                 all_boxes_to_mask.append(b)
 
         if len(all_boxes_to_mask) > 0:
-            frame_for_slat = frame.copy()
+            frame_for_slat = frame_inspected.copy()
             for box in all_boxes_to_mask:
                 bx1, by1, bx2, by2 = box
-                # Cek apakah bilah sirip berada di dalam atau mendekati gerbang inspeksi plat slat
-                if by2 >= (self.slat_y_min - 35) and by1 <= (self.slat_y_max + 35):
+                # Cek apakah bilah sirip berada di dalam atau mendekati gerbang inspeksi plat slat (aman tanpa None)
+                y_min_gate = float(getattr(self, "slat_y_min", None) or (0.50 * h_f))
+                y_max_gate = float(getattr(self, "slat_y_max", None) or (0.70 * h_f))
+                if by2 >= (y_min_gate - 35) and by1 <= (y_max_gate + 35):
                     is_slat_occluded = True
 
                 # Ambil sampel warna bersih plat slat dari bawah bilah sirip (atau dari atas jika di dasar frame)
@@ -1053,6 +1397,24 @@ class CombinedTopInspector:
         sync_realtime=True
     ):
         """
+        Merender visualisasi terpadu pada resolusi asli frame kamera dengan proteksi thread lock.
+        """
+        with self._render_lock:
+            return self._render_combined_dashboard_internal(
+                frame, inspect_result, fps, is_paused, frame_idx, total_frames, sync_realtime
+            )
+
+    def _render_combined_dashboard_internal(
+        self,
+        frame,
+        inspect_result,
+        fps=30.0,
+        is_paused=False,
+        frame_idx=0,
+        total_frames=0,
+        sync_realtime=True
+    ):
+        """
         Merender visualisasi terpadu pada resolusi asli frame kamera:
         1. Gerbang Plat Slat + Garis Celah Terstitching (Terproyeksi Persis di Celah Fisik Plat).
         2. Bounding Box Sirip + Garis Puncak Sirip (Ridge Tracking) menempel di Bilah Fisik.
@@ -1065,7 +1427,17 @@ class CombinedTopInspector:
 
         # Zero-copy canvas: langsung resize frame ke canvas atas (1000 x 520) tanpa copy 1080p
         main_resized = self._screen_buf[:520, :]
-        cv2.resize(frame, (1000, 520), dst=main_resized, interpolation=cv2.INTER_LINEAR)
+        if getattr(self, "rect_matrix", None) is not None:
+            frame_warped = cv2.warpAffine(
+                frame,
+                self.rect_matrix,
+                (w_f, h_f),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE
+            )
+            cv2.resize(frame_warped, (1000, 520), dst=main_resized, interpolation=cv2.INTER_LINEAR)
+        else:
+            cv2.resize(frame, (1000, 520), dst=main_resized, interpolation=cv2.INTER_LINEAR)
 
         # Faktor skala koordinat dari resolusi citra asli (w_f, h_f) ke tampilan (1000, 520)
         sx = 1000.0 / float(w_f)
@@ -1224,6 +1596,27 @@ class CombinedTopInspector:
             cv2.putText(main_resized, "[SPACE]: Play | [N]: +1 Frame | [P]: -1 Frame", (bx + 14, by + 44),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 240, 200), 1, cv2.LINE_AA)
 
+        # Indikator Banner Kalibrasi Konveyor Otomatis
+        if getattr(self, "is_calibrating", False):
+            cal_y = 70 if is_paused else 15
+            cv2.rectangle(main_resized, (15, cal_y), (600, cal_y + 42), (0, 130, 255), -1)
+            cv2.rectangle(main_resized, (15, cal_y), (600, cal_y + 42), (255, 255, 255), 2)
+            cv2.putText(main_resized, f"KALIBRASI: {self.calib_status_msg}", (25, cal_y + 27),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 2, cv2.LINE_AA)
+        elif getattr(self, "calib_banner_timer", 0) > 0:
+            cal_y = 70 if is_paused else 15
+            cv2.rectangle(main_resized, (15, cal_y), (720, cal_y + 42), (0, 160, 40), -1)
+            cv2.rectangle(main_resized, (15, cal_y), (720, cal_y + 42), (255, 255, 255), 2)
+            cv2.putText(main_resized, self.calib_status_msg, (25, cal_y + 27),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 2, cv2.LINE_AA)
+        elif getattr(self, "profile_banner_timer", 0) > 0:
+            cal_y = 70 if is_paused else 15
+            p_bg = (0, 150, 40) if "DEFAULT" in getattr(self, "active_profile_name", "") else (0, 120, 240)
+            cv2.rectangle(main_resized, (15, cal_y), (720, cal_y + 42), p_bg, -1)
+            cv2.rectangle(main_resized, (15, cal_y), (720, cal_y + 42), (255, 255, 255), 2)
+            cv2.putText(main_resized, self.profile_banner_text, (25, cal_y + 27),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 2, cv2.LINE_AA)
+
         # ======================================================================
         # 4. PANEL DASHBOARD BAWAH (1000 x 300 px) DENGAN KARTU METROLOGI GANDA
         # ======================================================================
@@ -1244,9 +1637,11 @@ class CombinedTopInspector:
         stat_x = 55 if len(overall_status) == 2 else (35 if len(overall_status) == 4 else 45)
         cv2.putText(hud, overall_status, (stat_x, 56), cv2.FONT_HERSHEY_DUPLEX, 1.35, (255, 255, 255), 3, cv2.LINE_AA)
 
-        # Header Status Terpadu (DIBESARKAN)
-        cv2.putText(hud, "CAM-01 TOP INSPECTION PIPELINE (SLAT & RIB INTEGRATED)",
-                    (195, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2, cv2.LINE_AA)
+        # Header Status Terpadu (DIBESARKAN) & Badge Profil
+        prof_tag = "[DEFAULT STABIL]" if "DEFAULT" in getattr(self, "active_profile_name", "") else "[HASIL KALIBRASI]"
+        prof_col = (100, 255, 140) if "DEFAULT" in getattr(self, "active_profile_name", "") else (255, 200, 50)
+        cv2.putText(hud, f"CAM-01 TOP INSPECTION PIPELINE {prof_tag}",
+                    (195, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.62, prof_col, 2, cv2.LINE_AA)
 
         # Badge Status Database Logging (ON / OFF)
         db_on = self.is_db_enabled()
@@ -1338,15 +1733,15 @@ class CombinedTopInspector:
         cv2.rectangle(hud, (15, 192), (985, 292), (45, 45, 55), 1)
         cv2.putText(hud, "PANDUAN KONTROL & PINTASAN KEYBOARD (HOTKEYS):", (25, 214),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (150, 180, 220), 2, cv2.LINE_AA)
-        cv2.putText(hud, "[SPACE]: Pause/Play   [N]: +1 Maju   [P]: -1 Mundur   [R]: Reset Counter", (25, 238),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 220, 220), 1, cv2.LINE_AA)
-        cv2.putText(hud, "[W]/[O]/[F]: Media   [V]: Ganti Video   [T]: Turbo   [D]: DB Log   [Q]: Keluar", (25, 260),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(hud, "[SPACE]: Pause/Play  [R]: Reset  [P]: Toggle Profil (Def/Cal)  [U]: Restore Def  [K]: Kalibrasi", (25, 238),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(hud, "[N]/[A]: Frame Step  [W]/[O]/[F]: Media  [V]: Ganti Video  [T]: Turbo  [D]: DB Log  [Q]: Keluar", (25, 260),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220, 220, 220), 1, cv2.LINE_AA)
         cv2.putText(hud, f"File: {inspect_result.get('filename', '-')} | Posisi: {frame_idx}/{total_frames}", (25, 282),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (140, 210, 140), 1, cv2.LINE_AA)
 
-        # Selesai: kembalikan buffer terpadu yang sudah terisi penuh (zero-copy)
-        return self._screen_buf
+        # Selesai: kembalikan buffer terpadu yang sudah terisi penuh (thread-safe copy)
+        return self._screen_buf.copy()
 
 
 def main():
@@ -1587,11 +1982,20 @@ def main():
             st = pipeline.toggle_db()
             mode_str = "AKTIF (RECORDING)" if st else "MATI (DRY-RUN)"
             print(f"[*] SAKLAR DATABASE LOGGING: {mode_str}")
-        elif key in [ord('p'), ord('P'), ord('a'), ord('A')]:
+        elif key in [ord('p'), ord('P')]:
             if is_paused:
                 step_backward = True
+            else:
+                pipeline.toggle_profile()
+        elif key in [ord('a'), ord('A')]:
+            if is_paused:
+                step_backward = True
+        elif key in [ord('u'), ord('U'), ord('0')]:
+            pipeline.restore_default_profile()
         elif key in [ord('r'), ord('R')]:
             pipeline.reset_counters()
+        elif key in [ord('k'), ord('K')]:
+            pipeline.start_calibration(duration_frames=60)
         elif key in [ord('w'), ord('W'), ord('o'), ord('O'), ord('f'), ord('F')]:
             # Buka dialog explorer
             print("\n[*] Membuka File Dialog Explorer...")

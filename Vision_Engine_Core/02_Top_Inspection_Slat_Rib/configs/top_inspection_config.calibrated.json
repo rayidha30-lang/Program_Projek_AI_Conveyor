@@ -1,0 +1,107 @@
+{
+  "camera_id": "CAM-03",
+  "profile_name": "HASIL_KALIBRASI",
+  "description": "Profil Parameter Hasil Kalibrasi Otomatis Kamera Top (Virtual Rectification)",
+  "rib_polygon": [
+    [
+      0.06,
+      0.28
+    ],
+    [
+      0.94,
+      0.28
+    ],
+    [
+      0.94,
+      0.79
+    ],
+    [
+      0.06,
+      0.79
+    ]
+  ],
+  "slat_polygon": [
+    [
+      0.0796875,
+      0.5231481481481481
+    ],
+    [
+      0.9239583333333333,
+      0.5046296296296297
+    ],
+    [
+      0.9614583333333333,
+      0.6583333333333333
+    ],
+    [
+      0.0484375,
+      0.6685185185185185
+    ]
+  ],
+  "thresholds": {
+    "rib_conf_threshold": 0.55,
+    "rib_pv_threshold": 14.0,
+    "rib_dev_threshold": 8.5,
+    "rib_max_dev_threshold": 8.5,
+    "rib_tip_threshold": 9.5,
+    "rib_sagitta_threshold": 11.5,
+    "slat_delta_limit": 14.0,
+    "slat_max_gap_limit": 45.0,
+    "slat_valley_sens": 5.0,
+    "calibrated_mll_ratio": 0.684,
+    "calibrated_v_thresh": 94.4,
+    "total_slats_in_loop": 16,
+    "bracket_tilt_deg": -0.96,
+    "max_flatness_pv": 16.5,
+    "max_sagitta": 8.6,
+    "max_center_void": 1450,
+    "scale_factor_mm_per_px": 0.515,
+    "scale_factor_y_mm_per_px": 0.442,
+    "rib_prime_min_y": 360,
+    "rib_prime_max_y": 430
+  },
+  "physical_dimensions": {
+    "slat_width_flat_mm": 820.0,
+    "slat_total_width_mm": 930.0,
+    "rib_length_mm": 750.0,
+    "rib_height_mm": 50.0,
+    "scale_factor_mm_per_px": 0.515,
+    "scale_factor_y_mm_per_px": 0.442
+  },
+  "updated_at": "2026-10-29 07:59:30",
+  "calibration_profile": {
+    "calibrated_at": "2026-10-29 07:59:30",
+    "total_slats_in_loop": 16,
+    "bracket_tilt_deg": 0.9,
+    "median_y_seam_px": 89.0,
+    "median_seam_length_px": 950.0,
+    "calibrated_mll_px": 684.0,
+    "calibrated_mll_ratio": 0.684,
+    "ambient_v_mean": 94.4,
+    "recommended_v_thresh": 94.4,
+    "recommended_max_pv": 16.5,
+    "recommended_max_sagitta": 8.6,
+    "cycle_duration_sec": 10.0,
+    "measured_tilt_deg": -0.96,
+    "target_tilt_deg": 0.9,
+    "angle_correction_deg": 1.86,
+    "conveyor_center_x": 951.0,
+    "lateral_offset_px": 9.0,
+    "left_rail_px": 188,
+    "right_rail_px": 1714,
+    "conveyor_width_px": 1526,
+    "motion_sample_count": 4
+  },
+  "rectification_matrix": [
+    [
+      0.9994730201662928,
+      0.03246046764403146,
+      -8.022751887418078
+    ],
+    [
+      -0.03246046764403146,
+      0.9994730201662928,
+      31.44661804847209
+    ]
+  ]
+}

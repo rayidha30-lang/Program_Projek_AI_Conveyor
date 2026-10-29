@@ -33,6 +33,7 @@ graphify-out/
 *.svg
 
 # Archives, Backup & Scratch
+*.bat
 *.zip
 *.engine
 scratch/
@@ -63,6 +64,7 @@ Program AI/Temporary Penyimpanan/
 *.csv
 benchmark_results.csv
 jetson_benchmark_fps.csv
+*.pdf
 
 # Arsip Lokal Eksperimen & Duplikat (Disimpan Lokal, Tidak Dipush ke GitHub)
 archive/
