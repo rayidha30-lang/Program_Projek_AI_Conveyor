@@ -81,6 +81,19 @@
     "recommended_v_thresh": 94.4,
     "recommended_max_pv": 16.5,
     "recommended_max_sagitta": 8.6,
-    "cycle_duration_sec": 10.0
+    "cycle_duration_sec": 10.0,
+    "golden_reference": {
+      "source_video": "Kamera posisi 3 dimmer 2 - Reverse.mp4",
+      "source_image": "WIN_20261005_09_01_08_Pro.jpg",
+      "target_tilt_deg": 0.9,
+      "target_cx": 960.0,
+      "left_rail_px": 188,
+      "right_rail_px": 1759,
+      "conveyor_width_px": 1571
+    },
+    "left_rail_px": 188,
+    "right_rail_px": 1759,
+    "conveyor_center_x": 960.0,
+    "conveyor_width_px": 1571
   }
 }

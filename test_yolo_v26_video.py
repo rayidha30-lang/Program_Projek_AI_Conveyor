@@ -53,10 +53,10 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # Lokasi model v26 default
 DEFAULT_MODEL_CANDIDATES = [
-    BASE_DIR / "Vision_Engine_Core" / "01_Side_Inspection_Bolt_Pin_Lekukan" / "models" / "best_v26_ok.pt"
+    BASE_DIR / "Vision_Engine_Core" / "02_Top_Inspection_Slat_Rib" / "models" / "best_rib_segmentation.pt"
 ]
 
-DEFAULT_VIDEO_DIR = Path(r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib")
+DEFAULT_VIDEO_DIR = Path(r"C:\Users\Victus\Pictures\Video & Foto Test Slat Rib\New\Reverse\Kamera posisi 3 dimmer 2 - Reverse.mp4")
 OUTPUT_DIR = BASE_DIR / "output_test_v26"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 

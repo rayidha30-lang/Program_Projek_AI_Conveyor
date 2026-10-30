@@ -28,13 +28,18 @@ class ConveyorMotionCalibrator:
     Kalibrator Geometris Kamera Konveyor berbasis Analisis Celah Plat & Vektor Gerak.
     """
 
-    def __init__(self, target_tilt_deg=0.90, target_cx=960.0):
+    def __init__(self, target_tilt_deg=0.90, target_cx=960.0, target_left_rail=188.0, target_right_rail=1759.0):
         """
         :param target_tilt_deg: Sudut target kanonikal konveyor (default: 0.90 derajat / golden baseline)
         :param target_cx: Titik tengah target sumbu X konveyor (default: 960.0 px pada frame 1080p)
+        :param target_left_rail: Posisi X rel kiri acuan emas (default: 188.0 px)
+        :param target_right_rail: Posisi X rel kanan acuan emas (default: 1759.0 px)
         """
         self.target_tilt_deg = float(target_tilt_deg)
         self.target_cx = float(target_cx)
+        self.target_left_rail = float(target_left_rail)
+        self.target_right_rail = float(target_right_rail)
+        self.target_width = float(self.target_right_rail - self.target_left_rail)
         self.collected_frames = []
 
     def reset(self):
@@ -209,6 +214,9 @@ class ConveyorMotionCalibrator:
             "lateral_offset_px": round(delta_x, 1),
             "left_rail_px": int(left_rail_x),
             "right_rail_px": int(right_rail_x),
+            "target_left_rail_px": int(self.target_left_rail),
+            "target_right_rail_px": int(self.target_right_rail),
+            "target_width_px": int(self.target_width),
             "conveyor_width_px": conveyor_width_px,
             "rectification_matrix": M_rect.tolist(),
             "calibrated_slat_polygon": calibrated_slat_poly,

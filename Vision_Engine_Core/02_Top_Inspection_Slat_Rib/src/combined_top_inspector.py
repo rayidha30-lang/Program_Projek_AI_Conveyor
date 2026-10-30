@@ -30,6 +30,7 @@ import sys
 import time
 import json
 import argparse
+import subprocess
 import threading
 import queue
 import cv2
@@ -309,6 +310,14 @@ class CombinedTopInspector:
         self.motion_calibrator = None
         self.device = device
 
+        # Geometri Acuan Emas (Golden Reference)
+        self.ref_left_rail_px = 188.0
+        self.ref_right_rail_px = 1759.0
+        self.ref_center_x = 960.0
+        self.ref_tilt_deg = 0.90
+        self.ref_width_px = 1571.0
+        self.show_alignment_guides = False  # Sakelar Garis Panduan [G]
+
         # Inisialisasi Database Bridge (Default: False / Dry Run)
         self.db_bridge = None
         if InspectionDBBridge is not None:
@@ -370,6 +379,12 @@ class CombinedTopInspector:
                     cp = cfg["calibration_profile"]
                     calib_mll = float(cp.get("calibrated_mll_ratio", calib_mll))
                     calib_v = float(cp.get("recommended_v_thresh", calib_v))
+                    gref = cp.get("golden_reference", {})
+                    self.ref_left_rail_px = float(gref.get("left_rail_px", cp.get("left_rail_px", self.ref_left_rail_px)))
+                    self.ref_right_rail_px = float(gref.get("right_rail_px", cp.get("right_rail_px", self.ref_right_rail_px)))
+                    self.ref_center_x = float(gref.get("target_cx", cp.get("conveyor_center_x", self.ref_center_x)))
+                    self.ref_tilt_deg = float(gref.get("target_tilt_deg", cp.get("bracket_tilt_deg", self.ref_tilt_deg)))
+                    self.ref_width_px = float(gref.get("conveyor_width_px", self.ref_right_rail_px - self.ref_left_rail_px))
 
                 th = cfg.get("thresholds", {})
                 max_pv_slat = float(th.get("max_flatness_pv", max_pv_slat))
@@ -573,7 +588,21 @@ class CombinedTopInspector:
             if "rib_polygon" in cfg and len(cfg["rib_polygon"]) >= 4:
                 self.rib_zone = cfg["rib_polygon"]
 
+            if "calibration_profile" in cfg:
+                cp = cfg["calibration_profile"]
+                gref = cp.get("golden_reference", {})
+                self.ref_left_rail_px = float(gref.get("left_rail_px", cp.get("left_rail_px", self.ref_left_rail_px)))
+                self.ref_right_rail_px = float(gref.get("right_rail_px", cp.get("right_rail_px", self.ref_right_rail_px)))
+                self.ref_center_x = float(gref.get("target_cx", cp.get("conveyor_center_x", self.ref_center_x)))
+                self.ref_tilt_deg = float(gref.get("target_tilt_deg", cp.get("bracket_tilt_deg", self.ref_tilt_deg)))
+                self.ref_width_px = float(gref.get("conveyor_width_px", self.ref_right_rail_px - self.ref_left_rail_px))
+
             return True
+
+    def toggle_alignment_guides(self):
+        """Membalik status tampilan garis referensi rel & sumbu konveyor (ON <-> OFF)."""
+        self.show_alignment_guides = not getattr(self, "show_alignment_guides", False)
+        return self.show_alignment_guides
 
     def restore_default_profile(self):
         """
@@ -659,7 +688,12 @@ class CombinedTopInspector:
         """Memulai sesi kalibrasi konveyor multi-frame (default 60 frame / ~2-3 detik)."""
         with self._inspect_lock:
             if not hasattr(self, "motion_calibrator") or self.motion_calibrator is None:
-                self.motion_calibrator = ConveyorMotionCalibrator(target_tilt_deg=0.90, target_cx=960.0)
+                self.motion_calibrator = ConveyorMotionCalibrator(
+                    target_tilt_deg=getattr(self, "ref_tilt_deg", 0.90),
+                    target_cx=getattr(self, "ref_center_x", 960.0),
+                    target_left_rail=getattr(self, "ref_left_rail_px", 188.0),
+                    target_right_rail=getattr(self, "ref_right_rail_px", 1759.0)
+                )
             self.motion_calibrator.reset()
             self.is_calibrating = True
             self.calib_frames_target = max(30, int(duration_frames))
@@ -692,7 +726,12 @@ class CombinedTopInspector:
         with self._inspect_lock:
             try:
                 if not hasattr(self, "motion_calibrator") or self.motion_calibrator is None:
-                    self.motion_calibrator = ConveyorMotionCalibrator(target_tilt_deg=0.90, target_cx=960.0)
+                    self.motion_calibrator = ConveyorMotionCalibrator(
+                        target_tilt_deg=getattr(self, "ref_tilt_deg", 0.90),
+                        target_cx=getattr(self, "ref_center_x", 960.0),
+                        target_left_rail=getattr(self, "ref_left_rail_px", 188.0),
+                        target_right_rail=getattr(self, "ref_right_rail_px", 1759.0)
+                    )
 
                 calib_res = self.motion_calibrator.calibrate(self.calib_buffer)
                 if not calib_res.get("success", False):
@@ -731,6 +770,15 @@ class CombinedTopInspector:
                     cfg_data["calibration_profile"] = {}
                 cfg_data["calibration_profile"].update({
                     "calibrated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "golden_reference": {
+                        "source_video": "Kamera posisi 3 dimmer 2 - Reverse.mp4",
+                        "source_image": "WIN_20261005_09_01_08_Pro.jpg",
+                        "target_tilt_deg": getattr(self, "ref_tilt_deg", 0.90),
+                        "target_cx": getattr(self, "ref_center_x", 960.0),
+                        "left_rail_px": int(getattr(self, "ref_left_rail_px", 188.0)),
+                        "right_rail_px": int(getattr(self, "ref_right_rail_px", 1759.0)),
+                        "conveyor_width_px": int(getattr(self, "ref_width_px", 1571.0))
+                    },
                     "measured_tilt_deg": calib_res["measured_tilt_deg"],
                     "target_tilt_deg": calib_res["target_tilt_deg"],
                     "angle_correction_deg": calib_res["angle_correction_deg"],
@@ -773,6 +821,44 @@ class CombinedTopInspector:
                 self.calib_buffer.clear()
                 self.is_calibrating = False
 
+    def auto_align_rails_instant(self, frame):
+        """
+        Melakukan Auto-Snap deteksi tepi rel dan langsung menghitung serta menerapkan
+        rektifikasi virtual (Perspective/Affine) seketika dari 1 frame saat ini.
+        """
+        if frame is None or frame.size == 0:
+            return False, "Frame kosong."
+        try:
+            from calibrate_dual_rails import DualRailCalibrator
+            calib = DualRailCalibrator(config_path=self.config_path)
+            calib.auto_snap_rails(frame)
+            M, m_type = calib.compute_rectification(frame.shape[1], frame.shape[0])
+
+            with self._inspect_lock:
+                self.rect_matrix = np.array(M, dtype=np.float32)
+                calib.save_calibration_to_config()
+                self.active_profile_name = "HASIL_KALIBRASI"
+                tilt_val = calib.metrology.get("measured_tilt_deg", 0.0)
+                offset_val = calib.metrology.get("lateral_offset_px", 0.0)
+                self.profile_banner_text = f"AUTO-SNAP REL: Tilt {tilt_val:+.2f} deg, Geser {offset_val:+.1f} px ({m_type})"
+                self.profile_banner_timer = 150
+                self.calib_status_msg = f"Auto-Snap Rel Sukses ({m_type})"
+                self.calib_banner_timer = 150
+
+            print("\n" + "=" * 70)
+            print(f"[CombinedTopInspector] ⚡ AUTO-SNAP REL INSTAN SUKSES! ({m_type})")
+            print(f"[*] Sudut Terukur    : {tilt_val:+.2f}° (Koreksi {-tilt_val:+.2f}°)")
+            print(f"[*] Lebar Terukur    : {calib.metrology.get('cur_width_px', 0.0):.1f} px (Target: {self.ref_width_px:.0f} px)")
+            print(f"[*] Offset Lateral   : {offset_val:+.1f} px")
+            print(f"[*] Mode Transformasi: {m_type}")
+            print(f"[*] Profil Tersimpan : {os.path.basename(self.calibrated_config_path)}")
+            print("=" * 70 + "\n")
+            return True, "Sukses"
+        except Exception as e:
+            err = f"Gagal auto-align rel: {e}"
+            print(f"[!] {err}")
+            return False, err
+
     def is_db_enabled(self):
         """Mengecek apakah database logging aktif."""
         if self.db_bridge is not None:
@@ -787,7 +873,10 @@ class CombinedTopInspector:
         if frame_raw is None:
             return None
         if getattr(self, "rect_matrix", None) is not None:
-            ann = cv2.warpAffine(frame_raw, self.rect_matrix, (frame_raw.shape[1], frame_raw.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            if self.rect_matrix.shape == (3, 3):
+                ann = cv2.warpPerspective(frame_raw, self.rect_matrix, (frame_raw.shape[1], frame_raw.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            else:
+                ann = cv2.warpAffine(frame_raw, self.rect_matrix, (frame_raw.shape[1], frame_raw.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         else:
             ann = frame_raw.copy()
         h_f, w_f = ann.shape[:2]
@@ -1133,13 +1222,22 @@ class CombinedTopInspector:
 
         # Virtual Image Rectification (Metode 4) jika profil terkalibrasi aktif
         if getattr(self, "rect_matrix", None) is not None:
-            frame_inspected = cv2.warpAffine(
-                frame,
-                self.rect_matrix,
-                (w_f, h_f),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_REPLICATE
-            )
+            if self.rect_matrix.shape == (3, 3):
+                frame_inspected = cv2.warpPerspective(
+                    frame,
+                    self.rect_matrix,
+                    (w_f, h_f),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE
+                )
+            else:
+                frame_inspected = cv2.warpAffine(
+                    frame,
+                    self.rect_matrix,
+                    (w_f, h_f),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE
+                )
         else:
             frame_inspected = frame
 
@@ -1386,6 +1484,79 @@ class CombinedTopInspector:
             "elapsed_ms": elapsed_ms
         }
 
+    def _render_alignment_guides(self, canvas, w_f, h_f):
+        """
+        Merender garis panduan referensi (Golden Reticle Alignment Guide)
+        pada canvas preview (1000 x 520 px).
+        Menampilkan rel kiri, rel kanan, sumbu simetri tengah, dan horizon celah plat
+        berdasarkan acuan emas (Kamera posisi 3 dimmer 2 / WIN_20261005_09_01_08_Pro).
+        """
+        if canvas is None or canvas.size == 0:
+            return
+        ch, cw = canvas.shape[:2]
+        sx = float(cw) / float(w_f if w_f > 0 else 1920)
+        sy = float(ch) / float(h_f if h_f > 0 else 1080)
+
+        lx = int(round(getattr(self, "ref_left_rail_px", 188.0) * sx))
+        rx = int(round(getattr(self, "ref_right_rail_px", 1759.0) * sx))
+        cx = int(round(getattr(self, "ref_center_x", 960.0) * sx))
+        tilt = float(getattr(self, "ref_tilt_deg", 0.90))
+
+        guide_col = (0, 235, 255)    # Amber / Emas Kanonikal
+        center_col = (255, 205, 0)   # Cyan terang untuk sumbu tengah
+
+        # 1. Garis Rel Kiri (Left Rail)
+        cv2.line(canvas, (lx, 0), (lx, ch), guide_col, 2, cv2.LINE_AA)
+        for y_tick in range(40, ch - 20, 60):
+            cv2.line(canvas, (lx - 7, y_tick), (lx + 7, y_tick), guide_col, 2, cv2.LINE_AA)
+
+        # 2. Garis Rel Kanan (Right Rail)
+        cv2.line(canvas, (rx, 0), (rx, ch), guide_col, 2, cv2.LINE_AA)
+        for y_tick in range(40, ch - 20, 60):
+            cv2.line(canvas, (rx - 7, y_tick), (rx + 7, y_tick), guide_col, 2, cv2.LINE_AA)
+
+        # 3. Sumbu Simetri Tengah (Centerline) - Garis Putus-putus
+        for y_dash in range(0, ch, 20):
+            cv2.line(canvas, (cx, y_dash), (cx, min(ch, y_dash + 10)), center_col, 1, cv2.LINE_AA)
+
+        # Crosshair di Prime Inspection Zone (Y ~ 200 px pada kanvas 520)
+        y_prime_center = int(round(395.0 * sy))
+        cv2.drawMarker(canvas, (cx, y_prime_center), center_col, cv2.MARKER_CROSS, 28, 2, cv2.LINE_AA)
+
+        # 4. Garis Horizon Celah Plat Acuan (Golden Seam Tilt)
+        rad = math.radians(tilt)
+        tan_t = math.tan(rad)
+        for x_dash in range(lx, rx, 25):
+            x2_d = min(rx, x_dash + 14)
+            y1_d = int(round(y_prime_center + (x_dash - cx) * tan_t))
+            y2_d = int(round(y_prime_center + (x2_d - cx) * tan_t))
+            cv2.line(canvas, (x_dash, y1_d), (x2_d, y2_d), (50, 220, 100), 1, cv2.LINE_AA)
+
+        # 5. Label Pills agar teks 100% kontras dan terbaca
+        # Badge Label Rel Kiri
+        lbl_l = f"REF KIRI ({int(round(self.ref_left_rail_px))}px)"
+        cv2.rectangle(canvas, (lx - 10, ch - 30), (lx + 130, ch - 8), (18, 22, 28), -1)
+        cv2.rectangle(canvas, (lx - 10, ch - 30), (lx + 130, ch - 8), guide_col, 1)
+        cv2.putText(canvas, lbl_l, (lx - 4, ch - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.38, guide_col, 1, cv2.LINE_AA)
+
+        # Badge Label Rel Kanan
+        lbl_r = f"REF KANAN ({int(round(self.ref_right_rail_px))}px)"
+        cv2.rectangle(canvas, (rx - 138, ch - 30), (rx + 10, ch - 8), (18, 22, 28), -1)
+        cv2.rectangle(canvas, (rx - 138, ch - 30), (rx + 10, ch - 8), guide_col, 1)
+        cv2.putText(canvas, lbl_r, (rx - 132, ch - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.38, guide_col, 1, cv2.LINE_AA)
+
+        # Badge Sumbu Tengah
+        lbl_c = f"SUMBU TENGAH ({int(round(self.ref_center_x))}px)"
+        cv2.rectangle(canvas, (cx - 75, ch - 30), (cx + 75, ch - 8), (18, 22, 28), -1)
+        cv2.rectangle(canvas, (cx - 75, ch - 30), (cx + 75, ch - 8), center_col, 1)
+        cv2.putText(canvas, lbl_c, (cx - 70, ch - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.38, center_col, 1, cv2.LINE_AA)
+
+        # Header Badge Reticle Aktif di Bagian Tengah Atas
+        cv2.rectangle(canvas, (cx - 120, 12), (cx + 120, 36), (15, 20, 26), -1)
+        cv2.rectangle(canvas, (cx - 120, 12), (cx + 120, 36), guide_col, 1)
+        cv2.putText(canvas, "📐 RETICLE ACUAN EMAS [G]", (cx - 110, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, guide_col, 1, cv2.LINE_AA)
+
     def render_combined_dashboard(
         self,
         frame,
@@ -1428,13 +1599,22 @@ class CombinedTopInspector:
         # Zero-copy canvas: langsung resize frame ke canvas atas (1000 x 520) tanpa copy 1080p
         main_resized = self._screen_buf[:520, :]
         if getattr(self, "rect_matrix", None) is not None:
-            frame_warped = cv2.warpAffine(
-                frame,
-                self.rect_matrix,
-                (w_f, h_f),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_REPLICATE
-            )
+            if self.rect_matrix.shape == (3, 3):
+                frame_warped = cv2.warpPerspective(
+                    frame,
+                    self.rect_matrix,
+                    (w_f, h_f),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE
+                )
+            else:
+                frame_warped = cv2.warpAffine(
+                    frame,
+                    self.rect_matrix,
+                    (w_f, h_f),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE
+                )
             cv2.resize(frame_warped, (1000, 520), dst=main_resized, interpolation=cv2.INTER_LINEAR)
         else:
             cv2.resize(frame, (1000, 520), dst=main_resized, interpolation=cv2.INTER_LINEAR)
@@ -1584,6 +1764,12 @@ class CombinedTopInspector:
             except Exception:
                 pass
 
+        # ======================================================================
+        # 3B. LAYER PANDUAN REFERENSI REL & SUMBU EMAS (GOLDEN ALIGNMENT RETICLE)
+        # ======================================================================
+        if getattr(self, "show_alignment_guides", False) or getattr(self, "is_calibrating", False):
+            self._render_alignment_guides(main_resized, w_f, h_f)
+
         # Indikator Banner PAUSED jika video dijeda
         if is_paused:
             bw, bh = 430, 52
@@ -1697,8 +1883,14 @@ class CombinedTopInspector:
         # ----------------------------------------------------------------------
         cv2.rectangle(hud, (495, 96), (985, 184), (28, 28, 36), -1)
         cv2.rectangle(hud, (495, 96), (985, 184), (60, 60, 75), 1)
-        cv2.putText(hud, f"METROLOGI BILAH SIRIP (HYBRID: {self.rib_inspector.mode})", (505, 118),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.54, (0, 255, 255), 2, cv2.LINE_AA)
+        if getattr(self.rib_inspector, "tracker_engine", "LEGACY") == "TIER2_YOLO_POSE":
+            eng_badge = "POSE"
+        elif getattr(self.rib_inspector, "tracker_engine", "LEGACY") == "TIER1_VITERBI":
+            eng_badge = "VITERBI"
+        else:
+            eng_badge = "SOBEL"
+        cv2.putText(hud, f"METROLOGI BILAH SIRIP (HYBRID: {self.rib_inspector.mode} | {eng_badge})", (505, 118),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 2, cv2.LINE_AA)
 
         r_pv = rib_res.get("pv_flatness", 0.0) if rib_res else 0.0
         r_sag = rib_res.get("sagitta", 0.0) if rib_res else 0.0
@@ -1733,10 +1925,10 @@ class CombinedTopInspector:
         cv2.rectangle(hud, (15, 192), (985, 292), (45, 45, 55), 1)
         cv2.putText(hud, "PANDUAN KONTROL & PINTASAN KEYBOARD (HOTKEYS):", (25, 214),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (150, 180, 220), 2, cv2.LINE_AA)
-        cv2.putText(hud, "[SPACE]: Pause/Play  [R]: Reset  [P]: Toggle Profil (Def/Cal)  [U]: Restore Def  [K]: Kalibrasi", (25, 238),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220, 220, 220), 1, cv2.LINE_AA)
-        cv2.putText(hud, "[N]/[A]: Frame Step  [W]/[O]/[F]: Media  [V]: Ganti Video  [T]: Turbo  [D]: DB Log  [Q]: Keluar", (25, 260),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(hud, "[SPACE]: Pause  [K]: Align Rel Instan  [L]: Wizard Rel  [G]: Reticle Acuan  [P]: Profil  [U]: Def", (25, 238),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(hud, "[T]: Engine Rib  [V]: Video  [1]/[2]: Media  [R]: Reset  [D]: DB Logging  [Q]: Keluar", (25, 260),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
         cv2.putText(hud, f"File: {inspect_result.get('filename', '-')} | Posisi: {frame_idx}/{total_frames}", (25, 282),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (140, 210, 140), 1, cv2.LINE_AA)
 
@@ -1975,6 +2167,9 @@ def main():
             sync_realtime = not sync_realtime
             sync_mode = "1.0x Realtime Sync" if sync_realtime else "TURBO (Uncapped FPS)"
             print(f"[*] Mode Kecepatan Video: {sync_mode}")
+        elif key in [ord('e'), ord('E')]:
+            new_eng = pipeline.rib_inspector.toggle_tracker_engine()
+            print(f"[*] 🔄 SAKELAR TRACKER ENGINE SIRIP (CAM-03): [{new_eng}]")
         elif key in [ord('n'), ord('N')]:
             if is_paused:
                 step_forward = True
@@ -1987,15 +2182,23 @@ def main():
                 step_backward = True
             else:
                 pipeline.toggle_profile()
-        elif key in [ord('a'), ord('A')]:
+        elif key in [ord('k'), ord('K'), ord('a'), ord('A')]:
             if is_paused:
                 step_backward = True
+            else:
+                pipeline.auto_align_rails_instant(frame)
         elif key in [ord('u'), ord('U'), ord('0')]:
             pipeline.restore_default_profile()
         elif key in [ord('r'), ord('R')]:
             pipeline.reset_counters()
-        elif key in [ord('k'), ord('K')]:
-            pipeline.start_calibration(duration_frames=60)
+        elif key in [ord('g'), ord('G')]:
+            st = pipeline.toggle_alignment_guides()
+            mode_str = "AKTIF (RETICLE ACUAN EMAS)" if st else "NON-AKTIF"
+            print(f"[*] 📐 GARIS REFERENSI REL & SUMBU KONVEYOR: {mode_str}")
+        elif key in [ord('l'), ord('L')]:
+            print("\n[*] 🚀 Membuka Wizard Kalibrasi Interaktif Rel Ganda...")
+            calib_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibrate_dual_rails.py")
+            subprocess.Popen([sys.executable, calib_script, "--source", str(current_source)])
         elif key in [ord('w'), ord('W'), ord('o'), ord('O'), ord('f'), ord('F')]:
             # Buka dialog explorer
             print("\n[*] Membuka File Dialog Explorer...")

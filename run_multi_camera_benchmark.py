@@ -23,6 +23,7 @@ import os
 import sys
 import time
 import argparse
+import subprocess
 import multiprocessing as mp
 from datetime import datetime
 
@@ -857,10 +858,18 @@ def _run_top_worker(
                 elif key in [ord("u"), ord("U"), ord("0")]:
                     if hasattr(inspector, "restore_default_profile"):
                         inspector.restore_default_profile()
-                elif key in [ord("k"), ord("K")]:
-                    if hasattr(inspector, "start_calibration"):
-                        inspector.start_calibration(duration_frames=60)
-                        print("\n[*] [CAM-01 TOP] 🔄 Memulai Kalibrasi Otomatis Sudut & Lebar Konveyor (60 Frame / ~3 Detik)...\n")
+                elif key in [ord("k"), ord("K"), ord("a"), ord("A")]:
+                    if hasattr(inspector, "auto_align_rails_instant"):
+                        inspector.auto_align_rails_instant(frame)
+                elif key in [ord("g"), ord("G")]:
+                    if hasattr(inspector, "toggle_alignment_guides"):
+                        st = inspector.toggle_alignment_guides()
+                        mode_str = "AKTIF (RETICLE ACUAN EMAS)" if st else "NON-AKTIF"
+                        print(f"\n[*] [CAM-01 TOP] 📐 GARIS REFERENSI REL & SUMBU KONVEYOR: {mode_str}\n")
+                elif key in [ord("l"), ord("L")]:
+                    print("\n[*] [CAM-01 TOP] 🚀 Membuka Wizard Kalibrasi Interaktif Rel Ganda...")
+                    calib_script = os.path.join(BASE_DIR, "Vision_Engine_Core", "02_Top_Inspection_Slat_Rib", "src", "calibrate_dual_rails.py")
+                    subprocess.Popen([sys.executable, calib_script, "--source", str(cap_src)])
                 elif key in [ord("v"), ord("V")]:
                     new_src = cycle_next_video(cap_src)
                     if new_src and str(new_src) != str(cap_src):
@@ -904,7 +913,11 @@ def _run_top_worker(
                         else:
                             print(f"[!] [CAM-01 TOP] Gagal membuka sumber baru: {new_src}, kembali ke sumber sebelumnya.")
                             cap, is_cam, cap_src = create_capture(cap_src)
-                elif key in [ord("1"), ord("t"), ord("T"), ord("o"), ord("O"), ord("f"), ord("F")]:
+                elif key in [ord("t"), ord("T"), ord("e"), ord("E")]:
+                    if hasattr(inspector, "rib_inspector"):
+                        new_eng = inspector.rib_inspector.toggle_tracker_engine()
+                        print(f"\n[*] [CAM-01 TOP] 🔄 SAKELAR TRACKER ENGINE SIRIP: [{new_eng}]\n")
+                elif key in [ord("1"), ord("o"), ord("O"), ord("f"), ord("F")]:
                     print("\n[*] [CAM-01 TOP] Membuka File Dialog Explorer...")
                     init_d = os.path.dirname(cap_src) if os.path.exists(str(cap_src)) else VIDEO_DIR
                     new_top = select_file_dialog(
@@ -1615,7 +1628,7 @@ def _run_threaded_engine(args):
         threads.append(th_side)
 
     # Windows GUI Setup
-    win_top = "CAM-01 TOP (SLAT & RIB) | [1]/[V]: Ganti Video TOP | [W]: Dual Setup | [D]: DB | [Q]: Keluar"
+    win_top = "CAM-01 TOP (SLAT & RIB) | [K]: Align Rel Instan | [1]/[V]: Video | [G]: Panduan | [L]: Wizard | [D]: DB | [Q]: Keluar"
     win_side = f"{args.side_cam_id} SIDE [{args.side_cam_id} {args.side_name}] | [2]/[O]: Video | [W]: Setup | [M]: Preset | [D]: DB | [Q]: Keluar"
     if args.mode == "dual":
         if top_inspector is not None:
@@ -1743,11 +1756,22 @@ def _run_threaded_engine(args):
                 if top_inspector and hasattr(top_inspector, "restore_default_profile"):
                     with top_lock:
                         top_inspector.restore_default_profile()
-            elif key in [ord("k"), ord("K")]:
-                if top_inspector and hasattr(top_inspector, "start_calibration"):
+            elif key in [ord("k"), ord("K"), ord("a"), ord("A")]:
+                if top_inspector and hasattr(top_inspector, "auto_align_rails_instant"):
                     with top_lock:
-                        top_inspector.start_calibration(duration_frames=60)
-                    print("\n[*] [CAM-01 TOP] 🔄 Memulai Kalibrasi Otomatis Sudut & Lebar Konveyor (60 Frame / ~3 Detik)...\n")
+                        cur_raw = top_state.get("raw_frame")
+                    if cur_raw is not None:
+                        top_inspector.auto_align_rails_instant(cur_raw)
+            elif key in [ord("g"), ord("G")]:
+                if top_inspector and hasattr(top_inspector, "toggle_alignment_guides"):
+                    with top_lock:
+                        st = top_inspector.toggle_alignment_guides()
+                    mode_str = "AKTIF (RETICLE ACUAN EMAS)" if st else "NON-AKTIF"
+                    print(f"\n[*] [CAM-01 TOP] 📐 GARIS REFERENSI REL & SUMBU KONVEYOR: {mode_str}\n")
+            elif key in [ord("l"), ord("L")]:
+                print("\n[*] [CAM-01 TOP] 🚀 Membuka Wizard Kalibrasi Interaktif Rel Ganda...")
+                calib_script = os.path.join(BASE_DIR, "Vision_Engine_Core", "02_Top_Inspection_Slat_Rib", "src", "calibrate_dual_rails.py")
+                subprocess.Popen([sys.executable, calib_script, "--source", str(top_source_path)])
             elif key in [ord("v"), ord("V")]:
                 new_top = cycle_next_video(top_source_path)
                 if new_top and str(new_top) != str(top_source_path):
@@ -1785,7 +1809,12 @@ def _run_threaded_engine(args):
                         cap_top, is_cam_top, top_source_path = create_capture(new_cam)
                     if top_inspector:
                         top_inspector.reset_counters()
-            elif key in [ord("1"), ord("t"), ord("T")]:
+            elif key in [ord("t"), ord("T"), ord("e"), ord("E")]:
+                if top_inspector and hasattr(top_inspector, "rib_inspector"):
+                    with top_lock:
+                        new_eng = top_inspector.rib_inspector.toggle_tracker_engine()
+                    print(f"\n[*] [CAM-01 TOP] 🔄 SAKELAR TRACKER ENGINE SIRIP: [{new_eng}]\n")
+            elif key in [ord("1"), ord("f"), ord("F")]:
                 print("\n[*] [CAM-01 TOP] Membuka File Explorer untuk Memilih Video Baru Plat & Rib...")
                 init_top = os.path.dirname(str(top_source_path)) if (top_source_path and os.path.exists(str(top_source_path))) else VIDEO_DIR
                 new_top = select_file_dialog(
@@ -1993,7 +2022,8 @@ Shortcut Keyboard Saat Berjalan:
   [B]               : Beralih instan ke video CAM-02 Side berikutnya (pada mode Threaded)
   [C]               : Beralih instan ke perangkat live webcam USB berikutnya (0 -> 1 -> ...)
   [W]               : Buka dialog visual pengaturan sumber dual kamera (Webcam / File Video)
-  [1] / [T]         : Buka File Explorer dialog untuk mengganti video CAM-01 TOP
+  [T] / [E]         : Sakelar Tracker Engine Sirip TOP (LEGACY <-> TIER 1 VITERBI <-> TIER 2 POSE)
+  [1] / [F]         : Buka File Explorer dialog untuk mengganti video CAM-01 TOP
   [2] / [O]         : Buka File Explorer dialog untuk mengganti video CAM-02 SIDE
   [D]               : Saklar Database Logging & Notifikasi Teams (ON / OFF)
   [R]               : Reset counter QC & cache deduplikasi ke 0
