@@ -7,8 +7,8 @@ echo   🚀 BENCHMARK MULTI-KAMERA: TOP (SLAT & RIB) + SIDE (BOLT & PIN)
 echo ======================================================================
 echo.
 echo Pilih mode pengujian yang ingin dijalankan:
-echo  [1] Mode Dual-Window (Threading - Hemat RAM/VRAM Laptop 8GB) [DEFAULT]
-echo  [2] Mode Dual-Window Multiprocessing (Multi-Core Terisolasi - Bebas GIL)
+echo  [1] Mode Dual-Window Multiprocessing (Throughput Tinggi 30+ FPS Bebas GIL) [DEFAULT]
+echo  [2] Mode Dual-Window Threading (Single-Process Hemat RAM Laptop 4GB)
 echo  [3] Mode Dual-Window + Database ^& Notifikasi Teams AKTIF (Test Dynamic Card)
 echo  [4] Mode Dual-Window + Pilih File Video Sendiri (File Explorer Dialog)
 echo  [5] Mode Headless Throughput Tinggi (Simulasi Jetson / Tanpa GUI Desktop)
@@ -26,8 +26,8 @@ set /p opt="Pilihan Anda (1-14, Enter untuk Default 1): "
 
 if "%opt%"=="2" (
     echo.
-    echo [*] Menjalankan Mode Dual-Window Multiprocessing (Multi-Core Terisolasi)...
-    python run_multi_camera_benchmark.py --engine process --mode dual
+    echo [*] Menjalankan Mode Dual-Window Threading (Single-Process)...
+    python run_multi_camera_benchmark.py --engine threads --mode dual
 ) else if "%opt%"=="3" (
     echo.
     echo [*] Menjalankan Mode Dual-Window dengan DATABASE ^& TEAMS NOTIFIER AKTIF...

@@ -92,7 +92,8 @@ class SideConveyorInspector:
         iou_thresh=None,
         patchcore_thresh=None,
         enable_db=False,
-        device=None
+        device=None,
+        enable_missing_check=None
     ):
         # Standar PRD & Frontend:
         # CAM-01: Top (Plat & Rib), CAM-02: Right Side (RH), CAM-03: Left Side (LH)
@@ -146,6 +147,12 @@ class SideConveyorInspector:
                 iou_thresh = 0.35
         self.conf_thresh = conf_thresh
         self.iou_thresh = iou_thresh
+
+        # Saklar Feature Flag Deteksi Baut & Pin Hilang (Default: True, bisa diatur via .env / argumen)
+        if enable_missing_check is None:
+            env_missing = (os.environ.get("ENABLE_MISSING_BOLT_PIN_CHECK") or os.environ.get("ENABLE_MISSING_CHECK") or "true").strip().lower()
+            enable_missing_check = env_missing in ("true", "1", "yes", "on")
+        self.enable_missing_check = bool(enable_missing_check)
 
         # Inisialisasi Database Bridge (SQLite, Captures & MS Teams)
         self.db_bridge = None
@@ -267,7 +274,10 @@ class SideConveyorInspector:
         self.current_slat_has_bolt_ng = False  # Akumulator defek baut pada slat aktif
         self.current_slat_has_pin_ng = False   # Akumulator defek pin pada slat aktif
         self.current_slat_has_crack_ng = False # Akumulator defek lekukan/crack pada slat aktif
-        self.current_slat_bolt_seen = False    # Penanda visual komponen slat terlihat di ROI
+        self.current_slat_bolt_seen = False    # Penanda visual komponen baut terlihat di ROI
+        self.current_slat_pin_seen = False     # Penanda visual komponen pin terlihat di ROI
+        self.last_slat_bolt_status = "WAIT"    # Hasil akhir komponen baut slat sebelumnya
+        self.last_slat_pin_status = "WAIT"     # Hasil akhir komponen pin slat sebelumnya
 
         # Statistik Sesi (Per-Slat Entity QC Counters)
         self.stats = {
@@ -315,6 +325,9 @@ class SideConveyorInspector:
         self.current_slat_has_pin_ng = False
         self.current_slat_has_crack_ng = False
         self.current_slat_bolt_seen = False
+        self.current_slat_pin_seen = False
+        self.last_slat_bolt_status = "WAIT"
+        self.last_slat_pin_status = "WAIT"
         self.stats = {
             "total_frames": 0,
             "total_slats": 0,
@@ -347,6 +360,20 @@ class SideConveyorInspector:
             self.last_slat_score = rep_score
             self.last_slat_verdict = "NG" if rep_score >= self.custom_patchcore_thresh else "OK"
             self.slat_evaluated = True
+
+        # Validasi ketiadaan komponen Baut & Pin (Missing Check) jika saklar diaktifkan
+        if self.enable_missing_check:
+            if not self.current_slat_bolt_seen:
+                self.current_slat_has_bolt_ng = True
+                self.last_slat_bolt_status = "NG"
+            else:
+                self.last_slat_bolt_status = "OK"
+
+            if not self.current_slat_pin_seen:
+                self.current_slat_has_pin_ng = True
+                self.last_slat_pin_status = "NG"
+            else:
+                self.last_slat_pin_status = "OK"
 
         is_crack_ng = self.current_slat_has_crack_ng or (self.last_slat_verdict == "NG")
         is_bolt_ng = self.current_slat_has_bolt_ng
@@ -472,8 +499,8 @@ class SideConveyorInspector:
         if norm_p == "opsi_2":
             th_h = os.environ.get("PHOTOCELL_POS2_HIGH") or os.environ.get("PHOTOCELL_THRESH_HIGH")
             th_l = os.environ.get("PHOTOCELL_POS2_LOW") or os.environ.get("PHOTOCELL_THRESH_LOW")
-            self.photocell_thresh_high = float(th_h) if th_h else 140.0
-            self.photocell_thresh_low = float(th_l) if th_l else 118.0
+            self.photocell_thresh_high = float(th_h) if th_h else 105.0
+            self.photocell_thresh_low = float(th_l) if th_l else 85.0
             default_patch_th = 0.8500
         else:
             th_h = os.environ.get("PHOTOCELL_POS1_HIGH") or os.environ.get("PHOTOCELL_THRESH_HIGH")
@@ -706,6 +733,7 @@ class SideConveyorInspector:
                             self.current_slat_has_pin_ng = False
                             self.current_slat_has_crack_ng = False
                             self.current_slat_bolt_seen = False
+                            self.current_slat_pin_seen = False
             else:
                 self.consecutive_plat_frames = 0
                 if beam_val < self.photocell_thresh_low:
@@ -744,7 +772,7 @@ class SideConveyorInspector:
                             self.last_slat_verdict = "WAIT"
                         self.slat_evaluated = True
 
-                    # Finalisasi evaluasi QC entitas slat yang baru selesai transit (Single Entity Slat Latch)
+
                     self._finalize_slat_qc()
             else:
                 self.consecutive_gap_frames = 0
@@ -757,8 +785,17 @@ class SideConveyorInspector:
         cv2.circle(display_frame, (px1, py), 4, beam_color, -1)
         cv2.circle(display_frame, (px2, py), 4, beam_color, -1)
         sensor_status_text = f"PHOTOCELL: {'ON [PLAT]' if is_plate_present else 'OFF [GAP]'} ({beam_val:.1f} | Th:{self.photocell_thresh_high:.0f}/{self.photocell_thresh_low:.0f})"
-        cv2.putText(display_frame, sensor_status_text, (px1 - 20, max(15, py - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, beam_color, 1)
+        font_scale = 0.58
+        font_thick = 2
+        (t_w, t_h), _ = cv2.getTextSize(sensor_status_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
+        bg_x1 = max(5, px1 - 20)
+        bg_y1 = max(5, py - t_h - 12)
+        bg_x2 = min(w_frame - 5, bg_x1 + t_w + 10)
+        bg_y2 = bg_y1 + t_h + 8
+        cv2.rectangle(display_frame, (bg_x1, bg_y1), (bg_x2, bg_y2), (20, 20, 20), -1)
+        cv2.rectangle(display_frame, (bg_x1, bg_y1), (bg_x2, bg_y2), beam_color, 1)
+        cv2.putText(display_frame, sensor_status_text, (bg_x1 + 5, bg_y2 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, beam_color, font_thick)
 
         # 4. Pemicuan & Audit Inspeksi Lekukan Plat (PADA POLIGON DIAM MASKED)
         inspected_bracket_info = None
@@ -824,6 +861,7 @@ class SideConveyorInspector:
                     self.slat_evaluated = True
 
                 lekukan_verdict = self.last_slat_verdict
+
                 lek_color = (0, 0, 255) if lekukan_verdict == "NG" else (0, 255, 0)
                 label_text = f"BRACKET CRACK: {lekukan_verdict} [{self.last_slat_score:.3f}]"
         else:
@@ -858,24 +896,53 @@ class SideConveyorInspector:
         cv2.putText(display_frame, label_text, (bx + 5, max(16, by - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.50, lek_color, 2)
 
-        # Akumulasi temuan defek fisik sepanjang transit plat slat aktif
+        # Akumulasi temuan keberadaan dan defek komponen sepanjang transit plat slat aktif
         if is_plate_present:
+            if any(not b.get("is_ng", False) for b in bolts):
+                self.current_slat_bolt_seen = True
+            if any(not p.get("is_ng", False) for p in pins):
+                self.current_slat_pin_seen = True
+
             if bolt_verdict == "NG":
                 self.current_slat_has_bolt_ng = True
             if pin_verdict == "NG":
                 self.current_slat_has_pin_ng = True
             if lekukan_verdict == "NG":
                 self.current_slat_has_crack_ng = True
-            if len(bolts) > 0 or len(pins) > 0:
-                self.current_slat_bolt_seen = True
+
+        # Evaluasi status visual Baut & Pin untuk Tampilan HUD & Telemetri
+        if is_plate_present:
+            if self.current_slat_bolt_seen or any(not b.get("is_ng", False) for b in bolts):
+                bolt_display = "OK"
+            elif self.enable_missing_check and self.slat_audit_countdown == 0 and len(self.current_slat_scores) >= self.min_audit_samples_required:
+                bolt_display = "NG"
+            else:
+                bolt_display = bolt_verdict if bolt_verdict != "EMPTY" else "WAIT"
+
+            if self.current_slat_pin_seen or any(not p.get("is_ng", False) for p in pins):
+                pin_display = "OK"
+            elif self.enable_missing_check and self.slat_audit_countdown == 0 and len(self.current_slat_scores) >= self.min_audit_samples_required:
+                pin_display = "NG"
+            else:
+                pin_display = pin_verdict if pin_verdict != "EMPTY" else "WAIT"
+        else:
+            if self.enable_missing_check and self.last_slat_bolt_status != "WAIT":
+                bolt_display = self.last_slat_bolt_status
+            else:
+                bolt_display = bolt_verdict
+
+            if self.enable_missing_check and self.last_slat_pin_status != "WAIT":
+                pin_display = self.last_slat_pin_status
+            else:
+                pin_display = pin_verdict
 
         # 4. Tentukan Overall Verdict Sisi Ini
         # Prioritas visual live: NG > INVALID > OK > WAIT
-        if bolt_verdict == "NG" or pin_verdict == "NG" or lekukan_verdict == "NG":
+        if bolt_display == "NG" or pin_display == "NG" or lekukan_verdict == "NG":
             overall_side = "NG"
-        elif bolt_verdict == "EMPTY" and pin_verdict == "EMPTY" and lekukan_verdict == "WAIT":
+        elif bolt_display == "WAIT" or pin_display == "WAIT" or lekukan_verdict == "WAIT":
             overall_side = "WAIT"
-        elif (bolt_verdict in ["OK", "EMPTY"]) and (pin_verdict in ["OK", "EMPTY"]) and (lekukan_verdict in ["OK", "WAIT"]):
+        elif (bolt_display in ["OK", "EMPTY"]) and (pin_display in ["OK", "EMPTY"]) and (lekukan_verdict in ["OK", "WAIT"]):
             overall_side = "OK"
         else:
             overall_side = "INVALID"
@@ -890,8 +957,8 @@ class SideConveyorInspector:
         transit_cooldown_ok = (current_f - self.last_emit_frame) >= self.min_slat_transit_frames or (current_f < self.last_emit_frame)
 
         # Evaluasi apakah slat ini berstatus NG
-        is_bolt_ng = self.current_slat_has_bolt_ng or (bolt_verdict == "NG")
-        is_pin_ng = self.current_slat_has_pin_ng or (pin_verdict == "NG")
+        is_bolt_ng = self.current_slat_has_bolt_ng or (bolt_display == "NG")
+        is_pin_ng = self.current_slat_has_pin_ng or (pin_display == "NG")
         is_lek_ng = self.current_slat_has_crack_ng or (self.last_slat_verdict == "NG")
         is_ng_slat = (is_bolt_ng or is_pin_ng or is_lek_ng)
 
@@ -938,8 +1005,8 @@ class SideConveyorInspector:
             "emit_raw_frame": emit_raw,
             "emit_ann_frame": emit_ann,
             "components": [
-                {"name": "BOLT", "result": bolt_verdict, "confidence": max_b_conf},
-                {"name": "PIN", "result": pin_verdict, "confidence": max_p_conf},
+                {"name": "BOLT", "result": bolt_display, "confidence": max_b_conf},
+                {"name": "PIN", "result": pin_display, "confidence": max_p_conf},
                 {"name": "LEKUKAN", "result": lekukan_verdict, "confidence": self.last_slat_score}
             ],
             "bracket_details": inspected_bracket_info or self.last_bracket_info
@@ -989,7 +1056,7 @@ class SideConveyorInspector:
         # Rincian Komponen dengan Confidence
         c_x = int(w * 0.42)
         for c in payload["components"]:
-            c_col = (0, 255, 0) if c["result"] == "OK" else ((0, 0, 255) if c["result"] == "NG" else (180, 180, 180))
+            c_col = (0, 255, 0) if c["result"] == "OK" else ((0, 0, 255) if "NG" in str(c["result"]) else ((0, 215, 255) if c["result"] == "WAIT" else (180, 180, 180)))
             conf_val = c.get("confidence", 0.0)
             if c["name"] == "LEKUKAN":
                 conf_str = f" [{conf_val:.3f}]" if conf_val > 0 else ""
@@ -1052,7 +1119,7 @@ def select_video_file(initial_dir=None, title="Pilih File Video Inspeksi"):
         return None
 
 
-def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", preset="auto", enable_db=False):
+def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", preset="auto", enable_db=False, enable_missing_check=None):
     """
     Fungsi demo interaktif untuk menguji video konveyor sisi samping.
     Mendukung:
@@ -1061,7 +1128,7 @@ def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", p
     - Toggle Preset Posisi Kamera (Opsi 1 / Opsi 2) via shortcut [M]
     - Penyesuaian titik sudut Poligon Diam & Master ROI menggunakan Mouse Drag
     """
-    inspector = SideConveyorInspector(camera_id=camera_id, side=side, preset=preset, enable_db=enable_db)
+    inspector = SideConveyorInspector(camera_id=camera_id, side=side, preset=preset, enable_db=enable_db, enable_missing_check=enable_missing_check)
 
     # Validasi path video, jika belum ada / salah, buka dialog pemilih file
     if not video_path or not os.path.exists(video_path):
@@ -1100,8 +1167,10 @@ def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", p
         "master_start_roi": None
     }
 
+    frame_dim = [1280, 720]
+
     def mouse_cb(event, x, y, flags, param):
-        w_f, h_f = param
+        w_f, h_f = frame_dim[0], frame_dim[1]
         nx, ny = max(0.01, min(0.99, x / float(w_f))), max(0.01, min(0.99, y / float(h_f)))
 
         mx1_n, my1_n, mx2_n, my2_n = inspector.master_roi
@@ -1193,6 +1262,7 @@ def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", p
         cap.set(cv2.CAP_PROP_POS_FRAMES, val)
 
     cv2.createTrackbar("Timeline", win_name, 0, max(1, total_frames - 1), on_timeline)
+    cv2.setMouseCallback(win_name, mouse_cb)
 
     is_paused = False
     delay_ms = max(1, int(1000 / fps))
@@ -1213,13 +1283,15 @@ def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", p
 
     try:
         while True:
+            t_loop_start = time.time()
             if not is_paused:
                 ret, frame = cap.read()
                 if not ret:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
                 cur_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                cv2.setTrackbarPos("Timeline", win_name, cur_pos)
+                if cur_pos % 5 == 0 or cur_pos >= total_frames - 1:
+                    cv2.setTrackbarPos("Timeline", win_name, cur_pos)
             else:
                 cur_pos = cv2.getTrackbarPos("Timeline", win_name)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, cur_pos)
@@ -1228,7 +1300,7 @@ def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", p
                     continue
 
             h_f, w_f = frame.shape[:2]
-            cv2.setMouseCallback(win_name, mouse_cb, (w_f, h_f))
+            frame_dim[0], frame_dim[1] = w_f, h_f
 
             display_frame, payload = inspector.process_frame(frame)
 
@@ -1248,7 +1320,12 @@ def run_side_inspector_demo(video_path=None, side="RIGHT", camera_id="CAM-01", p
 
             cv2.imshow(win_name, display_frame)
 
-            key = cv2.waitKey(delay_ms if not is_paused else 30) & 0xFF
+            if not is_paused:
+                elapsed_ms = (time.time() - t_loop_start) * 1000.0
+                dynamic_delay = max(1, int(delay_ms - elapsed_ms))
+                key = cv2.waitKey(dynamic_delay) & 0xFF
+            else:
+                key = cv2.waitKey(30) & 0xFF
             if key == ord('q') or key == 27:
                 break
             elif key == ord(' '):
@@ -1319,6 +1396,7 @@ if __name__ == "__main__":
     parser.add_argument("--cam", default="CAM-01", help="ID Kamera (default: CAM-01)")
     parser.add_argument("--preset", default="auto", choices=["auto", "opsi_1", "opsi_2", "1", "2"], help="Preset posisi kamera (opsi_1 / opsi_2 / auto)")
     parser.add_argument("--db", action="store_true", help="Aktifkan pencatatan Database SQLite & Notifikasi MS Teams")
+    parser.add_argument("--no-missing-check", action="store_true", help="Nonaktifkan deteksi baut & pin hilang (Default: Aktif)")
     args = parser.parse_args()
 
     video_input = args.video
@@ -1346,7 +1424,7 @@ if __name__ == "__main__":
             video_input = select_video_file(title="Pilih File Video untuk Inspeksi Samping")
 
     if video_input and (os.path.exists(video_input) or str(video_input).isdigit() or str(video_input).startswith(("rtsp://", "http://"))):
-        run_side_inspector_demo(video_input, side=args.side, camera_id=args.cam, preset=args.preset, enable_db=args.db)
+        run_side_inspector_demo(video_input, side=args.side, camera_id=args.cam, preset=args.preset, enable_db=args.db, enable_missing_check=not args.no_missing_check)
     else:
         print("[!] Tidak ada video yang dipilih. Program dihentikan.")
 

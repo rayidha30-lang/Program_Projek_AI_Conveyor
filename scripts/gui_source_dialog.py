@@ -32,10 +32,23 @@ VIDEO_DIR = os.path.join(PROJECT_ROOT, "Video_Testing")
 
 
 def get_available_cameras(max_devices=6):
-    """Mendeteksi index webcam fisik USB tanpa mengimpor OpenCV (Zero-Crash)."""
+    """Mendeteksi index webcam fisik USB yang aktif secara cepat dan aman."""
     cams = []
     if sys.platform.startswith("win"):
-        cams = [0, 1]
+        try:
+            import cv2
+            for i in range(min(max_devices, 5)):
+                try:
+                    cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+                    if cap is not None and cap.isOpened():
+                        cams.append(i)
+                        cap.release()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if not cams:
+            cams = [0, 1, 2, 3]
     else:
         nodes = sorted(glob.glob("/dev/video[0-9]*"))
         for node in nodes:
@@ -46,7 +59,7 @@ def get_available_cameras(max_devices=6):
             except ValueError:
                 pass
         if not cams:
-            cams = [0, 1]
+            cams = [0, 1, 2, 3]
     return cams
 
 
@@ -311,7 +324,7 @@ def run_tkinter_source(title="Pilih Sumber Kamera / Video", default_source=None)
 
     frame_cams = tk.Frame(frame_options, padx=20)
     frame_cams.pack(fill="x", pady=2)
-    candidate_cams = sorted(list(set(cams + [0, 1])))
+    candidate_cams = sorted(list(set(cams + [0, 1, 2, 3])))
     for c_idx in candidate_cams:
         tag = " (Aktif)" if c_idx in cams else ""
         tk.Radiobutton(frame_cams, text=f"Webcam #{c_idx}{tag}", variable=var_cam_idx, value=c_idx, command=lambda: var_choice.set("webcam"), font=f_reg).pack(anchor="w", pady=2)
@@ -389,8 +402,8 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
         except Exception:
             pass
 
-    root.geometry("560x540")
-    root.minsize(500, 480)
+    root.geometry("620x540")
+    root.minsize(560, 480)
 
     f_fam = "Segoe UI" if sys.platform.startswith("win") else "DejaVu Sans"
     f_title = (f_fam, 11, "bold")
@@ -419,7 +432,7 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
     var_top_cam = tk.IntVar(master=root, value=int(default_top) if is_top_cam else (cams[0] if cams else 0))
     top_file_path = {"path": str(default_top) if (default_top and not is_top_cam) else None}
 
-    candidate_cams = sorted(list(set(cams + [0, 1])))
+    candidate_cams = sorted(list(set(cams + [0, 1, 2, 3])))
     f_top_cams = tk.Frame(f_top)
     f_top_cams.pack(fill="x")
     tk.Radiobutton(f_top_cams, text="Webcam:", variable=var_top_choice, value="webcam", font=(f_fam, 9, "bold")).pack(side="left")

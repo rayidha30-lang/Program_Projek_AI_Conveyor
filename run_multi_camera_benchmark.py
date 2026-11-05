@@ -241,16 +241,16 @@ def detect_available_cameras(max_devices=6):
     cams = []
     if sys.platform.startswith("win"):
         import cv2
-        for i in range(max_devices):
+        for i in range(min(max_devices, 5)):
             try:
                 cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-                if cap is None or not cap.isOpened():
-                    cap = cv2.VideoCapture(i)
                 if cap is not None and cap.isOpened():
                     cams.append(i)
                     cap.release()
             except Exception:
                 pass
+        if not cams:
+            cams = [0, 1, 2, 3]
     else:
         import glob
         nodes = sorted(glob.glob("/dev/video[0-9]*"))
@@ -262,9 +262,11 @@ def detect_available_cameras(max_devices=6):
             except ValueError:
                 pass
         if not cams:
-            for i in range(min(max_devices, 3)):
+            for i in range(min(max_devices, 4)):
                 if os.path.exists(f"/dev/video{i}"):
                     cams.append(i)
+        if not cams:
+            cams = [0, 1, 2, 3]
     return cams
 
 
@@ -292,6 +294,16 @@ def create_capture(src):
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+                # Cek codec aktif & beri peringatan ramah jika sensor hardware dibatasi DirectShow
+                fourcc_val = int(cap.get(cv2.CAP_PROP_FOURCC))
+                fourcc_str = "".join([chr((fourcc_val >> 8 * i) & 0xFF) for i in range(4)])
+                w_act = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h_act = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                if "YUY" in fourcc_str.upper() and w_act >= 1280:
+                    print(f"[*] [INFO WEBCAM #{idx}] Format aktif: {fourcc_str} ({w_act}x{h_act}).")
+                    print(f"    Webcam laptop menggunakan format YUY2 uncompressed (dibatasi driver DirectShow ke ~10 FPS pada 720p).")
+                    print(f"    Untuk 30 FPS penuh, gunakan webcam USB eksternal dengan chip kompresi hardware MJPEG.")
             except Exception:
                 pass
         return cap, True, str(idx)
@@ -535,7 +547,7 @@ def _handle_isolated_gui_dialog():
             default_cam_idx = int(args.default) if is_default_cam else (cams[0] if cams else 0)
             var_cam_idx = tk.IntVar(value=default_cam_idx)
 
-            candidate_cams = sorted(list(set(cams + [0, 1, 2])))
+            candidate_cams = sorted(list(set(cams + [0, 1, 2, 3])))
             rb_cam = tk.Radiobutton(frame_options, text="Gunakan Perangkat Live Webcam:", variable=var_choice, value="webcam", font=F_BOLD)
             rb_cam.pack(anchor="w", pady=(0, 4))
             frame_cams = tk.Frame(frame_options, padx=20)
@@ -603,8 +615,8 @@ def _handle_isolated_gui_dialog():
             root = tk.Tk()
             root.title("Pengaturan Sumber Dual Kamera (CAM-01 Top & CAM-02 Side)")
             _apply_x11_safe_window_props(root)
-            root.geometry("560x530")
-            root.minsize(500, 480)
+            root.geometry("620x540")
+            root.minsize(560, 480)
 
             res = {"top": args.top, "side": args.side}
 
@@ -627,7 +639,7 @@ def _handle_isolated_gui_dialog():
             var_top_cam = tk.IntVar(value=int(args.top) if is_top_cam else (cams[0] if cams else 0))
             top_file_path = {"path": str(args.top) if (args.top and not is_top_cam) else None}
 
-            candidate_cams = sorted(list(set(cams + [0, 1, 2])))
+            candidate_cams = sorted(list(set(cams + [0, 1, 2, 3])))
             f_top_cams = tk.Frame(f_top)
             f_top_cams.pack(fill="x")
             tk.Radiobutton(f_top_cams, text="Webcam:", variable=var_top_choice, value="webcam", font=F_BOLD).pack(side="left")
@@ -758,9 +770,7 @@ def _run_top_worker(
         return
 
     # 3. Inisialisasi Sumber Video / Kamera
-    is_cam = str(source_path).isdigit()
-    cap_src = int(source_path) if is_cam else str(source_path)
-    cap = cv2.VideoCapture(cap_src)
+    cap, is_cam, cap_src = create_capture(source_path)
     if not cap.isOpened():
         print(f"[ERROR TOP WORKER] Tidak dapat membuka sumber video CAM-01: {source_path}")
         status_buf.value = b"SRC_ERROR"
@@ -784,8 +794,6 @@ def _run_top_worker(
 
     try:
         while not stop_event.is_set():
-            t_frame_start = time.time()
-
             ret, frame = cap.read()
             if not ret or frame is None:
                 # Jika file video habis, putar ulang (looping) dengan re-open agar FFmpeg tidak memory leak
@@ -800,12 +808,11 @@ def _run_top_worker(
                     time.sleep(0.01)
                     continue
 
-            # Jalankan inspeksi terpadu plat slat & rib
+            # Jalankan inspeksi terpadu plat slat & rib (ukur latensi murni pipeline AI)
+            t_infer_start = time.time()
             inspect_res = inspector.inspect(frame)
-
-            # Hitung latensi inferensi frame ini
             t_frame_end = time.time()
-            latency_ms = (t_frame_end - t_frame_start) * 1000.0
+            latency_ms = (t_frame_end - t_infer_start) * 1000.0
 
             frame_count += 1
             dt = t_frame_end - t_prev
@@ -839,6 +846,10 @@ def _run_top_worker(
                         total_frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
                     )
                     cv2.imshow(win_name, hud)
+                    if getattr(inspector, "show_rib_unwarp_window", False):
+                        rib_unwarp = getattr(inspector.rib_inspector, "last_rib_unwarped_annotated", None)
+                        if rib_unwarp is not None:
+                            cv2.imshow("CAM-01 TOP: PERSPECTIVE TOP-DOWN CONVEYOR (BIRD'S-EYE)", rib_unwarp)
                     last_gui_render = t_now
                 key = cv2.waitKey(1) & 0xFF
                 if key in [ord("q"), ord("Q"), 27]:  # 27 = ESC
@@ -852,6 +863,20 @@ def _run_top_worker(
                 elif key in [ord("r"), ord("R")]:
                     inspector.reset_counters()
                     print("\n[*] [CAM-01 TOP] Counter QC & Cache Deduplikasi di-reset ke 0.\n")
+                elif key in [ord("t"), ord("T"), ord("e"), ord("E")]:
+                    if hasattr(inspector, "rib_inspector") and hasattr(inspector.rib_inspector, "toggle_tracker_engine"):
+                        new_eng = inspector.rib_inspector.toggle_tracker_engine()
+                        print(f"\n[*] [CAM-01 TOP] 🔄 SAKELAR TRACKER ENGINE SIRIP: [{new_eng}]\n")
+                elif key in [ord("j"), ord("J")]:
+                    if hasattr(inspector, "toggle_rib_unwarp_window"):
+                        st = inspector.toggle_rib_unwarp_window()
+                        mode_str = "DITAMPILKAN" if st else "DISEMBUNYIKAN"
+                        print(f"\n[*] [CAM-01 TOP] 🔍 JENDELA UNWARP BIRD'S-EYE: {mode_str}\n")
+                elif key in [ord("b"), ord("B")]:
+                    if hasattr(inspector, "toggle_simulate_bending"):
+                        st = inspector.toggle_simulate_bending()
+                        mode_str = "AKTIF (+20mm BENGKOK - NG TEST)" if st else "NON-AKTIF (NORMAL)"
+                        print(f"\n[*] [CAM-01 TOP] ⚡ SIMULASI DEFEK SIRIP BENGKOK: {mode_str}\n")
                 elif key in [ord("p"), ord("P")]:
                     if hasattr(inspector, "toggle_profile"):
                         inspector.toggle_profile()
@@ -1032,20 +1057,14 @@ def _run_side_worker(
 
     if source_path is not None and os.path.exists(str(source_path)):
         side_video_path = str(source_path)
-        cap = cv2.VideoCapture(side_video_path)
-        is_cam = False
+        cap, is_cam, _ = create_capture(side_video_path)
         print(f"[*] Worker {camera_id} Side Inspection memuat video: {os.path.basename(side_video_path)}")
         if inspector.auto_preset_mode:
             det_p = inspector.resolve_preset_from_source(side_video_path)
             inspector.set_preset(det_p, verbose=True)
     elif source_path is None or source_path == "" or str(source_path).isdigit():
         cam_idx = int(source_path) if str(source_path).isdigit() else 0
-        # Gunakan DirectShow (CAP_DSHOW) di Windows untuk bypass bug MSMF Error -1072873822
-        if sys.platform.startswith("win"):
-            cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
-        else:
-            cap = cv2.VideoCapture(cam_idx)
-        is_cam = True
+        cap, is_cam, _ = create_capture(cam_idx)
 
         # Jika webcam tidak bisa dibuka, langsung alihkan ke file video testing
         if not cap.isOpened():
@@ -1053,8 +1072,7 @@ def _run_side_worker(
             cap = None
             if DEFAULT_SIDE_VIDEO and os.path.exists(DEFAULT_SIDE_VIDEO):
                 side_video_path = DEFAULT_SIDE_VIDEO
-                cap = cv2.VideoCapture(side_video_path)
-                is_cam = False
+                cap, is_cam, _ = create_capture(side_video_path)
                 print(f"[INFO SIDE WORKER] Webcam #{cam_idx} tidak terdeteksi. Beralih otomatis ke video testing: {os.path.basename(DEFAULT_SIDE_VIDEO)}")
                 if inspector.auto_preset_mode:
                     det_p = inspector.resolve_preset_from_source(side_video_path)
@@ -1078,8 +1096,6 @@ def _run_side_worker(
 
     try:
         while not stop_event.is_set():
-            t_frame_start = time.time()
-
             if cap is not None and cap.isOpened():
                 ret, frame = cap.read()
                 if not ret or frame is None:
@@ -1116,10 +1132,10 @@ def _run_side_worker(
                 time.sleep(0.015)
 
             # Jalankan inspeksi komponen samping (YOLO Bolt/Pin + PatchCore Bracket)
+            t_infer_start = time.time()
             display_frame, payload = inspector.process_frame(frame)
-
             t_frame_end = time.time()
-            latency_ms = (t_frame_end - t_frame_start) * 1000.0
+            latency_ms = (t_frame_end - t_infer_start) * 1000.0
 
             frame_count += 1
             dt = t_frame_end - t_prev
@@ -1481,7 +1497,6 @@ def _run_threaded_engine(args):
                     time.sleep(0.02)
                     continue
 
-                t_start = time.time()
                 ret, frame = cap_top.read()
                 if not ret or frame is None:
                     if not is_cam_top:
@@ -1494,6 +1509,7 @@ def _run_threaded_engine(args):
                         time.sleep(0.01)
                         continue
 
+                t_infer_start = time.time()
                 if top_stream is not None:
                     with torch.cuda.stream(top_stream):
                         with torch.inference_mode():
@@ -1501,7 +1517,7 @@ def _run_threaded_engine(args):
                 else:
                     inspect_res = top_inspector.inspect(frame)
                 t_end = time.time()
-                lat = (t_end - t_start) * 1000.0
+                lat = (t_end - t_infer_start) * 1000.0
 
                 dt = t_end - t_prev
                 t_prev = t_end
@@ -1558,7 +1574,6 @@ def _run_threaded_engine(args):
                     time.sleep(0.02)
                     continue
 
-                t_start = time.time()
                 ret, frame = cap_side.read()
                 if not ret or frame is None:
                     if not is_cam_side:
@@ -1572,6 +1587,7 @@ def _run_threaded_engine(args):
                         time.sleep(0.01)
                         continue
 
+                t_infer_start = time.time()
                 if side_stream is not None:
                     with torch.cuda.stream(side_stream):
                         with torch.inference_mode():
@@ -1579,7 +1595,7 @@ def _run_threaded_engine(args):
                 else:
                     display_frame, payload = side_inspector.process_frame(frame)
                 t_end = time.time()
-                lat = (t_end - t_start) * 1000.0
+                lat = (t_end - t_infer_start) * 1000.0
 
                 dt = t_end - t_prev
                 t_prev = t_end
@@ -1698,6 +1714,10 @@ def _run_threaded_engine(args):
                                 total_frames=total_f_top
                             )
                             cv2.imshow(win_top, hud_top)
+                            if getattr(top_inspector, "show_rib_unwarp_window", False):
+                                rib_unwarp = getattr(top_inspector.rib_inspector, "last_rib_unwarped_annotated", None)
+                                if rib_unwarp is not None:
+                                    cv2.imshow("CAM-01 TOP: PERSPECTIVE TOP-DOWN CONVEYOR (BIRD'S-EYE)", rib_unwarp)
 
                     if side_inspector is not None:
                         with side_lock:
@@ -1814,6 +1834,18 @@ def _run_threaded_engine(args):
                     with top_lock:
                         new_eng = top_inspector.rib_inspector.toggle_tracker_engine()
                     print(f"\n[*] [CAM-01 TOP] 🔄 SAKELAR TRACKER ENGINE SIRIP: [{new_eng}]\n")
+            elif key in [ord("j"), ord("J")]:
+                if top_inspector and hasattr(top_inspector, "toggle_rib_unwarp_window"):
+                    with top_lock:
+                        st = top_inspector.toggle_rib_unwarp_window()
+                    mode_str = "DITAMPILKAN" if st else "DISEMBUNYIKAN"
+                    print(f"\n[*] [CAM-01 TOP] 🔍 JENDELA UNWARP BIRD'S-EYE: {mode_str}\n")
+            elif key in [ord("b"), ord("B")]:
+                if top_inspector and hasattr(top_inspector, "toggle_simulate_bending"):
+                    with top_lock:
+                        st = top_inspector.toggle_simulate_bending()
+                    mode_str = "AKTIF (+20mm BENGKOK - NG TEST)" if st else "NON-AKTIF (NORMAL)"
+                    print(f"\n[*] [CAM-01 TOP] ⚡ SIMULASI DEFEK SIRIP BENGKOK: {mode_str}\n")
             elif key in [ord("1"), ord("f"), ord("F")]:
                 print("\n[*] [CAM-01 TOP] Membuka File Explorer untuk Memilih Video Baru Plat & Rib...")
                 init_top = os.path.dirname(str(top_source_path)) if (top_source_path and os.path.exists(str(top_source_path))) else VIDEO_DIR
@@ -2022,7 +2054,7 @@ Shortcut Keyboard Saat Berjalan:
   [B]               : Beralih instan ke video CAM-02 Side berikutnya (pada mode Threaded)
   [C]               : Beralih instan ke perangkat live webcam USB berikutnya (0 -> 1 -> ...)
   [W]               : Buka dialog visual pengaturan sumber dual kamera (Webcam / File Video)
-  [T] / [E]         : Sakelar Tracker Engine Sirip TOP (LEGACY <-> TIER 1 VITERBI <-> TIER 2 POSE)
+  [T] / [E]         : Sakelar Tracker Engine Sirip TOP (LEGACY <-> TIER 1 VITERBI <-> TIER 2 POSE <-> TIER 3 UNWARP)
   [1] / [F]         : Buka File Explorer dialog untuk mengganti video CAM-01 TOP
   [2] / [O]         : Buka File Explorer dialog untuk mengganti video CAM-02 SIDE
   [D]               : Saklar Database Logging & Notifikasi Teams (ON / OFF)
