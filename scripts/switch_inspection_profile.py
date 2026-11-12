@@ -30,7 +30,7 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+CURRENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_DIR = os.path.join(CURRENT_DIR, "Vision_Engine_Core", "02_Top_Inspection_Slat_Rib", "configs")
 ACTIVE_CONFIG_PATH = os.path.join(CONFIG_DIR, "top_inspection_config.json")
 DEFAULT_CONFIG_PATH = os.path.join(CONFIG_DIR, "top_inspection_config.default.json")

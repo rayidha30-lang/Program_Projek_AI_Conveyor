@@ -64,23 +64,50 @@ class BoltPinDetector:
             self.device_info = "CPU"
             self.use_half = False
 
-        # Cek apakah ada bobot TensorRT Engine (.engine) yang tersedia untuk akselerasi GPU Orin
-        engine_candidate = os.path.splitext(model_path)[0] + ".engine"
+        has_ort_cuda = False
+        if self.device != "cpu":
+            try:
+                import onnxruntime as _ort
+                has_ort_cuda = "CUDAExecutionProvider" in _ort.get_available_providers()
+            except Exception:
+                has_ort_cuda = False
+
+        # Auto-upgrade .pt ke TensorRT (.engine) atau ONNX Runtime CUDA (.onnx) jika tersedia
         actual_model_to_load = model_path
-        if self.device != "cpu" and os.path.exists(engine_candidate):
-            actual_model_to_load = engine_candidate
-            print(f"[BoltPinDetector] 🚀 Menggunakan TensorRT Engine FP16: {os.path.basename(engine_candidate)}")
+        if self.device != "cpu":
+            stem = os.path.splitext(model_path)[0]
+            engine_candidate = stem + ".engine"
+            onnx_candidate = stem + ".onnx"
+            if os.path.exists(engine_candidate):
+                actual_model_to_load = engine_candidate
+                print(f"[BoltPinDetector] 🚀 Menggunakan TensorRT Engine FP16: {os.path.basename(engine_candidate)}")
+            elif has_ort_cuda and str(model_path).endswith(".pt") and os.path.exists(onnx_candidate):
+                actual_model_to_load = onnx_candidate
+                print(f"[BoltPinDetector] ⚡ Akselerasi ONNX Runtime CUDA aktif: {os.path.basename(onnx_candidate)}")
+
+        def _load_yolo_weights(weights_path):
+            is_trt_or_onnx = str(weights_path).endswith((".engine", ".onnx"))
+            if str(weights_path).endswith(".onnx"):
+                try:
+                    import onnxruntime as _ort
+                    _ort.set_default_logger_severity(3)
+                except Exception:
+                    pass
+            loaded = YOLO(weights_path, task="detect") if is_trt_or_onnx else YOLO(weights_path)
+            if self.device != "cpu" and HAS_TORCH and torch.cuda.is_available() and not is_trt_or_onnx:
+                try:
+                    loaded.to(self.device)
+                    if hasattr(loaded, "model") and loaded.model is not None:
+                        loaded.model.half()
+                        self.use_half = True
+                except Exception:
+                    pass
+            elif is_trt_or_onnx:
+                self.use_half = True
+            return loaded
 
         self.actual_model_to_load = actual_model_to_load
-        self.model = YOLO(actual_model_to_load)
-        if self.device != "cpu" and HAS_TORCH and torch.cuda.is_available() and not actual_model_to_load.endswith((".engine", ".onnx")):
-            try:
-                self.model.to(self.device)
-                if hasattr(self.model, "model") and self.model.model is not None:
-                    self.model.model.half()
-                    self.use_half = True
-            except Exception:
-                pass
+        self.model = _load_yolo_weights(actual_model_to_load)
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self.max_pin_distance = max_pin_distance
@@ -109,9 +136,7 @@ class BoltPinDetector:
             for bc in bolt_cands:
                 if os.path.exists(bc):
                     try:
-                        self.model = YOLO(bc)
-                        if self.device != "cpu" and HAS_TORCH and torch.cuda.is_available() and not bc.endswith((".engine", ".onnx")):
-                            self.model.to(self.device)
+                        self.model = _load_yolo_weights(bc)
                         actual_model_to_load = bc
                         self.actual_model_to_load = bc
                         self.class_names = self.model.names if hasattr(self.model, 'names') else {}
@@ -189,15 +214,17 @@ class BoltPinDetector:
                         self.model.to("cpu")
                 except Exception:
                     pass
-                results = self.model(
-                    source=infer_img,
-                    conf=self.conf_threshold,
-                    iou=self.iou_threshold,
-                    device="cpu",
-                    agnostic_nms=self.agnostic_nms,
-                    imgsz=480,
-                    verbose=False
-                )
+                fb_kwargs = {
+                    "source": infer_img,
+                    "conf": self.conf_threshold,
+                    "iou": self.iou_threshold,
+                    "device": "cpu",
+                    "agnostic_nms": self.agnostic_nms,
+                    "verbose": False
+                }
+                if not is_trt_or_onnx:
+                    fb_kwargs["imgsz"] = 480
+                results = self.model(**fb_kwargs)
             else:
                 raise e_cuda
 

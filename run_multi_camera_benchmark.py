@@ -313,6 +313,118 @@ def create_capture(src):
         return cap, False, path
 
 
+class BufferedAsyncCapture:
+    """
+    Pembungkus non-blocking VideoCapture berbasis thread terpisah untuk mengeliminasi
+    latensi decode video (~9-12ms/frame) pada worker AI sambil tetap menjaga urutan frame.
+    """
+
+    def __init__(self, cap, is_cam=False, buffer_size=3):
+        import cv2
+        import queue
+        import threading
+        self._cv2 = cv2
+        self._cap = cap
+        self._is_cam = bool(is_cam)
+        self._queue_mod = queue
+        self._buf = queue.Queue(maxsize=1 if self._is_cam else max(2, int(buffer_size)))
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._seek_pos = None
+        self._at_eof = False
+        self._thread = threading.Thread(target=self._grab_loop, daemon=True, name="Thread-AsyncCap")
+        self._thread.start()
+
+    def _clear_queue(self):
+        while not self._buf.empty():
+            try:
+                self._buf.get_nowait()
+            except self._queue_mod.Empty:
+                break
+
+    def _grab_loop(self):
+        while not self._stop.is_set():
+            with self._lock:
+                if self._seek_pos is not None:
+                    pos = self._seek_pos
+                    self._seek_pos = None
+                    self._at_eof = False
+                    if self._cap is not None and self._cap.isOpened():
+                        self._cap.set(self._cv2.CAP_PROP_POS_FRAMES, pos)
+                    self._clear_queue()
+
+            if self._at_eof or self._cap is None or not self._cap.isOpened():
+                time.sleep(0.005)
+                continue
+
+            if not self._is_cam and self._buf.full():
+                time.sleep(0.002)
+                continue
+
+            ret, frame = self._cap.read()
+            if not ret or frame is None:
+                if not self._is_cam:
+                    self._at_eof = True
+                    while not self._stop.is_set() and self._seek_pos is None:
+                        try:
+                            self._buf.put((False, None), timeout=0.02)
+                            break
+                        except self._queue_mod.Full:
+                            continue
+                else:
+                    time.sleep(0.005)
+                continue
+
+            if self._is_cam:
+                if self._buf.full():
+                    self._clear_queue()
+                try:
+                    self._buf.put((True, frame), timeout=0.01)
+                except self._queue_mod.Full:
+                    pass
+            else:
+                while not self._stop.is_set() and self._seek_pos is None:
+                    try:
+                        self._buf.put((True, frame), timeout=0.02)
+                        break
+                    except self._queue_mod.Full:
+                        continue
+
+    def isOpened(self):
+        return self._cap is not None and self._cap.isOpened()
+
+    def read(self):
+        try:
+            return self._buf.get(timeout=0.25)
+        except self._queue_mod.Empty:
+            return False, None
+
+    def get(self, prop_id):
+        if self._cap is not None:
+            return self._cap.get(prop_id)
+        return 0.0
+
+    def set(self, prop_id, value):
+        import cv2
+        if prop_id == cv2.CAP_PROP_POS_FRAMES:
+            with self._lock:
+                self._seek_pos = max(0, int(value))
+                self._at_eof = False
+                self._clear_queue()
+            return True
+        if self._cap is not None:
+            return self._cap.set(prop_id, value)
+        return False
+
+    def release(self):
+        self._stop.set()
+        self._clear_queue()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        if self._cap is not None and self._cap.isOpened():
+            self._cap.release()
+
+
 def get_available_videos():
     """Mengambil daftar seluruh file video pengujian yang ada di direktori Video_Testing / Documentation."""
     search_dirs = [
@@ -1439,30 +1551,60 @@ def _run_threaded_engine(args):
     except Exception:
         pass
 
-    # Pre-Warmup pass untuk mengeliminasi latensi inisialisasi CUDA 5.8s pada frame 0
+    def _create_buffered_capture(src):
+        c_raw, is_c, r_path = create_capture(src)
+        if c_raw is not None and c_raw.isOpened():
+            return BufferedAsyncCapture(c_raw, is_cam=is_c, buffer_size=3), is_c, r_path
+        return c_raw, is_c, r_path
+
+    # Pre-Warmup pass pada CUDA stream aktif (stride=1 agar kernel YOLO benar-benar terkompilasi sebelum loop!)
     print("[*] Melakukan pre-warmup GPU AI Engine (mengeliminasi lonjakan latensi frame pertama)...")
     try:
         if top_inspector is not None and cap_top is not None and cap_top.isOpened():
             ret_w, frame_w = cap_top.read()
             if ret_w and frame_w is not None:
-                top_inspector.inspect(frame_w)
+                if top_stream is not None:
+                    with torch.cuda.stream(top_stream):
+                        with torch.inference_mode():
+                            top_inspector.inspect(frame_w)
+                else:
+                    top_inspector.inspect(frame_w)
+                top_inspector.reset_counters()
                 if not is_cam_top:
                     cap_top.set(cv2.CAP_PROP_POS_FRAMES, 0)
         if side_inspector is not None and cap_side is not None and cap_side.isOpened():
             ret_w, frame_w = cap_side.read()
             if ret_w and frame_w is not None:
-                side_inspector.process_frame(frame_w)
+                if side_stream is not None:
+                    with torch.cuda.stream(side_stream):
+                        with torch.inference_mode():
+                            side_inspector.process_frame(frame_w)
+                else:
+                    side_inspector.process_frame(frame_w)
+                side_inspector.reset_session()
                 if not is_cam_side:
                     cap_side.set(cv2.CAP_PROP_POS_FRAMES, 0)
         print("[*] Pre-warmup selesai. GPU siap pada performa steady-state.")
     except Exception as e_wm:
         print(f"[WARN] Pre-warmup skipped: {e_wm}")
 
+    # Aktifkan adaptive yolo_stride=2 pada CAM-01 saat dual-camera berbagi 1 GPU agar beban CUDA turun 50%
+    if top_inspector is not None and side_inspector is not None and hasattr(top_inspector, "rib_inspector"):
+        if top_inspector.rib_inspector.yolo_stride < 2:
+            top_inspector.rib_inspector.yolo_stride = 2
+            print("[*] [CAM-01 TOP] Dual-GPU adaptive yolo_stride=2 aktif (hemat beban CUDA 50% sambil menjaga akurasi).")
+
+    total_f_top = int(cap_top.get(cv2.CAP_PROP_FRAME_COUNT)) if (cap_top and not is_cam_top) else 0
+
+    # Bungkus capture dengan pre-decode async agar decode video 9-12ms tidak memblokir AI
+    if cap_top is not None and cap_top.isOpened():
+        cap_top = BufferedAsyncCapture(cap_top, is_cam=is_cam_top, buffer_size=3)
+    if cap_side is not None and cap_side.isOpened():
+        cap_side = BufferedAsyncCapture(cap_side, is_cam=is_cam_side, buffer_size=3)
+
     # Decoupled GUI Rendering Pacing: Pacing tampilan visual GUI desktop tanpa mencekik throughput AI
     gui_fps = getattr(args, "gui_fps", 15.0)
     gui_interval = (1.0 / gui_fps) if (gui_fps and gui_fps > 0) else 0.0
-
-    total_f_top = int(cap_top.get(cv2.CAP_PROP_FRAME_COUNT)) if (cap_top and not is_cam_top) else 0
 
     top_state = {
         "display": None,
@@ -1490,6 +1632,9 @@ def _run_threaded_engine(args):
         nonlocal cap_top, top_source_path, is_cam_top
         t_prev = time.time()
         fps_hist = []
+        # Tracker dataset: catat setiap rib yang selesai transit (OK maupun NG) ke Rib_Dataset
+        _ds_last_rib_no   = 0   # rib_count terakhir yang sudah dilog
+        _ds_prev_rib_res  = {}  # snapshot rib_res saat rib terakhir aktif
 
         while not stop_event.is_set():
             try:
@@ -1544,6 +1689,34 @@ def _run_threaded_engine(args):
                         slat_no=getattr(top_inspector.slat_inspector, "slat_count", None),
                         rib_no=getattr(top_inspector.rib_inspector, "rib_count", None)
                     )
+
+                # Dataset logging: catat SETIAP rib selesai (OK maupun NG) ke Rib_Dataset
+                # Strategi: saat rib_count bertambah, log data rib SEBELUMNYA (yang sudah final)
+                if top_inspector and top_inspector.is_db_enabled():
+                    _rib_res_now = inspect_res.get("rib_res", {}) or {}
+                    _curr_rib_no = int(_rib_res_now.get("rib_count", 0) or 0)
+                    _curr_status = _rib_res_now.get("status", "WAIT")
+                    # Simpan snapshot saat rib aktif (status OK/NG, bukan WAIT)
+                    if _curr_status in ("OK", "NG") and _curr_rib_no > 0:
+                        _ds_prev_rib_res = dict(_rib_res_now)
+                    # Saat rib_count bertambah → rib sebelumnya sudah selesai, log ke DB
+                    if _curr_rib_no > _ds_last_rib_no and _ds_last_rib_no > 0 and _ds_prev_rib_res:
+                        try:
+                            _db = getattr(top_inspector, "db_bridge", None)
+                            if _db is not None and hasattr(_db, "log_rib_dataset"):
+                                # Filter: minimal 15 frame aktif → buang fragmen rekaman tidak lengkap
+                                _active_frames = int(_ds_prev_rib_res.get("active_rib_frames", 0) or 0)
+                                if _active_frames >= 15:
+                                    _db.log_rib_dataset(
+                                        rib_res=_ds_prev_rib_res,
+                                        rib_number=_ds_last_rib_no,
+                                        slat_number=getattr(top_inspector.slat_inspector, "slat_count", None),
+                                        camera_profile=getattr(top_inspector, "active_profile_name", None)
+                                    )
+                        except Exception:
+                            pass
+                    if _curr_rib_no > _ds_last_rib_no:
+                        _ds_last_rib_no = _curr_rib_no
 
                 # Push data ke top_state untuk dirender asinkron oleh Main GUI Thread (Zero-Overhead di Thread AI)
                 with top_lock:
@@ -1671,9 +1844,32 @@ def _run_threaded_engine(args):
             print(f"[!] Gagal membuat file CSV: {e_csv}")
             csv_file = None
 
+    def _switch_top_source(new_src):
+        nonlocal cap_top, is_cam_top, top_source_path, total_f_top
+        with top_lock:
+            if cap_top is not None:
+                cap_top.release()
+            cap_top, is_cam_top, top_source_path = _create_buffered_capture(new_src)
+            total_f_top = int(cap_top.get(cv2.CAP_PROP_FRAME_COUNT)) if (cap_top and not is_cam_top) else 0
+        if top_inspector:
+            top_inspector.reset_counters()
+
+    def _switch_side_source(new_src):
+        nonlocal cap_side, is_cam_side, side_source_path
+        with side_lock:
+            if cap_side is not None:
+                cap_side.release()
+            cap_side, is_cam_side, side_source_path = _create_buffered_capture(new_src)
+        if side_inspector:
+            if getattr(side_inspector, "auto_preset_mode", True):
+                det_p = side_inspector.resolve_preset_from_source(side_source_path)
+                side_inspector.set_preset(det_p, verbose=True)
+            side_inspector.reset_session()
+
     t0 = None
     last_print = 0.0
     last_gui_render = 0.0
+    last_key_poll = 0.0
 
     try:
         while not stop_event.is_set():
@@ -1691,11 +1887,11 @@ def _run_threaded_engine(args):
                 stop_event.set()
                 break
 
-            # Render GUI OpenCV di Main Thread (Decoupled GUI Rendering Sejati - Bebas GIL dari Thread AI)
+            # Render GUI OpenCV di Main Thread (Decoupled GUI Rendering mulus tanpa jitter interval)
             key = -1
             if args.mode == "dual":
+                rendered_any = False
                 if (now - last_gui_render) >= gui_interval:
-                    last_gui_render = now
                     if top_inspector is not None:
                         with top_lock:
                             has_new_top = top_state.get("has_new", False)
@@ -1703,7 +1899,8 @@ def _run_threaded_engine(args):
                             res_top = top_state.get("inspect_res")
                             fps_top = top_state.get("fps", 0.0)
                             f_idx_top = top_state.get("frames", 0)
-                            top_state["has_new"] = False
+                            if has_new_top:
+                                top_state["has_new"] = False
 
                         if has_new_top and raw_top is not None and res_top is not None:
                             hud_top = top_inspector.render_combined_dashboard(
@@ -1714,6 +1911,7 @@ def _run_threaded_engine(args):
                                 total_frames=total_f_top
                             )
                             cv2.imshow(win_top, hud_top)
+                            rendered_any = True
                             if getattr(top_inspector, "show_rib_unwarp_window", False):
                                 rib_unwarp = getattr(top_inspector.rib_inspector, "last_rib_unwarped_annotated", None)
                                 if rib_unwarp is not None:
@@ -1725,7 +1923,8 @@ def _run_threaded_engine(args):
                             disp_side = side_state.get("display")
                             fps_side = side_state.get("fps", 0.0)
                             lat_side = side_state.get("latency", 0.0)
-                            side_state["has_new"] = False
+                            if has_new_side:
+                                side_state["has_new"] = False
 
                         if has_new_side and disp_side is not None:
                             # Render banner pada disp_side di Main Thread
@@ -1741,12 +1940,16 @@ def _run_threaded_engine(args):
                             cv2.putText(disp_side, banner, (25, h_d - 24),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.76, (0, 255, 255), 2, cv2.LINE_AA)
                             cv2.imshow(win_side, disp_side)
+                            rendered_any = True
 
+                    if rendered_any:
+                        last_gui_render = now
+
+                if rendered_any or (now - last_key_poll) >= 0.025:
                     key = cv2.waitKey(1) & 0xFF
-                else:
-                    # Pompa event loop window & tidur sejenak untuk melepaskan GIL sepenuhnya ke thread AI
-                    key = cv2.waitKey(1) & 0xFF
-                    time.sleep(0.005)
+                    last_key_poll = now
+                if not rendered_any:
+                    time.sleep(0.003)
             else:
                 time.sleep(0.005)
 
@@ -1795,12 +1998,7 @@ def _run_threaded_engine(args):
             elif key in [ord("v"), ord("V")]:
                 new_top = cycle_next_video(top_source_path)
                 if new_top and str(new_top) != str(top_source_path):
-                    with top_lock:
-                        if cap_top is not None:
-                            cap_top.release()
-                        cap_top, is_cam_top, top_source_path = create_capture(new_top)
-                    if top_inspector:
-                        top_inspector.reset_counters()
+                    _switch_top_source(new_top)
             elif key in [ord("m"), ord("M")]:
                 if side_inspector:
                     cur_p = getattr(side_inspector, "preset", "opsi_1")
@@ -1811,24 +2009,11 @@ def _run_threaded_engine(args):
             elif key in [ord("b"), ord("B")]:
                 new_side = cycle_next_video(side_source_path)
                 if new_side and str(new_side) != str(side_source_path):
-                    with side_lock:
-                        if cap_side is not None:
-                            cap_side.release()
-                        cap_side, is_cam_side, side_source_path = create_capture(new_side)
-                    if side_inspector:
-                        if getattr(side_inspector, "auto_preset_mode", True):
-                            det_p = side_inspector.resolve_preset_from_source(side_source_path)
-                            side_inspector.set_preset(det_p, verbose=True)
-                        side_inspector.reset_session()
+                    _switch_side_source(new_side)
             elif key in [ord("c"), ord("C")]:
                 new_cam = cycle_next_camera(top_source_path)
                 if new_cam and str(new_cam) != str(top_source_path):
-                    with top_lock:
-                        if cap_top is not None:
-                            cap_top.release()
-                        cap_top, is_cam_top, top_source_path = create_capture(new_cam)
-                    if top_inspector:
-                        top_inspector.reset_counters()
+                    _switch_top_source(new_cam)
             elif key in [ord("t"), ord("T"), ord("e"), ord("E")]:
                 if top_inspector and hasattr(top_inspector, "rib_inspector"):
                     with top_lock:
@@ -1854,12 +2039,7 @@ def _run_threaded_engine(args):
                     title="[CAM-01 TOP] Pilih File Video Plat Slat & Bilah Rib"
                 )
                 if new_top and os.path.exists(new_top) and str(new_top) != str(top_source_path):
-                    with top_lock:
-                        if cap_top is not None:
-                            cap_top.release()
-                        cap_top, is_cam_top, top_source_path = create_capture(new_top)
-                    if top_inspector:
-                        top_inspector.reset_counters()
+                    _switch_top_source(new_top)
                     print(f"[*] CAM-01 Top berhasil beralih ke video: {os.path.basename(str(top_source_path))}")
             elif key in [ord("2"), ord("o"), ord("O"), ord("f"), ord("F"), ord("s"), ord("S")]:
                 print(f"\n[*] [{args.side_cam_id} SIDE] Membuka File Explorer untuk Memilih Video Baru Baut & Pin...")
@@ -1869,15 +2049,7 @@ def _run_threaded_engine(args):
                     title=f"[{args.side_cam_id} SIDE] Pilih File Video Baut, Pin & Bracket"
                 )
                 if new_side and os.path.exists(new_side) and str(new_side) != str(side_source_path):
-                    with side_lock:
-                        if cap_side is not None:
-                            cap_side.release()
-                        cap_side, is_cam_side, side_source_path = create_capture(new_side)
-                    if side_inspector:
-                        if getattr(side_inspector, "auto_preset_mode", True):
-                            det_p = side_inspector.resolve_preset_from_source(side_source_path)
-                            side_inspector.set_preset(det_p, verbose=True)
-                        side_inspector.reset_session()
+                    _switch_side_source(new_side)
                     print(f"[*] {args.side_cam_id} Side berhasil beralih ke video: {os.path.basename(str(side_source_path))}")
             elif key in [ord("w"), ord("W")]:
                 print("\n[*] Membuka Dialog Pengaturan Sumber Dual Kamera (Webcam / File Video)...")
@@ -1887,25 +2059,12 @@ def _run_threaded_engine(args):
                     side_cam_id=args.side_cam_id
                 )
                 if new_top and str(new_top) != str(top_source_path):
-                    with top_lock:
-                        if cap_top is not None:
-                            cap_top.release()
-                        cap_top, is_cam_top, top_source_path = create_capture(new_top)
-                    if top_inspector:
-                        top_inspector.reset_counters()
+                    _switch_top_source(new_top)
                     s_label = f"Webcam #{top_source_path}" if is_cam_top else os.path.basename(str(top_source_path))
                     print(f"[*] CAM-01 Top beralih ke: {s_label}")
 
                 if new_side and str(new_side) != str(side_source_path):
-                    with side_lock:
-                        if cap_side is not None:
-                            cap_side.release()
-                        cap_side, is_cam_side, side_source_path = create_capture(new_side)
-                    if side_inspector:
-                        if getattr(side_inspector, "auto_preset_mode", True):
-                            det_p = side_inspector.resolve_preset_from_source(side_source_path)
-                            side_inspector.set_preset(det_p, verbose=True)
-                        side_inspector.reset_session()
+                    _switch_side_source(new_side)
                     s_label = f"Webcam #{side_source_path}" if is_cam_side else os.path.basename(str(side_source_path))
                     print(f"[*] {args.side_cam_id} Side beralih ke: {s_label}")
 
@@ -2054,7 +2213,7 @@ Shortcut Keyboard Saat Berjalan:
   [B]               : Beralih instan ke video CAM-02 Side berikutnya (pada mode Threaded)
   [C]               : Beralih instan ke perangkat live webcam USB berikutnya (0 -> 1 -> ...)
   [W]               : Buka dialog visual pengaturan sumber dual kamera (Webcam / File Video)
-  [T] / [E]         : Sakelar Tracker Engine Sirip TOP (LEGACY <-> TIER 1 VITERBI <-> TIER 2 POSE <-> TIER 3 UNWARP)
+  [T] / [E]         : Sakelar Tracker Engine Sirip TOP (LEGACY <-> TIER 1 VITERBI <-> TIER 4 HOUGH STITCH)
   [1] / [F]         : Buka File Explorer dialog untuk mengganti video CAM-01 TOP
   [2] / [O]         : Buka File Explorer dialog untuk mengganti video CAM-02 SIDE
   [D]               : Saklar Database Logging & Notifikasi Teams (ON / OFF)

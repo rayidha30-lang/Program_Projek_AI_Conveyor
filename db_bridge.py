@@ -192,6 +192,26 @@ class InspectionDBBridge:
                 CREATE INDEX IF NOT EXISTS idx_inspections_time ON Inspections (InspectionTime DESC);
                 CREATE INDEX IF NOT EXISTS idx_inspections_result ON Inspections (OverallResult);
                 CREATE INDEX IF NOT EXISTS idx_detections_lookup ON Inspection_Detections (ComponentType, Side, Result);
+                CREATE TABLE IF NOT EXISTS Rib_Dataset (
+                    DatasetID     INTEGER PRIMARY KEY AUTOINCREMENT,
+                    RecordedAt    DATETIME NOT NULL DEFAULT (datetime('now', 'localtime')),
+                    RibNumber     INTEGER,
+                    SlatNumber    INTEGER,
+                    Label         TEXT NOT NULL CHECK (Label IN ('OK', 'NG')),
+                    TrackerEngine TEXT,
+                    PVFlatness    REAL,
+                    Sagitta       REAL,
+                    InnerDev      REAL,
+                    TipDev        REAL,
+                    Coverage      REAL,
+                    ActiveFrames  INTEGER,
+                    Confidence    REAL,
+                    ProfileJson   TEXT,
+                    CameraProfile TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_ribdataset_label   ON Rib_Dataset (Label);
+                CREATE INDEX IF NOT EXISTS idx_ribdataset_time    ON Rib_Dataset (RecordedAt DESC);
+                CREATE INDEX IF NOT EXISTS idx_ribdataset_profile ON Rib_Dataset (CameraProfile, Label);
                 """)
             conn.close()
         except Exception as e_schema:
@@ -228,6 +248,81 @@ class InspectionDBBridge:
     def is_enabled(self) -> bool:
         """Mengecek apakah database logging sedang aktif."""
         return self.enabled
+
+    def log_rib_dataset(self, rib_res: dict, rib_number=None, slat_number=None,
+                        camera_profile: str = None):
+        """
+        Mencatat satu baris dataset metrologi rib ke tabel Rib_Dataset (non-blocking).
+        Dipanggil untuk SETIAP rib yang selesai dievaluasi (OK maupun NG) agar dataset
+        terkumpul otomatis selama benchmark berjalan dengan tombol [D] aktif.
+
+        :param camera_profile: Nama profil kamera aktif (dari profile_name di config JSON).
+                               Memisahkan dataset antar posisi kamera agar threshold adaptif
+                               tidak tercampur antar sudut pandang yang berbeda.
+
+        Kolom yang disimpan:
+        - Label         : 'OK' atau 'NG' (vonis final sistem)
+        - PVFlatness    : Peak-Valley flatness (px) — metrik kelurusan global
+        - Sagitta       : Lendutan busur parabola (px) — metrik kelengkungan
+        - InnerDev      : Deviasi badan rib (px) — metrik cacat badan
+        - TipDev        : Deviasi ujung rib (px) — metrik cacat ujung
+        - Coverage      : Rasio kontur yang berhasil dilacak [0..1]
+        - ActiveFrames  : Jumlah frame rib aktif selama transit
+        - Confidence    : Confidence YOLO atau dual-polarity
+        - ProfileJson   : JSON array koordinat Y kontur rib (downsample 4x) — Opsi B
+        - CameraProfile : Nama profil/posisi kamera aktif saat rekaman
+        """
+        if not self.enabled:
+            return False
+
+        label = "NG" if rib_res.get("is_ng", False) else "OK"
+        pv    = float(rib_res.get("pv_flatness", 0.0) or 0.0)
+        sag   = float(rib_res.get("sagitta", 0.0) or 0.0)
+        idev  = float(rib_res.get("inner_dev", 0.0) or 0.0)
+        tdev  = float(rib_res.get("tip_dev", 0.0) or 0.0)
+        cov   = float(rib_res.get("coverage", 0.0) or 0.0)
+        conf  = float(rib_res.get("confidence", 0.0) or 0.0)
+        afrm  = int(rib_res.get("active_rib_frames", 0) or 0)
+        eng   = str(rib_res.get("tracker_engine", "UNKNOWN"))
+        prof  = str(camera_profile) if camera_profile else None
+
+        # Simpan profil kontur Y (downsample 4x) sebagai JSON — Opsi B dataset
+        ys_raw = rib_res.get("ys_contour")
+        profile_json = None
+        if ys_raw is not None and len(ys_raw) >= 10:
+            try:
+                import json as _json
+                _ys = ys_raw[::4] if hasattr(ys_raw, "__getitem__") else list(ys_raw)[::4]
+                _ys_list = [round(float(v), 2) for v in _ys]
+                profile_json = _json.dumps(_ys_list)
+            except Exception:
+                profile_json = None
+
+        def _do_insert():
+            try:
+                conn = self._get_connection()
+                with conn:
+                    conn.execute(
+                        """INSERT INTO Rib_Dataset
+                           (RibNumber, SlatNumber, Label, TrackerEngine,
+                            PVFlatness, Sagitta, InnerDev, TipDev, Coverage,
+                            ActiveFrames, Confidence, ProfileJson, CameraProfile)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (rib_number, slat_number, label, eng,
+                         pv, sag, idev, tdev, cov,
+                         afrm, conf, profile_json, prof)
+                    )
+                conn.close()
+            except Exception as e:
+                print(f"[DB DATASET WARN] Gagal menyimpan Rib_Dataset: {e}")
+
+        # Non-blocking: kirim ke worker queue yang sama dengan emit_top_inspection
+        try:
+            self._queue.put_nowait(("dataset", _do_insert))
+        except Exception:
+            # Fallback sinkron jika queue penuh
+            _do_insert()
+        return True
 
     def _get_today_capture_dirs(self):
         """Menyiapkan direktori captures/DD-MM/raw dan captures/DD-MM/annotated."""
@@ -381,7 +476,11 @@ class InspectionDBBridge:
                 continue
 
             try:
-                self._save_to_database_and_disk(item)
+                # Tangani perintah dataset langsung (tuple ("dataset", callable))
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "dataset":
+                    item[1]()
+                else:
+                    self._save_to_database_and_disk(item)
             except Exception as e:
                 print(f"[DB ERROR] Gagal menyimpan data NG: {e}")
             finally:
