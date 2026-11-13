@@ -47,6 +47,25 @@ class RibDatasetRecorderTests(unittest.TestCase):
             written = cv2.imread(evidence["raw_image_path"])
             self.assertEqual(written[0, 0].tolist(), [40, 50, 60])
 
+    def test_recorder_initialization_creates_review_schema_before_first_rib(self):
+        """A new run must expose its tables even before a rib reaches finalization."""
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = os.path.join(directory, "review.db")
+            store = DatasetReviewStore(db_path)
+            RibDatasetRecorder(store, os.path.join(directory, "captures"))
+
+            conn = sqlite3.connect(db_path)
+            try:
+                tables = {
+                    row[0] for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+            finally:
+                conn.close()
+            self.assertIn("Rib_Dataset", tables)
+            self.assertIn("Rib_Dataset_Evidence", tables)
+
     def test_recorder_skips_wait_and_short_transits(self):
         """Recording WAIT or fewer than 15 active frames would pollute the dataset."""
         with tempfile.TemporaryDirectory() as directory:

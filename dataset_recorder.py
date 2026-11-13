@@ -28,6 +28,7 @@ class RibDatasetRecorder:
         min_active_frames: int = 15,
     ):
         self.store = store
+        self.store.ensure_schema()
         self.capture_root = Path(capture_root)
         self.session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:8]
         self.source_label = source_label

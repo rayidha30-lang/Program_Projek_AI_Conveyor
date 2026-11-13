@@ -148,12 +148,37 @@ def resolve_source_path(src, candidates=None):
     return s
 
 
+def record_top_ng_if_enabled(
+    inspector, frame, inspect_result, fps, frame_idx, total_frames, slat_no, rib_no,
+):
+    """Render and persist NG evidence only when the top verdict is actually NG."""
+    if not inspector or inspect_result.get("status") != "NG" or not inspector.is_db_enabled():
+        return False
+    annotation = inspector.render_combined_dashboard(
+        frame=frame,
+        inspect_result=inspect_result,
+        fps=fps,
+        frame_idx=frame_idx,
+        total_frames=total_frames,
+    )
+    inspector.record_if_ng(
+        frame_raw=frame,
+        frame_ann=annotation,
+        inspect_res=inspect_result,
+        slat_no=slat_no,
+        rib_no=rib_no,
+    )
+    return True
+
+
 # Video Default CAM-01 Top Inspection (Plat Slat & Bilah Rib)
 ENV_TOP_VIDEO = os.environ.get("TOP_CAMERA_SOURCE")
 CANDIDATE_TOP_VIDEOS = [
     ENV_TOP_VIDEO,
     os.path.join(VIDEO_DIR, "Deform Sedikit.mp4"),
     os.path.join(VIDEO_DIR, "OK Semua.mp4"),
+    os.path.join(BASE_DIR, "Documentation", "Video Testing", "Deform Sedikit.mp4"),
+    os.path.join(BASE_DIR, "Documentation", "Video Testing", "OK Semua.mp4"),
     os.path.join(BASE_DIR, "Jetson_Vision_Engine", "Video_Testing", "OK Semua.mp4"),
     "0",
 ]
@@ -164,6 +189,7 @@ ENV_SIDE_VIDEO = os.environ.get("SIDE_CAMERA_SOURCE")
 CANDIDATE_SIDE_VIDEOS = [
     ENV_SIDE_VIDEO,
     os.path.join(VIDEO_DIR, "Deform Sedikit.mp4"),
+    os.path.join(BASE_DIR, "Documentation", "WhatsApp Video 2026-08-19 at 15.37.46.mp4"),
     os.path.abspath(os.path.join(BASE_DIR, "..", "Documentation", "WhatsApp Video 2026-08-19 at 15.37.46.mp4")),
     os.path.abspath(os.path.join(BASE_DIR, "Documentation", "WhatsApp Video 2026-08-19 at 15.37.46.mp4")),
     "1",
@@ -1586,14 +1612,16 @@ def _run_threaded_engine(args):
 
                 # Rekam ke database SQLite dan kirim notifikasi MS Teams menggunakan Best-Shot Buffer jika DB aktif & NG
                 is_ng = inspect_res.get("status") == "NG"
-                if is_ng and top_inspector and top_inspector.is_db_enabled():
-                    ann_ng = top_inspector.render_combined_dashboard(
-                        frame=frame,
-                        inspect_result=inspect_res,
-                        fps=avg_f,
-                        frame_idx=top_state["frames"] + 1,
-                        total_frames=total_f_top
-                    )
+                record_top_ng_if_enabled(
+                    top_inspector,
+                    frame,
+                    inspect_res,
+                    avg_f,
+                    top_state["frames"] + 1,
+                    total_f_top,
+                    getattr(top_inspector.slat_inspector, "slat_count", None),
+                    getattr(top_inspector.rib_inspector, "rib_count", None),
+                )
 
                 # Satu bukti raw/annotated untuk setiap rib yang sudah final.
                 # Vonis detektor tidak diubah; perekam hanya mengarsipkan hasilnya.
@@ -1625,13 +1653,6 @@ def _run_threaded_engine(args):
                             rib_result, frame, annotated, current_rib_no, slat_number
                         )
                         dataset_previous = (dict(rib_result), current_rib_no, slat_number)
-                    top_inspector.record_if_ng(
-                        frame_raw=frame,
-                        frame_ann=ann_ng,
-                        inspect_res=inspect_res,
-                        slat_no=getattr(top_inspector.slat_inspector, "slat_count", None),
-                        rib_no=getattr(top_inspector.rib_inspector, "rib_count", None)
-                    )
 
                 # Push data ke top_state untuk dirender asinkron oleh Main GUI Thread (Zero-Overhead di Thread AI)
                 with top_lock:
