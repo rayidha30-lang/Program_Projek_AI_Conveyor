@@ -107,6 +107,13 @@ def is_stream_or_camera(src):
     return False
 
 
+def is_usable_source(src):
+    """Return True only for an existing media file, camera index, or stream URL."""
+    if src is None or not str(src).strip():
+        return False
+    return is_stream_or_camera(src) or os.path.exists(str(src))
+
+
 def resolve_source_path(src, candidates=None):
     """
     Menemukan path media/video atau sumber kamera yang valid secara multi-platform.
@@ -116,7 +123,7 @@ def resolve_source_path(src, candidates=None):
         if candidates:
             for cand in candidates:
                 res = resolve_source_path(cand)
-                if res:
+                if is_usable_source(res):
                     return res
         return ""
 
@@ -143,9 +150,9 @@ def resolve_source_path(src, candidates=None):
         for cand in candidates:
             if cand != src:
                 res = resolve_source_path(cand)
-                if res:
+                if is_usable_source(res):
                     return res
-    return s
+    return ""
 
 
 def record_top_ng_if_enabled(
@@ -195,7 +202,6 @@ CANDIDATE_TOP_VIDEOS = [
     os.path.join(BASE_DIR, "Documentation", "Video Testing", "Deform Sedikit.mp4"),
     os.path.join(BASE_DIR, "Documentation", "Video Testing", "OK Semua.mp4"),
     os.path.join(BASE_DIR, "Jetson_Vision_Engine", "Video_Testing", "OK Semua.mp4"),
-    "0",
 ]
 DEFAULT_TOP_VIDEO = resolve_source_path(ENV_TOP_VIDEO, CANDIDATE_TOP_VIDEOS)
 
@@ -207,7 +213,6 @@ CANDIDATE_SIDE_VIDEOS = [
     os.path.join(BASE_DIR, "Documentation", "WhatsApp Video 2026-08-19 at 15.37.46.mp4"),
     os.path.abspath(os.path.join(BASE_DIR, "..", "Documentation", "WhatsApp Video 2026-08-19 at 15.37.46.mp4")),
     os.path.abspath(os.path.join(BASE_DIR, "Documentation", "WhatsApp Video 2026-08-19 at 15.37.46.mp4")),
-    "1",
 ]
 DEFAULT_SIDE_VIDEO = resolve_source_path(ENV_SIDE_VIDEO, CANDIDATE_SIDE_VIDEOS)
 
@@ -2271,12 +2276,11 @@ Shortcut Keyboard Saat Berjalan:
         default=DEFAULT_TOP_VIDEO,
         help="Path video, index webcam (0/1), atau ketik 'browse' untuk membuka dialog sumber CAM-01 Top Slat/Rib"
     )
-    default_side_arg = DEFAULT_SIDE_VIDEO if DEFAULT_SIDE_VIDEO else "0"
     parser.add_argument(
         "--side-source",
         type=str,
-        default=default_side_arg,
-        help=f"Path video, index webcam (0/1), atau ketik 'browse' untuk Side Bolt/Pin (default: {os.path.basename(default_side_arg) if os.path.exists(str(default_side_arg)) else default_side_arg})"
+        default=DEFAULT_SIDE_VIDEO,
+        help="Path video, index webcam (0/1), atau ketik 'browse' untuk Side Bolt/Pin. Jika kosong, dialog pemilih sumber akan muncul."
     )
     parser.add_argument("--side-name", type=str, default=env_side_name, choices=["RIGHT", "LEFT"], help="Sisi konveyor (RIGHT / LEFT)")
     parser.add_argument("--side-cam-id", type=str, default=env_side_cam_id, help="ID Kamera samping (default: CAM-02 untuk RIGHT, CAM-03 untuk LEFT)")
@@ -2361,7 +2365,12 @@ Shortcut Keyboard Saat Berjalan:
         else:
             print("[!] Peringatan: Tidak ditemukan webcam fisik yang aktif. Tetap menggunakan input default.")
 
-    if args.select_webcam or args.browse or str(args.top_source).lower() == "browse" or str(args.side_source).lower() == "browse":
+    top_is_active = args.mode in ["dual", "headless", "top-only"]
+    side_is_active = args.mode in ["dual", "headless", "side-only"]
+    missing_top_source = top_is_active and not is_usable_source(args.top_source)
+    missing_side_source = side_is_active and not is_usable_source(args.side_source)
+
+    if args.select_webcam or args.browse or str(args.top_source).lower() == "browse" or str(args.side_source).lower() == "browse" or (missing_top_source and missing_side_source):
         print("\n[*] Menampilkan dialog pengaturan sumber kamera...")
         ch_top, ch_side = select_dual_camera_setup_dialog(
             default_top=args.top_source,
@@ -2373,29 +2382,38 @@ Shortcut Keyboard Saat Berjalan:
         if ch_side:
             args.side_source = ch_side
     else:
-        if args.select_top or str(args.top_source).lower() in ["select", "dialog", "file"]:
+        if missing_top_source or args.select_top or str(args.top_source).lower() in ["select", "dialog", "file"]:
             ch_top = select_source_dialog(title="[CAM-01 TOP] Pilih Sumber Plat & Rib", default_source=args.top_source)
             if ch_top:
                 args.top_source = ch_top
-        if args.select_side or str(args.side_source).lower() in ["select", "dialog", "file"]:
+        if missing_side_source or args.select_side or str(args.side_source).lower() in ["select", "dialog", "file"]:
             ch_side = select_source_dialog(title=f"[{args.side_cam_id} SIDE] Pilih Sumber Baut & Pin", default_source=args.side_source)
             if ch_side:
                 args.side_source = ch_side
 
     # Validasi fallback path jika path manual tidak ditemukan
-    if not is_stream_or_camera(args.top_source) and not os.path.exists(str(args.top_source)):
+    if not is_usable_source(args.top_source):
         resolved_top = resolve_source_path(args.top_source)
-        if os.path.exists(resolved_top) or is_stream_or_camera(resolved_top):
+        if is_usable_source(resolved_top):
             args.top_source = resolved_top
         else:
             args.top_source = DEFAULT_TOP_VIDEO
 
-    if not is_stream_or_camera(args.side_source) and not os.path.exists(str(args.side_source)):
+    if not is_usable_source(args.side_source):
         resolved_side = resolve_source_path(args.side_source)
-        if os.path.exists(resolved_side) or is_stream_or_camera(resolved_side):
+        if is_usable_source(resolved_side):
             args.side_source = resolved_side
         else:
             args.side_source = DEFAULT_SIDE_VIDEO
+
+    if top_is_active and not is_usable_source(args.top_source):
+        print("[!] CAM-01 Top belum memiliki sumber video/kamera yang valid. Program dibatalkan.")
+        print("    Jalankan kembali dan pilih file video pada dialog, atau gunakan --top-source \"C:\\path\\video.mp4\".")
+        return
+    if side_is_active and not is_usable_source(args.side_source):
+        print(f"[!] {args.side_cam_id} Side belum memiliki sumber video/kamera yang valid. Program dibatalkan.")
+        print("    Jalankan kembali dan pilih file video pada dialog, atau gunakan --side-source \"C:\\path\\video.mp4\".")
+        return
 
     print("=" * 86)
     print("🚀 MULTI-CAMERA INSPECTION BENCHMARK RUNNER")
