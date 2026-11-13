@@ -178,6 +178,14 @@ def rib_result_for_dataset(rib_result, rib_inspector):
     return result
 
 
+def finalize_pending_rib_dataset(recorder, previous):
+    """Persist the last completed candidate when a file loop or run ends."""
+    if recorder is None or previous is None:
+        return None
+    result, rib_number, slat_number = previous
+    return recorder.finalize(result, rib_number, slat_number)
+
+
 # Video Default CAM-01 Top Inspection (Plat Slat & Bilah Rib)
 ENV_TOP_VIDEO = os.environ.get("TOP_CAMERA_SOURCE")
 CANDIDATE_TOP_VIDEOS = [
@@ -847,6 +855,12 @@ def _run_top_worker(
             if not ret or frame is None:
                 # Jika file video habis, putar ulang (looping) dengan re-open agar FFmpeg tidak memory leak
                 if not is_cam:
+                    finalize_pending_rib_dataset(dataset_recorder, dataset_previous)
+                    if dataset_recorder is not None:
+                        dataset_recorder.start_new_session()
+                    dataset_last_rib_no = 0
+                    dataset_previous = None
+                    inspector.reset_counters()
                     cap.release()
                     cap = cv2.VideoCapture(cap_src)
                     ret, frame = cap.read()
@@ -888,6 +902,7 @@ def _run_top_worker(
                 current_status = str(rib_result.get("status", "WAIT")).upper()
                 slat_number = getattr(inspector.slat_inspector, "slat_count", None)
                 if current_rib_no < dataset_last_rib_no:
+                    finalize_pending_rib_dataset(dataset_recorder, dataset_previous)
                     dataset_recorder.start_new_session()
                     dataset_last_rib_no = 0
                     dataset_previous = None
@@ -1049,6 +1064,7 @@ def _run_top_worker(
     except KeyboardInterrupt:
         stop_event.set()
     finally:
+        finalize_pending_rib_dataset(dataset_recorder, dataset_previous)
         cap.release()
         if mode == "dual":
             cv2.destroyWindow(win_name)
@@ -1592,6 +1608,12 @@ def _run_threaded_engine(args):
                 ret, frame = cap_top.read()
                 if not ret or frame is None:
                     if not is_cam_top:
+                        finalize_pending_rib_dataset(top_dataset_recorder, dataset_previous)
+                        if top_dataset_recorder is not None:
+                            top_dataset_recorder.start_new_session()
+                        dataset_last_rib_no = 0
+                        dataset_previous = None
+                        top_inspector.reset_counters()
                         cap_top.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         ret, frame = cap_top.read()
                         if not ret or frame is None:
@@ -1642,6 +1664,7 @@ def _run_threaded_engine(args):
                     current_status = str(rib_result.get("status", "WAIT")).upper()
                     slat_number = getattr(top_inspector.slat_inspector, "slat_count", None)
                     if current_rib_no < dataset_last_rib_no:
+                        finalize_pending_rib_dataset(top_dataset_recorder, dataset_previous)
                         top_dataset_recorder.start_new_session()
                         dataset_last_rib_no = 0
                         dataset_previous = None
@@ -1680,6 +1703,8 @@ def _run_threaded_engine(args):
                 print(f"\n[WARN Thread-TopInspector] Transient exception caught (auto-recovered): {e}")
                 traceback.print_exc()
                 time.sleep(0.01)
+
+        finalize_pending_rib_dataset(top_dataset_recorder, dataset_previous)
 
     # Worker Thread 2: Side Inspector
     def _side_loop():

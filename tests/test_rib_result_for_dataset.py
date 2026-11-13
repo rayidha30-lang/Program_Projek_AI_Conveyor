@@ -1,6 +1,6 @@
 import unittest
 
-from run_multi_camera_benchmark import rib_result_for_dataset
+from run_multi_camera_benchmark import finalize_pending_rib_dataset, rib_result_for_dataset
 
 
 class FakeRibInspector:
@@ -23,6 +23,22 @@ class RibResultForDatasetTests(unittest.TestCase):
             {"status": "NG", "active_rib_frames": 31}, FakeRibInspector(24)
         )
         self.assertEqual(result["active_rib_frames"], 31)
+
+    def test_finalizes_last_pending_rib_when_run_stops(self):
+        """Dropping the final transit at shutdown would permanently lose the last rib."""
+        calls = []
+
+        class Recorder:
+            def finalize(self, result, rib_number, slat_number):
+                calls.append((result, rib_number, slat_number))
+                return 12
+
+        result = finalize_pending_rib_dataset(
+            Recorder(), ({"status": "NG", "active_rib_frames": 18}, 29, 118)
+        )
+
+        self.assertEqual(result, 12)
+        self.assertEqual(calls, [({"status": "NG", "active_rib_frames": 18}, 29, 118)])
 
 
 if __name__ == "__main__":
