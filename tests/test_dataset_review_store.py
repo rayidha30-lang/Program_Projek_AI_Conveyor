@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from dataset_review_store import DatasetReviewStore
 from conveyor_db_path import resolve_db_path
+from scripts.evaluate_rib_dataset import summarize_rows, write_report
 
 
 def sample_values():
@@ -97,6 +98,42 @@ class DatasetReviewStoreTests(unittest.TestCase):
                 "annotated_image_path": os.path.join(directory, "missing_annotated.jpg"),
             })
             self.assertIsNone(store.next_unreviewed())
+
+    def test_evaluation_counts_model_ng_manual_ok_as_false_ng(self):
+        """Swapping model/manual labels must not hide a false NG from the report."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = DatasetReviewStore(os.path.join(directory, "review.db"))
+            dataset_id = store.insert_sample(sample_values())  # Model NG.
+            store.save_review(dataset_id, "OK", "qa")
+
+            summary = summarize_rows(store.evaluation_rows())
+            self.assertEqual(summary["false_ng"], 1)
+            self.assertEqual(summary["false_ok"], 0)
+            self.assertEqual(summary["comparable_total"], 1)
+
+    def test_evaluation_excludes_manual_invalid_from_confusion_matrix(self):
+        """Counting INVALID as OK or NG would falsify both error rates."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = DatasetReviewStore(os.path.join(directory, "review.db"))
+            dataset_id = store.insert_sample({**sample_values(), "label": "OK"})
+            store.save_review(dataset_id, "INVALID", "qa")
+
+            summary = summarize_rows(store.evaluation_rows())
+            self.assertEqual(summary["invalid"], 1)
+            self.assertEqual(summary["comparable_total"], 0)
+            self.assertEqual(summary["invalid_rate"], 1.0)
+
+    def test_evaluation_never_updates_configuration_files(self):
+        """Generating a report must only create CSV output, never alter a detector config."""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "top_inspection_config.json")
+            with open(config_path, "w", encoding="utf-8") as config:
+                config.write('{"threshold": 12}')
+            output_path = write_report(summarize_rows([]), os.path.join(directory, "reports"))
+
+            self.assertTrue(os.path.isfile(output_path))
+            with open(config_path, encoding="utf-8") as config:
+                self.assertEqual(config.read(), '{"threshold": 12}')
 
 
 if __name__ == "__main__":

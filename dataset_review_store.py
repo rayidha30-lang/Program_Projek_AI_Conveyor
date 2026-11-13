@@ -185,6 +185,28 @@ class DatasetReviewStore:
                 return item
         return None
 
+    def evaluation_rows(self) -> list[dict[str, Any]]:
+        """Return reviewed model/manual label pairs without changing any configuration."""
+        self.ensure_schema()
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT d.DatasetID, d.Label, r.ManualLabel, d.CameraProfile
+                FROM Rib_Dataset AS d
+                INNER JOIN Rib_Dataset_Review AS r ON r.DatasetID = d.DatasetID
+                ORDER BY r.ReviewedAt ASC, d.DatasetID ASC
+                """
+            ).fetchall()
+        return [
+            {
+                "dataset_id": row[0],
+                "model_label": row[1],
+                "manual_label": row[2],
+                "camera_profile": row[3] or "UNSPECIFIED",
+            }
+            for row in rows
+        ]
+
     def save_review(self, dataset_id: int, manual_label: str, reviewer: str, note: str = "") -> bool:
         label = str(manual_label).upper()
         if label not in MANUAL_LABELS:
