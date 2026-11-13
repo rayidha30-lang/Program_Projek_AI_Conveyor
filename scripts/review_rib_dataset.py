@@ -16,6 +16,43 @@ import numpy as np
 from dataset_review_store import DatasetReviewStore
 
 
+def default_database_path() -> Path:
+    """Return the project-local review database used by direct launches."""
+    return PROJECT_ROOT / "Database" / "AI_Slat_Rib_Conveyor.db"
+
+
+def resolve_review_config(db_argument, reviewer_argument, prompt_reviewer) -> tuple[Path, str]:
+    """Resolve optional CLI values without making the Run button depend on a terminal."""
+    database_path = Path(db_argument).expanduser().resolve() if db_argument else default_database_path()
+    reviewer = str(reviewer_argument or "").strip()
+    if not reviewer:
+        reviewer = str(prompt_reviewer() or "").strip()
+    return database_path, reviewer
+
+
+def prompt_text(title: str, prompt: str, initial_value: str = "") -> str | None:
+    """Request text in a native popup so direct execution needs no terminal input."""
+    try:
+        import tkinter as tk
+        from tkinter import simpledialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+        try:
+            return simpledialog.askstring(title, prompt, initialvalue=initial_value, parent=root)
+        finally:
+            root.destroy()
+    except Exception as error:
+        print(f"[!] Popup input tidak dapat dibuka: {error}")
+        return None
+
+
+def prompt_reviewer() -> str | None:
+    return prompt_text("Rib Dataset Review", "Masukkan nama atau ID reviewer:")
+
+
 def _fit(image: np.ndarray, target_height: int = 520) -> np.ndarray:
     height, width = image.shape[:2]
     if height == target_height:
@@ -44,10 +81,15 @@ def _render(sample: dict) -> np.ndarray | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Review captured rib evidence on a local PC.")
-    parser.add_argument("--db", required=True, help="Path to AI_Slat_Rib_Conveyor.db")
-    parser.add_argument("--reviewer", required=True, help="Name or ID of the QA reviewer")
+    parser.add_argument("--db", help="Path to AI_Slat_Rib_Conveyor.db (default: Database proyek)")
+    parser.add_argument("--reviewer", help="Name atau ID QA reviewer (default: diminta lewat popup)")
     args = parser.parse_args()
-    store = DatasetReviewStore(args.db)
+    database_path, reviewer = resolve_review_config(args.db, args.reviewer, prompt_reviewer)
+    if not reviewer:
+        print("Review dibatalkan: nama reviewer belum diisi.")
+        return 0
+
+    store = DatasetReviewStore(database_path)
     window = "Rib Dataset Review"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     try:
@@ -68,8 +110,11 @@ def main() -> int:
             if key in (ord("s"),):
                 continue
             if key in labels:
-                note = input(f"Catatan untuk DatasetID {sample['dataset_id']} (opsional): ").strip()
-                saved = store.save_review(sample["dataset_id"], labels[key], args.reviewer, note)
+                note = prompt_text(
+                    "Catatan Judgment (Opsional)",
+                    f"Catatan untuk DatasetID {sample['dataset_id']}:",
+                )
+                saved = store.save_review(sample["dataset_id"], labels[key], reviewer, (note or "").strip())
                 print(f"DatasetID {sample['dataset_id']}: {'tersimpan' if saved else 'sudah direview'}.")
     finally:
         cv2.destroyAllWindows()
