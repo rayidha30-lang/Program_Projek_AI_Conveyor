@@ -73,6 +73,22 @@ class RibDatasetRecorderTests(unittest.TestCase):
             self.assertEqual(store.sample_count(), 1)
             self.assertEqual(store.evidence_count(), 1)
 
+    def test_new_session_allows_reused_counter_without_reusing_old_sample(self):
+        """A counter reset for a new video must not suppress its first physical rib."""
+        with tempfile.TemporaryDirectory() as directory:
+            store, recorder = self.make_recorder(directory)
+            frame = np.full((12, 12, 3), 90, dtype=np.uint8)
+            result = rib_result()
+            recorder.observe(result, frame, frame, 1, 1)
+            first_id = recorder.finalize(result, 1, 1)
+
+            recorder.start_new_session("next-video")
+            recorder.observe(result, frame, frame, 1, 1)
+            second_id = recorder.finalize(result, 1, 1)
+
+            self.assertNotEqual(first_id, second_id)
+            self.assertEqual(store.sample_count(), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

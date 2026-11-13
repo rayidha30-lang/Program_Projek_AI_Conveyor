@@ -37,6 +37,12 @@ class RibDatasetRecorder:
         self._candidates: dict[tuple[int | None, int | None], dict[str, Any]] = {}
         self._finalized: dict[tuple[int | None, int | None], int] = {}
 
+    def start_new_session(self, session_id: str | None = None) -> None:
+        """Reset in-memory deduplication after the operator resets the rib counter."""
+        self.session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:8]
+        self._candidates.clear()
+        self._finalized.clear()
+
     @staticmethod
     def _model_label(rib_result: Mapping[str, Any]) -> str | None:
         status = str(rib_result.get("status", "")).upper()

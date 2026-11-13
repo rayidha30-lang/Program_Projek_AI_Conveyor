@@ -756,6 +756,9 @@ def _run_top_worker(
     import cv2
     import numpy as np
     from combined_top_inspector import CombinedTopInspector
+    from conveyor_db_path import resolve_db_path
+    from dataset_recorder import RibDatasetRecorder
+    from dataset_review_store import DatasetReviewStore
 
     # 2. Inisialisasi Engine Top Inspector
     try:
@@ -768,6 +771,17 @@ def _run_top_worker(
         print(f"[ERROR TOP WORKER] Gagal menginisialisasi CombinedTopInspector: {e}")
         status_buf.value = b"INIT_ERROR"
         return
+
+    try:
+        dataset_recorder = RibDatasetRecorder(
+            DatasetReviewStore(resolve_db_path()),
+            os.path.join(os.path.dirname(resolve_db_path()), "dataset_captures"),
+            source_label="CAM-01 TOP",
+            camera_profile=getattr(inspector, "active_profile_name", None),
+        )
+    except Exception as e_dataset:
+        dataset_recorder = None
+        print(f"[WARN TOP WORKER] Perekam dataset rib tidak aktif: {e_dataset}")
 
     # 3. Inisialisasi Sumber Video / Kamera
     cap, is_cam, cap_src = create_capture(source_path)
@@ -789,6 +803,8 @@ def _run_top_worker(
     t_prev = t_start
     gui_interval = (1.0 / gui_fps) if (gui_fps and gui_fps > 0) else 0.0
     last_gui_render = 0.0
+    dataset_last_rib_no = 0
+    dataset_previous = None
 
     print("[*] Worker CAM-01 Top Inspection AKTIF dan mulai memproses...")
 
@@ -830,6 +846,31 @@ def _run_top_worker(
             latency_val.value = latency_ms
             curr_stat = inspect_res.get("status", "WAIT")
             status_buf.value = curr_stat.encode("utf-8")[:63]
+
+            if dataset_recorder is not None and inspector.is_db_enabled():
+                rib_result = inspect_res.get("rib_res", {}) or {}
+                current_rib_no = int(rib_result.get("rib_count", 0) or 0)
+                current_status = str(rib_result.get("status", "WAIT")).upper()
+                slat_number = getattr(inspector.slat_inspector, "slat_count", None)
+                if current_rib_no < dataset_last_rib_no:
+                    dataset_recorder.start_new_session()
+                    dataset_last_rib_no = 0
+                    dataset_previous = None
+                if current_rib_no > dataset_last_rib_no:
+                    if dataset_last_rib_no > 0 and dataset_previous is not None:
+                        previous_result, previous_rib_no, previous_slat_no = dataset_previous
+                        dataset_recorder.finalize(previous_result, previous_rib_no, previous_slat_no)
+                    dataset_last_rib_no = current_rib_no
+                if current_status in {"OK", "NG"} and current_rib_no > 0:
+                    annotated = inspector.render_combined_dashboard(
+                        frame=frame,
+                        inspect_result=inspect_res,
+                        fps=avg_fps,
+                        frame_idx=frame_count,
+                        total_frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0,
+                    )
+                    dataset_recorder.observe(rib_result, frame, annotated, current_rib_no, slat_number)
+                    dataset_previous = (dict(rib_result), current_rib_no, slat_number)
 
             # Render Visual jika mode dual (Decoupled GUI Rendering)
             hud = None
@@ -1561,6 +1602,10 @@ def _run_threaded_engine(args):
                     current_rib_no = int(rib_result.get("rib_count", 0) or 0)
                     current_status = str(rib_result.get("status", "WAIT")).upper()
                     slat_number = getattr(top_inspector.slat_inspector, "slat_count", None)
+                    if current_rib_no < dataset_last_rib_no:
+                        top_dataset_recorder.start_new_session()
+                        dataset_last_rib_no = 0
+                        dataset_previous = None
                     if current_rib_no > dataset_last_rib_no:
                         if dataset_last_rib_no > 0 and dataset_previous is not None:
                             previous_result, previous_rib_no, previous_slat_no = dataset_previous

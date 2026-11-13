@@ -215,6 +215,12 @@ class DatasetReviewStore:
             raise ValueError("reviewer is required")
         self.ensure_schema()
         with self._connection() as conn:
+            evidence = conn.execute(
+                "SELECT RawImagePath, AnnotatedImagePath FROM Rib_Dataset_Evidence WHERE DatasetID = ?",
+                (dataset_id,),
+            ).fetchone()
+            if evidence is None or not Path(evidence[0]).is_file() or not Path(evidence[1]).is_file():
+                return False
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO Rib_Dataset_Review (DatasetID, ManualLabel, Reviewer, Note)

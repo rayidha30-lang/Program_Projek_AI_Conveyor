@@ -27,6 +27,18 @@ def sample_values():
     }
 
 
+def attach_reviewable_evidence(store, directory, dataset_id):
+    raw_path = os.path.join(directory, f"{dataset_id}_raw.jpg")
+    annotated_path = os.path.join(directory, f"{dataset_id}_annotated.jpg")
+    open(raw_path, "wb").close()
+    open(annotated_path, "wb").close()
+    store.attach_evidence(dataset_id, {
+        "session_id": "session",
+        "raw_image_path": raw_path,
+        "annotated_image_path": annotated_path,
+    })
+
+
 class DatasetReviewStoreTests(unittest.TestCase):
     def test_store_creates_evidence_and_review_tables_in_temp_database(self):
         """Removing either schema table must make this test fail."""
@@ -54,6 +66,7 @@ class DatasetReviewStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = DatasetReviewStore(os.path.join(directory, "review.db"))
             dataset_id = store.insert_sample(sample_values())
+            attach_reviewable_evidence(store, directory, dataset_id)
 
             self.assertTrue(store.save_review(dataset_id, "OK", "qa-01", "clear"))
             self.assertFalse(store.save_review(dataset_id, "NG", "qa-01", "duplicate"))
@@ -98,12 +111,14 @@ class DatasetReviewStoreTests(unittest.TestCase):
                 "annotated_image_path": os.path.join(directory, "missing_annotated.jpg"),
             })
             self.assertIsNone(store.next_unreviewed())
+            self.assertFalse(store.save_review(dataset_id, "INVALID", "qa"))
 
     def test_evaluation_counts_model_ng_manual_ok_as_false_ng(self):
         """Swapping model/manual labels must not hide a false NG from the report."""
         with tempfile.TemporaryDirectory() as directory:
             store = DatasetReviewStore(os.path.join(directory, "review.db"))
             dataset_id = store.insert_sample(sample_values())  # Model NG.
+            attach_reviewable_evidence(store, directory, dataset_id)
             store.save_review(dataset_id, "OK", "qa")
 
             summary = summarize_rows(store.evaluation_rows())
@@ -116,6 +131,7 @@ class DatasetReviewStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = DatasetReviewStore(os.path.join(directory, "review.db"))
             dataset_id = store.insert_sample({**sample_values(), "label": "OK"})
+            attach_reviewable_evidence(store, directory, dataset_id)
             store.save_review(dataset_id, "INVALID", "qa")
 
             summary = summarize_rows(store.evaluation_rows())
