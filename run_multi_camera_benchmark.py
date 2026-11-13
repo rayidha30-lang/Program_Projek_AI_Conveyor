@@ -171,6 +171,13 @@ def record_top_ng_if_enabled(
     return True
 
 
+def rib_result_for_dataset(rib_result, rib_inspector):
+    """Supply the live transit-frame count omitted by the current rib result payload."""
+    result = dict(rib_result or {})
+    result.setdefault("active_rib_frames", int(getattr(rib_inspector, "active_rib_frames", 0) or 0))
+    return result
+
+
 # Video Default CAM-01 Top Inspection (Plat Slat & Bilah Rib)
 ENV_TOP_VIDEO = os.environ.get("TOP_CAMERA_SOURCE")
 CANDIDATE_TOP_VIDEOS = [
@@ -874,7 +881,9 @@ def _run_top_worker(
             status_buf.value = curr_stat.encode("utf-8")[:63]
 
             if dataset_recorder is not None and inspector.is_db_enabled():
-                rib_result = inspect_res.get("rib_res", {}) or {}
+                rib_result = rib_result_for_dataset(
+                    inspect_res.get("rib_res", {}), inspector.rib_inspector
+                )
                 current_rib_no = int(rib_result.get("rib_count", 0) or 0)
                 current_status = str(rib_result.get("status", "WAIT")).upper()
                 slat_number = getattr(inspector.slat_inspector, "slat_count", None)
@@ -1626,7 +1635,9 @@ def _run_threaded_engine(args):
                 # Satu bukti raw/annotated untuk setiap rib yang sudah final.
                 # Vonis detektor tidak diubah; perekam hanya mengarsipkan hasilnya.
                 if top_dataset_recorder is not None and top_inspector and top_inspector.is_db_enabled():
-                    rib_result = inspect_res.get("rib_res", {}) or {}
+                    rib_result = rib_result_for_dataset(
+                        inspect_res.get("rib_res", {}), top_inspector.rib_inspector
+                    )
                     current_rib_no = int(rib_result.get("rib_count", 0) or 0)
                     current_status = str(rib_result.get("status", "WAIT")).upper()
                     slat_number = getattr(top_inspector.slat_inspector, "slat_count", None)
