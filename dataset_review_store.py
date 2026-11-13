@@ -156,6 +156,35 @@ class DatasetReviewStore:
         with self._connection() as conn:
             return int(conn.execute("SELECT COUNT(*) FROM Rib_Dataset_Evidence").fetchone()[0])
 
+    def next_unreviewed(self) -> dict[str, Any] | None:
+        """Return the oldest reviewable row, excluding missing files and prior reviews."""
+        self.ensure_schema()
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT d.DatasetID, d.RecordedAt, d.RibNumber, d.SlatNumber, d.Label,
+                       d.PVFlatness, d.Sagitta, d.InnerDev, d.TipDev, d.Coverage,
+                       d.ActiveFrames, d.Confidence, d.CameraProfile,
+                       e.RawImagePath, e.AnnotatedImagePath
+                FROM Rib_Dataset AS d
+                INNER JOIN Rib_Dataset_Evidence AS e ON e.DatasetID = d.DatasetID
+                LEFT JOIN Rib_Dataset_Review AS r ON r.DatasetID = d.DatasetID
+                WHERE r.DatasetID IS NULL
+                ORDER BY d.RecordedAt ASC, d.DatasetID ASC
+                """
+            ).fetchall()
+        keys = (
+            "dataset_id", "recorded_at", "rib_number", "slat_number", "model_label",
+            "pv_flatness", "sagitta", "inner_dev", "tip_dev", "coverage",
+            "active_frames", "confidence", "camera_profile", "raw_image_path",
+            "annotated_image_path",
+        )
+        for row in rows:
+            item = dict(zip(keys, row))
+            if Path(item["raw_image_path"]).is_file() and Path(item["annotated_image_path"]).is_file():
+                return item
+        return None
+
     def save_review(self, dataset_id: int, manual_label: str, reviewer: str, note: str = "") -> bool:
         label = str(manual_label).upper()
         if label not in MANUAL_LABELS:
