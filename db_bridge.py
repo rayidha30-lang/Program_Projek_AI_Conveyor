@@ -30,6 +30,7 @@ from datetime import datetime
 
 from collections import deque
 import cv2
+from conveyor_db_path import resolve_db_path
 
 # Impor modul Notifikasi MS Teams via Node-RED
 PROGRAM_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Program"))
@@ -53,24 +54,7 @@ class InspectionDBBridge:
     ):
         # 1. Tentukan lokasi database file
         if db_path is None:
-            env_db = os.environ.get("SQLITE_DB_PATH")
-            if env_db:
-                db_path = os.path.abspath(env_db)
-            else:
-                base_dir = os.path.dirname(os.path.abspath(__file__))
-                candidate = os.path.join(base_dir, "AI_Slat_Rib_Conveyor.db")
-                if not os.path.exists(candidate):
-                    # Cari di parent direktori jika diimpor dari subfolder lain
-                    search_roots = [
-                        os.path.abspath(os.path.join(base_dir, "AI_Slat_Rib_Conveyor.db")),
-                        os.path.abspath(os.path.join(base_dir, "..", "Database", "AI_Slat_Rib_Conveyor.db")),
-                        os.path.abspath(os.path.join(base_dir, "..", "..", "Database", "AI_Slat_Rib_Conveyor.db")),
-                    ]
-                    for r in search_roots:
-                        if os.path.exists(r):
-                            candidate = r
-                            break
-                db_path = candidate
+            db_path = resolve_db_path()
         self.db_path = db_path
 
         # 2. Tentukan lokasi direktori captures
