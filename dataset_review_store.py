@@ -129,6 +129,33 @@ class DatasetReviewStore:
                 ),
             )
 
+    def delete_sample(self, dataset_id: int) -> None:
+        """Remove a row when its required evidence files could not be written."""
+        self.ensure_schema()
+        with self._connection() as conn:
+            conn.execute("DELETE FROM Rib_Dataset WHERE DatasetID = ?", (dataset_id,))
+
+    def evidence_for(self, dataset_id: int) -> dict[str, Any] | None:
+        self.ensure_schema()
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT DatasetID, RawImagePath, AnnotatedImagePath FROM Rib_Dataset_Evidence WHERE DatasetID = ?",
+                (dataset_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"dataset_id": row[0], "raw_image_path": row[1], "annotated_image_path": row[2]}
+
+    def sample_count(self) -> int:
+        self.ensure_schema()
+        with self._connection() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM Rib_Dataset").fetchone()[0])
+
+    def evidence_count(self) -> int:
+        self.ensure_schema()
+        with self._connection() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM Rib_Dataset_Evidence").fetchone()[0])
+
     def save_review(self, dataset_id: int, manual_label: str, reviewer: str, note: str = "") -> bool:
         label = str(manual_label).upper()
         if label not in MANUAL_LABELS:

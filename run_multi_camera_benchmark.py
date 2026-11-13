@@ -1338,6 +1338,9 @@ def _run_threaded_engine(args):
         from db_bridge import InspectionDBBridge
     except ImportError:
         InspectionDBBridge = None
+    from conveyor_db_path import resolve_db_path
+    from dataset_recorder import RibDatasetRecorder
+    from dataset_review_store import DatasetReviewStore
 
     # Konfigurasi Anti-Throttling Windows & Prioritas Thread Realtime
     configure_windows_process_performance()
@@ -1356,6 +1359,7 @@ def _run_threaded_engine(args):
 
     # 2. Inisialisasi Top Inspector jika aktif
     top_inspector = None
+    top_dataset_recorder = None
     cap_top = None
     is_cam_top = False
     top_source_path = args.top_source
@@ -1371,6 +1375,16 @@ def _run_threaded_engine(args):
         except Exception as e_top:
             print(f"[ERROR] Gagal inisialisasi CombinedTopInspector: {e_top}")
             return
+
+        try:
+            top_dataset_recorder = RibDatasetRecorder(
+                DatasetReviewStore(resolve_db_path()),
+                os.path.join(os.path.dirname(resolve_db_path()), "dataset_captures"),
+                source_label="CAM-01 TOP",
+                camera_profile=getattr(top_inspector, "active_profile_name", None),
+            )
+        except Exception as e_dataset:
+            print(f"[WARN] Perekam dataset rib tidak aktif: {e_dataset}")
 
         cap_top, is_cam_top, top_source_path = create_capture(top_source_path)
         if not cap_top.isOpened():
@@ -1490,6 +1504,8 @@ def _run_threaded_engine(args):
         nonlocal cap_top, top_source_path, is_cam_top
         t_prev = time.time()
         fps_hist = []
+        dataset_last_rib_no = 0
+        dataset_previous = None
 
         while not stop_event.is_set():
             try:
@@ -1537,6 +1553,33 @@ def _run_threaded_engine(args):
                         frame_idx=top_state["frames"] + 1,
                         total_frames=total_f_top
                     )
+
+                # Satu bukti raw/annotated untuk setiap rib yang sudah final.
+                # Vonis detektor tidak diubah; perekam hanya mengarsipkan hasilnya.
+                if top_dataset_recorder is not None and top_inspector and top_inspector.is_db_enabled():
+                    rib_result = inspect_res.get("rib_res", {}) or {}
+                    current_rib_no = int(rib_result.get("rib_count", 0) or 0)
+                    current_status = str(rib_result.get("status", "WAIT")).upper()
+                    slat_number = getattr(top_inspector.slat_inspector, "slat_count", None)
+                    if current_rib_no > dataset_last_rib_no:
+                        if dataset_last_rib_no > 0 and dataset_previous is not None:
+                            previous_result, previous_rib_no, previous_slat_no = dataset_previous
+                            top_dataset_recorder.finalize(
+                                previous_result, previous_rib_no, previous_slat_no
+                            )
+                        dataset_last_rib_no = current_rib_no
+                    if current_status in {"OK", "NG"} and current_rib_no > 0:
+                        annotated = top_inspector.render_combined_dashboard(
+                            frame=frame,
+                            inspect_result=inspect_res,
+                            fps=avg_f,
+                            frame_idx=top_state["frames"] + 1,
+                            total_frames=total_f_top,
+                        )
+                        top_dataset_recorder.observe(
+                            rib_result, frame, annotated, current_rib_no, slat_number
+                        )
+                        dataset_previous = (dict(rib_result), current_rib_no, slat_number)
                     top_inspector.record_if_ng(
                         frame_raw=frame,
                         frame_ann=ann_ng,
