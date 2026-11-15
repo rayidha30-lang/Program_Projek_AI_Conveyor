@@ -1706,11 +1706,14 @@ class HybridRibInspector:
         pos_all = sy_full[sy_full > 4.0]
         neg_all = -sy_full[sy_full < -4.0]
         if len(pos_all) > 20:
-            _dp_top_thresh = float(np.clip(np.percentile(pos_all, 82), 12.0, 32.0))
+            # [ANTI-FALSE-DET] Percentile 82→85 & clamp bawah 12→16: threshold lebih konservatif
+            # sehingga gradien shadow celah slat saat cahaya rendah tidak lolos gate deteksi
+            _dp_top_thresh = float(np.clip(np.percentile(pos_all, 85), 16.0, 32.0))
         else:
             _dp_top_thresh = 18.0  # fallback ke default
         if len(neg_all) > 20:
-            _dp_bot_thresh = float(np.clip(np.percentile(neg_all, 82), 14.0, 36.0))
+            # [ANTI-FALSE-DET] Clamp bawah 14→18: bot threshold tidak terlalu longgar saat gelap
+            _dp_bot_thresh = float(np.clip(np.percentile(neg_all, 85), 18.0, 36.0))
         else:
             _dp_bot_thresh = 20.0  # fallback ke default
 
@@ -1850,7 +1853,8 @@ class HybridRibInspector:
             )
             _pos_roi_t1 = _sy_roi_t1[_sy_roi_t1 > 0]
             _adaptive_contrast_thresh_t1 = float(
-                np.clip(np.percentile(_pos_roi_t1, 70), 10.0, 22.0)
+                # [ANTI-FALSE-DET] Clamp [10,22]→[13,25]: gate lebih ketat cegah karat/shadow lolos Tier-1
+                np.clip(np.percentile(_pos_roi_t1, 70), 13.0, 25.0)
             ) if len(_pos_roi_t1) > 50 else 15.0
         except Exception:
             _adaptive_contrast_thresh_t1 = 15.0
@@ -1866,9 +1870,11 @@ class HybridRibInspector:
 
         tilt_deg = float(np.arctan(guide_poly[0]) * 180.0 / np.pi)
 
-        # 2. Batas Fisik Lateral Konveyor (Anti-Chain Bracket)
-        x_limit_left = max(248, bx1 + 10)
-        x_limit_right = min(1635, bx2 - 10)
+        # 2. Batas Fisik Lateral Konveyor Adaptif (Zoom & Vibration Tolerant)
+        pad_x = 10
+        margin_frame = int(0.04 * w_f)
+        x_limit_left = max(margin_frame, int(bx1 + pad_x))
+        x_limit_right = min(w_f - margin_frame, int(bx2 - pad_x))
         if x_limit_right <= x_limit_left + 100:
             return [], [], 0.0, 0, 0.0
 
@@ -1886,6 +1892,7 @@ class HybridRibInspector:
         off_sq = (np.arange(H_b, dtype=np.float32) - half_band) ** 2
         guide_prior_body = 0.28 * off_sq
         guide_prior_tip = 0.04 * off_sq
+        tip_w_t1 = max(120, int(0.09 * (x_limit_right - x_limit_left)))
 
         def get_col_energy(x):
             gy = int(round(np.polyval(guide_poly, x)))
@@ -1900,7 +1907,7 @@ class HybridRibInspector:
             above_col = gray[col_y1 - 4:col_y2 - 3, x].astype(np.float32)
             lip = np.clip(center_col - below_col, 0.0, 100.0)
             diff_above = np.clip(center_col - above_col, 0.0, 80.0)
-            is_tip_col = (x < x_limit_left + 120) or (x > x_limit_right - 120)
+            is_tip_col = (x < x_limit_left + tip_w_t1) or (x > x_limit_right - tip_w_t1)
             prior = guide_prior_tip if is_tip_col else guide_prior_body
             e = np.clip(-syy * 0.7, 0.0, 90.0) + 0.9 * lip + 0.6 * diff_above - prior
             return e, gy
@@ -1984,8 +1991,10 @@ class HybridRibInspector:
                 return [], [], 0.0, 0, 0.0
 
         bx1, by1, bx2, by2 = active_box
-        x_limit_left = max(248, bx1 + 10)
-        x_limit_right = min(1635, bx2 - 10)
+        pad_x = 10
+        margin_frame = int(0.04 * w_f)
+        x_limit_left = max(margin_frame, int(bx1 + pad_x))
+        x_limit_right = min(w_f - margin_frame, int(bx2 - pad_x))
         if x_limit_right <= x_limit_left + 100:
             return [], [], 0.0, 0, 0.0
 
@@ -2117,8 +2126,10 @@ class HybridRibInspector:
 
         bx1, by1, bx2, by2 = active_box
         curr_cy = (by1 + by2) / 2.0
-        x_min_limit = max(248, int(bx1 + 10))
-        x_max_limit = min(1635, int(bx2 - 10))
+        pad_x = 10
+        margin_frame = int(0.04 * w_u if 'w_u' in locals() else 0.04 * w_f)
+        x_min_limit = max(margin_frame, int(bx1 + pad_x))
+        x_max_limit = min(w_f - margin_frame, int(bx2 - pad_x))
 
         # TAHAP 1: Fast Temporal Sub-Pixel Tracking (Hanya aktif di CPU untuk optimasi latensi)
         # Jika GPU CUDA aktif, sistem menjalankan inferensi FP16 penuh setiap frame demi presisi maksimum
@@ -2664,12 +2675,15 @@ class HybridRibInspector:
             p_guide = np.array([0.75 * prev_slope + 0.25 * curr_slope, 0.50 * prev_c + 0.50 * curr_c])
         self._prev_hough_pguide = p_guide
 
-        # Pastikan batas pencarian tidak melebar ke rantai/gap samping konveyor
-        x_limit_left = max(248, bx1 + 12)
-        x_limit_right = min(1635, bx2 - 12)
+        # Pastikan batas pencarian tidak melebar ke rantai/gap samping konveyor (Adaptif Zoom/Vibration)
+        pad_x = 12
+        margin_frame = int(0.04 * w_f)
+        x_limit_left = max(margin_frame, int(bx1 + pad_x))
+        x_limit_right = min(w_f - margin_frame, int(bx2 - pad_x))
         if len(anchor_xs) >= 2:
             x_limit_left = max(x_limit_left, anchor_xs[0] - 50)
             x_limit_right = min(x_limit_right, anchor_xs[-1] + 50)
+        tip_w_t4 = max(135, int(0.09 * (x_limit_right - x_limit_left)))
 
         # 2. Extract Strip ROI di sekitar Garis Panduan
         y_min_g = max(0, int(min(np.polyval(p_guide, [x_limit_left, x_limit_right]))) - 14)
@@ -2725,8 +2739,8 @@ class HybridRibInspector:
 
                 # Asymmetric Guard Terkalibrasi:
                 # - Badan ketat (ceil 6.0px, floor 7.0px) menolak refleksi celah plat slat & garis las dasar
-                # - Zona Ujung (outer 135px) leluasa (floor 18.0px, angle 24 deg) agar bengkok ujung nyata seperti F1224 tertangkap
-                is_tip = (mid_x < x_limit_left + 135 or mid_x > x_limit_right - 135)
+                # - Zona Ujung (proporsional ~9% span) leluasa (floor 18.0px, angle 24 deg) agar bengkok ujung nyata tertangkap
+                is_tip = (mid_x < x_limit_left + tip_w_t4 or mid_x > x_limit_right - tip_w_t4)
                 max_ang = 18.0 if is_tip else 11.0
                 ceil_g = 6.5 if is_tip else 6.0
                 floor_g = 9.0 if is_tip else 7.0
@@ -2762,7 +2776,7 @@ class HybridRibInspector:
             idx = valid_idxs[k]
             gx = x_grid[idx]
             y_nom = float(np.polyval(p_guide, gx))
-            is_tip_pt = (gx < x_limit_left + 135)
+            is_tip_pt = (gx < x_limit_left + tip_w_t4)
             c_ceil = 6.5 if is_tip_pt else 6.0
             c_floor = 9.0 if is_tip_pt else 7.0
             cands = [y for y in y_accum[idx] if (y_nom - c_ceil) <= y <= (y_nom + c_floor)]
@@ -2782,7 +2796,7 @@ class HybridRibInspector:
             idx = valid_idxs[k]
             gx = x_grid[idx]
             y_nom = float(np.polyval(p_guide, gx))
-            is_tip_pt = (gx > x_limit_right - 135)
+            is_tip_pt = (gx > x_limit_right - tip_w_t4)
             c_ceil = 6.5 if is_tip_pt else 6.0
             c_floor = 9.0 if is_tip_pt else 7.0
             cands = [y for y in y_accum[idx] if (y_nom - c_ceil) <= y <= (y_nom + c_floor)]
@@ -2817,7 +2831,7 @@ class HybridRibInspector:
         refined_ys = []
         for gx, y_est in zip(x_grid, full_ys):
             y_nom = float(np.polyval(p_guide, gx))
-            is_tip_gx = (gx < x_limit_left + 135 or gx > x_limit_right - 135)
+            is_tip_gx = (gx < x_limit_left + tip_w_t4 or gx > x_limit_right - tip_w_t4)
             max_nom_dist = 9.5 if is_tip_gx else 7.5
             best_y = int(round(y_est))
             best_sc = -9999.0
@@ -3301,7 +3315,8 @@ class HybridRibInspector:
                 )
                 _pos_roi_def = _sy_roi_def[_sy_roi_def > 0]
                 _adapt_contrast_def = float(
-                    np.clip(np.percentile(_pos_roi_def, 70), 10.0, 22.0)
+                    # [ANTI-FALSE-DET] Clamp [10,22]→[13,25]: konsisten dengan Tier-1, cegah karat/shadow lolos Legacy
+                    np.clip(np.percentile(_pos_roi_def, 70), 13.0, 25.0)
                 ) if len(_pos_roi_def) > 50 else 15.0
             except Exception:
                 _adapt_contrast_def = 15.0
@@ -3364,9 +3379,12 @@ class HybridRibInspector:
             mid_idx = int(np.argmin([abs(ax - mid_target_x) for ax in anchor_xs]))
             x_center = int(anchor_xs[mid_idx])
 
-            # Jangkauan pelacakan lateral penuh (Tip-to-Tip Coverage)
-            x_limit_left = max(248, bx1 + 10)
-            x_limit_right = min(1635, bx2 - 10)
+            # Jangkauan pelacakan lateral adaptif (Zoom & Vibration Tolerant Tip-to-Tip Coverage)
+            pad_x = 10
+            margin_frame = int(0.04 * w_f)
+            x_limit_left = max(margin_frame, int(bx1 + pad_x))
+            x_limit_right = min(w_f - margin_frame, int(bx2 - pad_x))
+            tip_w_legacy = max(120, int(0.09 * (x_limit_right - x_limit_left)))
 
             # Grid kolom step-4 sejajar x_center agar vektorisasi band 100% identik dengan loop skalar
             x_grid_start = max(0, x_center - max(0, (x_center - x_limit_left) // 4) * 4)
@@ -3381,7 +3399,33 @@ class HybridRibInspector:
 
             pad_top = roi_y1 - 1
             pad_bot = roi_y2 + 1
-            gb_sub = gray[pad_top:pad_bot + 1, x_grid_start:x_grid_end + 1:4].astype(np.float32)
+
+            # [ANTI-FALSE-DET CM-2] Bilateral Filter pada ROI strip sebelum scan kolom Legacy:
+            # Meratakan bintik karat & goresan permukaan metal tanpa menghaluskan tepi tajam bibir rib.
+            # d=5 cukup cepat (<1ms), sigma=25 menjaga ketajaman gradien deviasi ujung/tip bending asli.
+            _roi_strip_raw = gray[pad_top:pad_bot + 1, x_grid_start:x_grid_end + 1]
+            try:
+                _roi_strip_filt = cv2.bilateralFilter(_roi_strip_raw, d=5, sigmaColor=25, sigmaSpace=25)
+            except Exception:
+                _roi_strip_filt = _roi_strip_raw  # fallback tanpa filter jika error
+
+            # [ANTI-FALSE-DET CM-1] Gap Dark-Stripe Mask Terkalibrasi:
+            # Hanya celah gelap nyata (< 35) yang diblokir, dan bebaskan zona tip (outer 15% per sisi)
+            # agar deviasi ujung asli (bending tip) tidak salah terbaca sebagai celah dan tidak dipaksa coasting lurus.
+            _gap_col_brightness_full = np.median(_roi_strip_filt, axis=0)
+            _gap_mask_full = (_gap_col_brightness_full < 35).astype(np.uint8)
+            _tip_zone_px = int(0.15 * len(_gap_mask_full))
+            if _tip_zone_px > 0:
+                _gap_mask_full[:_tip_zone_px] = 0        # bebaskan ujung kiri
+                _gap_mask_full[-_tip_zone_px:] = 0       # bebaskan ujung kanan
+
+            # Morphological dilation: gap yang sempit (< 8px) diabaikan, gap nyata (>= 8px) diblokir
+            _gap_mask_full = cv2.dilate(_gap_mask_full.reshape(1, -1),
+                                        cv2.getStructuringElement(cv2.MORPH_RECT, (8, 1))).flatten()
+            # Downsample ke step-4 agar sinkron dengan indeks kolom `col` di loop
+            _gap_mask_cols = _gap_mask_full[::4]
+
+            gb_sub = _roi_strip_filt[:, ::4].astype(np.float32)  # step-4 agar sinkron dengan x_grid
             gb_sub_b = gray[pad_top + 8:pad_bot + 9, x_grid_start:x_grid_end + 1:4].astype(np.float32)
             sub_band = gb_sub * 0.4 + (gb_sub - gb_sub_b) * 1.2
             gb = gb_sub[1:-1]
@@ -3424,7 +3468,7 @@ class HybridRibInspector:
 
                 for x in range(x_center + step_x, x_limit + direction, step_x):
                     gy = g_m * x + g_c
-                    is_tip = (x > x_limit - 120) if direction > 0 else (x < x_limit + 120)
+                    is_tip = (x > x_limit - tip_w_legacy) if direction > 0 else (x < x_limit + tip_w_legacy)
                     y_pred = cur_y + rolling_slope * step_x
 
                     # Guard bebas bias di ujung (ceiling diperlonggar ke 14px agar tidak terpaksa turun ke sisi berkarat)
@@ -3440,7 +3484,13 @@ class HybridRibInspector:
                     best_sc = -9999.0
                     best_g = 0.0
                     col = (x - x_grid_start) // 4
-                    if y_high >= y_low and 0 <= col < n_band_cols:
+
+                    # [ANTI-FALSE-DET P6] Gap Dark-Stripe Guard:
+                    # Jika kolom ini terdeteksi sebagai celah antar slat (brightness rendah), paksa coast —
+                    # jangan latch ke tepi gelap celah yang akan menciptakan spike deviasi palsu.
+                    _col_in_gap = (0 <= col < len(_gap_mask_cols) and _gap_mask_cols[col] > 0)
+
+                    if not _col_in_gap and y_high >= y_low and 0 <= col < n_band_cols:
                         yl_r = y_low - roi_y1
                         yh_r = y_high - roi_y1
                         yv = ys_band[yl_r:yh_r + 1]
