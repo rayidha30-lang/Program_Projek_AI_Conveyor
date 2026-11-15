@@ -1,0 +1,55 @@
+======================================================================
+PANDUAN PERINTAH JETSON (COPY-PASTE) - AI SLAT RIB CONVEYOR
+======================================================================
+
+----------------------------------------------------------------------
+1. MASUK KE FOLDER REPO & PULL SEMUA UPDATE DARI GITHUB
+----------------------------------------------------------------------
+cd ~/Program_Projek_AI_Conveyor
+git status
+git fetch --all --prune
+git checkout main
+git pull origin main
+git merge origin/feat/jetson-webcam-test
+
+# (Jika git pull terhalang perubahan lokal, jalankan dulu: git stash)
+
+
+----------------------------------------------------------------------
+2. SETUP AWAL JETSON (CUKUP SEKALI SAJA)
+----------------------------------------------------------------------
+chmod +x scripts/setup_jetson.sh scripts/configure_jetson_env.sh scripts/repair_jetson_camera.sh scripts/run_jetson_production.sh
+bash scripts/setup_jetson.sh
+
+# Jika langkah [4/5] berhenti karena requirements.txt tidak ditemukan:
+pip3 install "numpy>=1.23.5,<2.0.0"
+pip3 install -r requirements.txt
+
+# Generate .env otomatis & aktifkan izin kamera user:
+bash scripts/configure_jetson_env.sh --auto
+sudo usermod -aG video $USER
+
+
+----------------------------------------------------------------------
+3. CEK KAMERA & TES WEBCAM
+----------------------------------------------------------------------
+bash scripts/repair_jetson_camera.sh
+python3 scripts/test_jetson_webcam.py --list
+
+# Ganti 0 dengan /dev/videoX sesuai hasil --list jika perlu:
+python3 scripts/test_jetson_webcam.py --cam 0
+
+# Jika lewat SSH tanpa monitor (headless 10 detik + simpan snapshot):
+python3 scripts/test_jetson_webcam.py --cam 0 --headless --seconds 10
+
+
+----------------------------------------------------------------------
+4. VERIFIKASI GPU CUDA & JALANKAN PROGRAM UTAMA
+----------------------------------------------------------------------
+python3 -c "import torch; print('CUDA Ready:', torch.cuda.is_available(), '| GPU:', torch.cuda.get_device_name(0))"
+
+# Jalankan mode benchmark GUI:
+python3 run_multi_camera_benchmark.py
+
+# Atau jalankan mode produksi:
+bash scripts/run_jetson_production.sh
