@@ -710,7 +710,7 @@ def get_analytics():
 # ==========================================================
 TOP_CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "Jetson_Vision_Engine",
+    "Vision_Engine_Core",
     "02_Top_Inspection_Slat_Rib",
     "configs",
     "top_inspection_config.json"

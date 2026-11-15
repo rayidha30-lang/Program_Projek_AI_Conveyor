@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.ipynb_checkpoints/
+.pytest_cache/
+.vscode/
 
 # Node & Frontend Build
 node_modules/
@@ -13,7 +15,6 @@ build/
 # Graphify Knowledge Graph & AI Agent Artifacts
 graphify-out/
 **/graphify-out/
-.agents/
 .gemini/
 
 # File Video & Media Berat
@@ -32,6 +33,8 @@ graphify-out/
 *.ico
 *.svg
 *.txt
+!requirements.txt
+!Documentation/*.txt
 *.onnx
 
 # Archives, Backup & Scratch
@@ -71,3 +74,7 @@ jetson_benchmark_fps.csv
 # Arsip Lokal Eksperimen & Duplikat (Disimpan Lokal, Tidak Dipush ke GitHub)
 archive/
 output/
+Database/
+*.db
+*.sqlite
+*.log
