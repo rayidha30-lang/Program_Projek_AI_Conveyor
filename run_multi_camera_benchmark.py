@@ -1813,7 +1813,7 @@ def _run_threaded_engine(args):
     # Windows GUI Setup
     win_top = "CAM-01 TOP (SLAT & RIB) | [K]: Align Rel Instan | [1]/[V]: Video | [G]: Panduan | [L]: Wizard | [D]: DB | [Q]: Keluar"
     win_side = f"{args.side_cam_id} SIDE [{args.side_cam_id} {args.side_name}] | [2]/[O]: Video | [W]: Setup | [M]: Preset | [D]: DB | [Q]: Keluar"
-    if args.mode == "dual":
+    if args.mode != "headless":
         if top_inspector is not None:
             cv2.namedWindow(win_top, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(win_top, 920, 518)
@@ -1860,7 +1860,7 @@ def _run_threaded_engine(args):
 
             # Render GUI OpenCV di Main Thread (Decoupled GUI Rendering Sejati - Bebas GIL dari Thread AI)
             key = -1
-            if args.mode == "dual":
+            if args.mode != "headless":
                 if (now - last_gui_render) >= gui_interval:
                     last_gui_render = now
                     if top_inspector is not None:
@@ -2132,7 +2132,7 @@ def _run_threaded_engine(args):
             top_inspector.db_bridge.close()
         if side_db_bridge is not None:
             side_db_bridge.close()
-        if args.mode == "dual":
+        if args.mode != "headless":
             cv2.destroyAllWindows()
         if csv_file is not None:
             csv_file.close()
@@ -2437,7 +2437,7 @@ Shortcut Keyboard Saat Berjalan:
     print("=" * 86)
     print(f"[*] Engine Arsitektur  : {'THREADS (Hemat RAM 8GB, Berbagi VRAM Bersama)' if args.engine == 'threads' else 'PROCESS (Multiprocessing Terisolasi)'}")
     print(f"[*] Mode Operasional   : {args.mode.upper()}")
-    if args.mode == "dual":
+    if args.mode != "headless":
         print(f"[*] GUI Render Mode    : DECOUPLED ({args.gui_fps:.1f} FPS GUI Display Pacing, AI Full Speed 35+ FPS)")
     print(f"[*] CAM-01 Top Source  : {os.path.basename(str(args.top_source)) if os.path.exists(str(args.top_source)) else args.top_source}")
     print(f"[*] {args.side_cam_id} Side Source : {os.path.basename(str(args.side_source)) if os.path.exists(str(args.side_source)) else args.side_source} ({args.side_name})")
@@ -2477,7 +2477,7 @@ Shortcut Keyboard Saat Berjalan:
             target=_run_top_worker,
             args=(
                 args.top_source,
-                "dual" if args.mode == "dual" else "headless",
+                "headless" if args.mode == "headless" else "dual",
                 args.rib_mode,
                 args.device,
                 args.enable_db,
@@ -2498,7 +2498,7 @@ Shortcut Keyboard Saat Berjalan:
             target=_run_side_worker,
             args=(
                 args.side_source,
-                "dual" if args.mode == "dual" else "headless",
+                "headless" if args.mode == "headless" else "dual",
                 args.side_name,
                 args.side_cam_id,
                 args.device,
