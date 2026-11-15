@@ -181,7 +181,8 @@ class HybridRibInspector:
         dev_thresh=9.5,
         tip_thresh=9.5,
         device=None,
-        stride=None
+        stride=None,
+        tracker_engine="LEGACY"
     ):
         """
         :param mode: "HYBRID", "YOLO_ONLY", atau "DUAL_POLARITY_ONLY"
@@ -198,6 +199,8 @@ class HybridRibInspector:
         cur_dir = os.path.dirname(os.path.abspath(__file__))
         parent_dir = os.path.dirname(cur_dir)
         cfg_path = os.path.join(parent_dir, "configs", "top_inspection_config.json")
+        cfg_prime_min_y = 355
+        cfg_prime_max_y = 435
         if os.path.exists(cfg_path):
             try:
                 with open(cfg_path, "r", encoding="utf-8") as _f_cfg:
@@ -211,6 +214,12 @@ class HybridRibInspector:
                         dev_thresh = float(_th.get("rib_dev_threshold", _th.get("rib_max_dev_threshold")))
                     if "rib_tip_threshold" in _th and tip_thresh == 9.5:
                         tip_thresh = float(_th["rib_tip_threshold"])
+                    if "rib_prime_min_y" in _th and _th["rib_prime_min_y"] is not None:
+                        cfg_prime_min_y = int(_th["rib_prime_min_y"])
+                    if "rib_prime_max_y" in _th and _th["rib_prime_max_y"] is not None:
+                        cfg_prime_max_y = int(_th["rib_prime_max_y"])
+                    # Muat severity zones (untuk klasifikasi LOW/MEDIUM/HIGH bending di masa depan)
+                    self._severity_zones = _th.get("rib_severity_zones", {})
             except Exception:
                 pass
 
@@ -221,6 +230,13 @@ class HybridRibInspector:
         self.sagitta_thresh = float(sagitta_thresh)
         self.dev_thresh = float(dev_thresh)
         self.tip_thresh = float(tip_thresh)
+
+        # Flag: threshold sudah dimuat dari dataset adaptif (untuk log)
+        self._adaptive_loaded = False
+        self._adaptive_n_ok = 0
+        # Pastikan _severity_zones terisi default jika config tidak memuatnya
+        if not hasattr(self, "_severity_zones"):
+            self._severity_zones = {}
 
         # 0. Konfigurasi Device Komputasi (CUDA / CPU)
         if device is None or str(device).lower() in ("auto", ""):
@@ -301,7 +317,18 @@ class HybridRibInspector:
                 os.path.abspath(os.path.join(cur_dir, "..", "..", "..", "02_Top_Inspection_Slat_Rib", "models", "best_rib_v4.onnx")),
                 os.path.abspath(os.path.join(cur_dir, "..", "..", "..", "02_Top_Inspection_Slat_Rib", "models", "best_rib.onnx")),
             ]
-            candidates = (engine_candidates + pt_candidates + onnx_candidates) if self.device != "cpu" else (pt_candidates + onnx_candidates)
+            has_ort_cuda = False
+            if self.device != "cpu":
+                try:
+                    import onnxruntime as _ort
+                    has_ort_cuda = "CUDAExecutionProvider" in _ort.get_available_providers()
+                except Exception:
+                    has_ort_cuda = False
+
+            if self.device != "cpu":
+                candidates = (engine_candidates + onnx_candidates + pt_candidates) if has_ort_cuda else (engine_candidates + pt_candidates + onnx_candidates)
+            else:
+                candidates = pt_candidates + onnx_candidates
 
             if not model_path or not os.path.exists(model_path):
                 env_top = os.environ.get("MODEL_TOP_PATH")
@@ -323,28 +350,42 @@ class HybridRibInspector:
                         model_path = c
                         break
 
-            # Jika model_path berakhiran .pt tetapi ada .engine di GPU
+            # Auto-upgrade .pt ke .engine (TensorRT) atau .onnx (ONNX Runtime CUDA) jika tersedia di GPU
             if model_path and model_path.endswith(".pt") and self.device != "cpu":
                 eng_cand = model_path.replace(".pt", ".engine")
+                onnx_cand = model_path.replace(".pt", ".onnx")
                 if os.path.exists(eng_cand):
                     model_path = eng_cand
                     print(f"[HybridRibInspector] 🚀 Menggunakan TensorRT Engine FP16: {os.path.basename(eng_cand)}")
+                elif has_ort_cuda and os.path.exists(onnx_cand):
+                    model_path = onnx_cand
+                    print(f"[HybridRibInspector] ⚡ Akselerasi ONNX Runtime CUDA aktif: {os.path.basename(onnx_cand)}")
+
+            def _load_detector_weights(weights_path):
+                is_trt_or_onnx = str(weights_path).endswith((".engine", ".onnx"))
+                if str(weights_path).endswith(".onnx"):
+                    try:
+                        import onnxruntime as _ort
+                        _ort.set_default_logger_severity(3)
+                    except Exception:
+                        pass
+                loaded = YOLO(weights_path, task="detect") if is_trt_or_onnx else YOLO(weights_path)
+                if self.device != "cpu" and HAS_TORCH and torch.cuda.is_available() and not is_trt_or_onnx:
+                    try:
+                        loaded.to(self.device)
+                        if hasattr(loaded, "model") and loaded.model is not None:
+                            loaded.model.half()
+                        self.use_half = True
+                    except Exception:
+                        pass
+                elif is_trt_or_onnx:
+                    self.use_half = True
+                return loaded
 
             self.model_path = model_path
             if model_path and os.path.exists(model_path):
                 try:
-                    self.yolo_model = YOLO(model_path)
-                    is_trt_or_onnx = str(model_path).endswith((".engine", ".onnx"))
-                    if self.device != "cpu" and HAS_TORCH and torch.cuda.is_available() and not is_trt_or_onnx:
-                        try:
-                            self.yolo_model.to(self.device)
-                            if hasattr(self.yolo_model, "model") and self.yolo_model.model is not None:
-                                self.yolo_model.model.half()
-                            self.use_half = True
-                        except Exception:
-                            pass
-                    elif is_trt_or_onnx:
-                        self.use_half = True
+                    self.yolo_model = _load_detector_weights(model_path)
                     self.class_names = self.yolo_model.names if hasattr(self.yolo_model, 'names') else {0: 'rib'}
 
                     # Validasi kelas model: pastikan bukan model Bolt/Pin yang salah konfigurasi
@@ -359,18 +400,7 @@ class HybridRibInspector:
                                 break
                         if fallback_rib:
                             try:
-                                self.yolo_model = YOLO(fallback_rib)
-                                is_fb_trt_or_onnx = str(fallback_rib).endswith((".engine", ".onnx"))
-                                if self.device != "cpu" and HAS_TORCH and torch.cuda.is_available() and not is_fb_trt_or_onnx:
-                                    try:
-                                        self.yolo_model.to(self.device)
-                                        if hasattr(self.yolo_model, "model") and self.yolo_model.model is not None:
-                                            self.yolo_model.model.half()
-                                        self.use_half = True
-                                    except Exception:
-                                        pass
-                                elif is_fb_trt_or_onnx:
-                                    self.use_half = True
+                                self.yolo_model = _load_detector_weights(fallback_rib)
                                 self.model_path = fallback_rib
                                 self.class_names = self.yolo_model.names if hasattr(self.yolo_model, 'names') else {0: 'rib'}
                                 print(f"[HybridRibInspector] ✅ Berhasil beralih ke Model Rib: {os.path.basename(fallback_rib)} (Kelas: {self.class_names})")
@@ -397,18 +427,27 @@ class HybridRibInspector:
         # Parameter Temporal Voting & Multi-Frame Consensus Anti-Glitch
         self.min_transit_frames = 15
         self.absence_frames = 0
-        self.max_absence_tolerance = 16
+        self.max_absence_tolerance = 8
 
-        # Zona Prime Evaluasi Konveyor (Pusat optik planar bebas distorsi lensa Y: 340 - 460 px)
-        self.prime_min_y = 340
-        self.prime_max_y = 460
+        # ── Anti-False Detection: EMA Dual Polarity Ratio (S4) ───────────────
+        # Meratakan rasio valid_points antar frame → menolak spike 1-frame dari
+        # noda oli, pantulan sesaat, atau fluktuasi cahaya redup
+        self._dp_ratio_ema = 0.0
+        self._dp_alpha = 0.55  # 0.55 = responsif tapi punya memori 2–3 frame
+
+        # Kernel morphological BG subtraction (dibuat sekali, re-use tiap frame)
+        self._dp_kernel_bg = cv2.getStructuringElement(cv2.MORPH_RECT, (91, 1))
+
+        # Zona Prime Evaluasi Konveyor (Pusat optik planar bebas distorsi masuk/keluar Y: 355 - 435 px)
+        self.prime_min_y = int(cfg_prime_min_y)
+        self.prime_max_y = int(cfg_prime_max_y)
         # Prime zone kamera untuk TIER3_UNWARP (305-385px): area tengah planar bebas distorsi lensa & bebas seam konveyor
         # Di unwarp space, rentang ini memetakan tepat ke Y=145-215px (sweet spot optik).
         self.tier3_prime_min_y = 305
         self.tier3_prime_max_y = 385
-        # Prime zone kamera untuk DEFAULT LEGACY (340-460px): area optik planar murni bebas distorsi
-        self._legacy_prime_min_y = 340
-        self._legacy_prime_max_y = 460
+        # Prime zone kamera untuk DEFAULT LEGACY & TIER 1 (sinkron dengan top_inspection_config.json)
+        self._legacy_prime_min_y = int(cfg_prime_min_y)
+        self._legacy_prime_max_y = int(cfg_prime_max_y)
         self.prime_pv_samples = []
         self.prime_sagitta_samples = []
         self.prime_inner_dev_samples = []
@@ -432,6 +471,11 @@ class HybridRibInspector:
         self._frame_count = 0
         self._last_yolo_det = (False, None, 0.0, [])
 
+        # Solusi 1: Temporal Multi-Frame Profile Fusion (Tier 4 Hough Stitching)
+        self.tier4_profile_history = []
+        self.tier4_fused_dev = None
+        self.tier4_ref_xs = np.linspace(260.0, 1620.0, 341, dtype=np.float32)
+
         # Cache Dual Polarity untuk stride (skip setiap frame ke-2 hemat 6-7ms)
         self._last_dual_det = (False, None, 0.0, 0.0, None)
         self._dual_stride = 2  # Jalankan dual polarity setiap N frame
@@ -443,10 +487,12 @@ class HybridRibInspector:
         self._last_active_box = None
         self._last_active_cy = None
 
-        # Sakelar Engine Pelacakan Kontur Sirip (Mutually Exclusive 3-Way):
-        # 1. "LEGACY" (Default: Sobel-Y Anchor + Guided Crest Outward)
+        # Sakelar Engine Pelacakan Kontur Sirip (Mutually Exclusive 3-Way Teruji):
+        # 1. "LEGACY" (Default: Sobel-Y Anchor + Guided Crest Outward — 46 FPS)
         # 2. "TIER1_VITERBI" (Pilihan A: Anchor-Guided Tight-Ribbon Steger-Viterbi v2)
-        # 3. "TIER2_YOLO_POSE" (Pilihan B: Deep Learning 13-Keypoints Direct Pose + Sub-Pixel Polish)
+        # 3. "TIER4_HOUGH_STITCH" (Pilihan B: Micro-Houghlet Grouping & Elastic Stitching)
+        # (TIER2_YOLO_POSE & TIER3 YOLO-Segmentation di-take out karena tidak konsisten;
+        #  Preprocessing Perspective Transform / Unwarp 90 Deg tetap dipertahankan penuh.)
         # Parameter Preprocessing Perspective Transform (Top-Down Orthogonal 90 Deg)
         self.canonical_w = 960
         self.canonical_h = 460
@@ -463,15 +509,205 @@ class HybridRibInspector:
         self.pose_model_path = None
         self.seg_model = None
         self.seg_model_path = None
+        if tracker_engine and tracker_engine != "LEGACY":
+            self.set_tracker_engine(tracker_engine)
         # Cache Stride Temporal Tracker untuk Tier 3 (Ultra-Fast 45+ FPS)
         self._seg_stride_counter = 0
         self._last_seg_xs = None
         self._last_seg_ys = None
         self._last_seg_cy = None
+        # Anti-Flicker & Stabilisasi Temporal Tier 3 (YOLO-Segmentation + Unwarp Metrology)
+        self._prev_tier3_cam_xs = None
+        self._prev_tier3_cam_ys = None
+        self._prev_tier3_unw_xs = None
+        self._prev_tier3_unw_ys = None
+        self.tier3_profile_history = []
 
-        # Buffer Diagnostik Pre-Processing untuk Tier 4 (Micro-Houghlet Grouping & Stitching)
+        # Buffer Diagnostik Pre-Processing & Temporal Tracker untuk Tier 4 (Micro-Houghlet Grouping & Stitching)
         self._last_hough_diag = None
         self._last_hough_patch = None
+        self._prev_hough_pguide = None
+        self._prev_hough_contour_ys = None
+        self.tier4_profile_history.clear()
+        self.tier4_fused_dev = None
+        self._kinematic_coasting_frames = 0
+
+        # State Kinematic Linear Motion Tracker & Anti-Switching Locking
+        self._last_active_cy = None
+        self._last_active_box = None
+        self._conveyor_vy_ema = -2.5  # Kecepatan translasi vertikal konveyor (px/frame)
+        self._kinematic_coasting_frames = 0
+        self._max_kinematic_coasting = 4  # Toleransi bridge drop AI maksimal 4 frame (cegah ghost holding real-time)
+
+    # ------------------------------------------------------------------
+    # FASE 2: Adaptive Threshold dari Dataset Rib_Dataset (SQLite)
+    # ------------------------------------------------------------------
+    def load_adaptive_thresholds(self, db_path: str, sigma_factor: float = 2.5,
+                                  min_ok_rows: int = 30,
+                                  camera_profile: str = None) -> bool:
+        """
+        Memuat threshold adaptif dari tabel Rib_Dataset di database SQLite,
+        difilter per profil kamera agar dataset posisi berbeda tidak tercampur.
+
+        Threshold dihitung dengan formula:  mean(OK) + sigma_factor × std(OK)
+        untuk setiap metrik (PVFlatness, Sagitta, InnerDev, TipDev).
+
+        Parameter
+        ----------
+        db_path        : Path absolut ke file database SQLite.
+        sigma_factor   : Pengali standar deviasi. Default 2.5 → menangkap ~99 % distribusi normal.
+        min_ok_rows    : Jumlah baris OK minimum agar adaptive threshold dianggap valid.
+        camera_profile : Nama profil kamera (dari profile_name di config JSON). Jika None,
+                         mengambil semua baris tanpa filter profil (backward-compatible).
+
+        Return
+        ------
+        True  jika threshold berhasil dimuat dan diterapkan.
+        False jika gagal (file tidak ada, tabel belum ada, data terlalu sedikit, dsb.)
+        """
+        import sqlite3 as _sqlite3
+        import math as _math
+
+        if not db_path or not os.path.exists(db_path):
+            return False
+
+        try:
+            conn = _sqlite3.connect(db_path, timeout=5)
+            cur = conn.cursor()
+
+            # Query difilter per profil kamera jika tersedia, agar distribusi tiap posisi terpisah
+            if camera_profile:
+                cur.execute(
+                    "SELECT PVFlatness, Sagitta, InnerDev, TipDev "
+                    "FROM Rib_Dataset "
+                    "WHERE Label='OK' AND PVFlatness > 0 AND ActiveFrames >= 15 "
+                    "AND CameraProfile = ?",
+                    (camera_profile,)
+                )
+                profile_desc = f"profil='{camera_profile}'"
+            else:
+                # Fallback: ambil semua baris tanpa filter profil (kompatibel mundur)
+                cur.execute(
+                    "SELECT PVFlatness, Sagitta, InnerDev, TipDev "
+                    "FROM Rib_Dataset "
+                    "WHERE Label='OK' AND PVFlatness > 0 AND ActiveFrames >= 15"
+                )
+                profile_desc = "semua profil"
+
+            rows = cur.fetchall()
+            conn.close()
+
+            n = len(rows)
+            if n < min_ok_rows:
+                print(
+                    f"[HybridRibInspector] ⚠ Adaptive threshold dilewati [{profile_desc}]: "
+                    f"hanya {n} baris OK valid (minimum {min_ok_rows}). "
+                    f"Menggunakan threshold dari config."
+                )
+                return False
+
+            def _stats(vals):
+                mean = sum(vals) / len(vals)
+                std  = _math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
+                return mean, std
+
+            pvs  = [r[0] for r in rows]
+            sags = [r[1] for r in rows]
+            devs = [r[2] for r in rows]
+            tips = [r[3] for r in rows]
+
+            pv_m,  pv_s  = _stats(pvs)
+            sag_m, sag_s = _stats(sags)
+            dev_m, dev_s = _stats(devs)
+            tip_m, tip_s = _stats(tips)
+
+            # Hitung threshold adaptif; pastikan tidak lebih longgar dari nilai config saat ini
+            new_pv  = round(pv_m  + sigma_factor * pv_s,  2)
+            new_sag = round(sag_m + sigma_factor * sag_s, 2)
+            new_dev = round(dev_m + sigma_factor * dev_s,  2)
+            new_tip = round(tip_m + sigma_factor * tip_s,  2)
+
+            # Terapkan — gunakan nilai terkecil antara config lama dan adaptive (lebih aman / lebih ketat)
+            self.pv_thresh       = min(self.pv_thresh,       new_pv)
+            self.sagitta_thresh  = min(self.sagitta_thresh,  new_sag)
+            self.dev_thresh      = min(self.dev_thresh,      new_dev)
+            self.tip_thresh      = min(self.tip_thresh,      new_tip)
+
+            self._adaptive_loaded  = True
+            self._adaptive_n_ok    = n
+            self._adaptive_profile = camera_profile or "ALL"
+
+            print(
+                f"[HybridRibInspector] ✅ Adaptive threshold dimuat dari Rib_Dataset "
+                f"(n={n} OK, σ×{sigma_factor}, {profile_desc}) | "
+                f"PV≤{self.pv_thresh:.2f}  Sag≤{self.sagitta_thresh:.2f}  "
+                f"Dev≤{self.dev_thresh:.2f}  Tip≤{self.tip_thresh:.2f}"
+            )
+            return True
+
+        except Exception as exc:
+            print(f"[HybridRibInspector] ⚠ Gagal muat adaptive threshold: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Tingkat Keparahan Bending (Severity: LOW / MEDIUM / HIGH)
+    # Arsitektur siap pakai — semua level saat ini divonis NG.
+    # Pembagian zona mengacu pada rib sebagai penahan ingot di incline conveyor.
+    # ------------------------------------------------------------------
+    def compute_ng_severity(self, eval_pv: float, eval_sag: float,
+                            eval_idev: float, eval_tdev: float,
+                            is_ng: bool = None) -> str:
+        """
+        Menghitung tingkat keparahan cacat rib berdasarkan nilai metrik evaluasi.
+
+        Tingkat (saat ini semua divonis NG, severity hanya informatif):
+          - 'OK'     : semua metrik dalam batas toleransi
+          - 'LOW'    : satu metrik melampaui threshold utama (bending ringan)
+          - 'MEDIUM' : nilai cukup jauh melampaui threshold (bending sedang)
+          - 'HIGH'   : nilai jauh melampaui threshold (bending parah / kritis)
+
+        Zona threshold (px) — dapat dikustomisasi melalui config rib_severity_zones:
+          TipDev  : LOW ≥ tip_thresh | MEDIUM ≥ tip_thresh+3 | HIGH ≥ tip_thresh+6
+          InnerDev: LOW ≥ dev_thresh | MEDIUM ≥ dev_thresh+3 | HIGH ≥ dev_thresh+6
+          PV      : LOW ≥ pv_thresh  | MEDIUM ≥ pv_thresh+2  | HIGH ≥ pv_thresh+5
+
+        Return
+        ------
+        'OK' | 'LOW' | 'MEDIUM' | 'HIGH'
+        """
+        if is_ng is False:
+            return "OK"
+
+        # Ambil zona kustom dari atribut (diisi dari config) atau hitung dari threshold
+        sz = getattr(self, "_severity_zones", {}) or {}
+
+        def _zone(val, prefix, thresh, med_add=3.0, high_add=6.0):
+            """Klasifikasikan nilai ke zona LOW/MEDIUM/HIGH sesuai kunci prefix config."""
+            low_cfg = sz.get(f"{prefix}_low", sz.get("low", thresh))
+            low_bound  = min(float(thresh), float(low_cfg))
+            med_bound  = float(sz.get(f"{prefix}_medium", sz.get("medium", thresh + med_add)))
+            high_bound = float(sz.get(f"{prefix}_high", sz.get("high", thresh + high_add)))
+            if val >= high_bound:
+                return "HIGH"
+            elif val >= med_bound:
+                return "MEDIUM"
+            elif val >= low_bound:
+                return "LOW"
+            return "OK"
+
+        # Evaluasi severity masing-masing metrik
+        sev_tip  = _zone(eval_tdev,  "tip", self.tip_thresh,         med_add=3.0, high_add=6.0)
+        sev_dev  = _zone(eval_idev,  "dev", self.dev_thresh,         med_add=3.0, high_add=6.0)
+        sev_pv   = _zone(eval_pv,    "pv",  self.pv_thresh,          med_add=2.0, high_add=5.0)
+        sev_sag  = _zone(eval_sag,   "sag", self.sagitta_thresh,     med_add=2.0, high_add=4.0)
+
+        # Severity keseluruhan = level tertinggi dari semua metrik
+        rank = {"OK": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
+        worst = max([sev_tip, sev_dev, sev_pv, sev_sag], key=lambda s: rank[s])
+        if is_ng is True and worst == "OK":
+            return "LOW"
+        return worst
+
 
     def _load_seg_model(self):
         """Memuat model YOLO11-Segmentation untuk Tier 3 secara lazy loading."""
@@ -551,23 +787,10 @@ class HybridRibInspector:
         return False
 
     def toggle_tracker_engine(self):
-        """Beralih secara mutually exclusive antara 5 engine: LEGACY -> TIER1_VITERBI -> TIER2_YOLO_POSE -> TIER3_UNWARP -> TIER4_HOUGH_STITCH -> LEGACY."""
+        """Beralih secara mutually exclusive antara 3 engine teruji: LEGACY -> TIER1_VITERBI -> TIER4_HOUGH_STITCH -> LEGACY."""
         if self.tracker_engine == "LEGACY":
             self.tracker_engine = "TIER1_VITERBI"
         elif self.tracker_engine == "TIER1_VITERBI":
-            if self.pose_model is None:
-                self._load_pose_model()
-            if self.pose_model is not None:
-                self.tracker_engine = "TIER2_YOLO_POSE"
-            else:
-                if self.seg_model is None:
-                    self._load_seg_model()
-                self.tracker_engine = "TIER3_UNWARP"
-        elif self.tracker_engine == "TIER2_YOLO_POSE":
-            if self.seg_model is None:
-                self._load_seg_model()
-            self.tracker_engine = "TIER3_UNWARP"
-        elif self.tracker_engine == "TIER3_UNWARP":
             self.tracker_engine = "TIER4_HOUGH_STITCH"
         elif self.tracker_engine == "TIER4_HOUGH_STITCH":
             self.tracker_engine = "LEGACY"
@@ -577,18 +800,16 @@ class HybridRibInspector:
         return self.tracker_engine
 
     def set_tracker_engine(self, engine_name):
-        """Mengatur engine pelacakan kontur secara eksplisit ('LEGACY', 'TIER1_VITERBI', 'TIER2_YOLO_POSE', 'TIER3_UNWARP', atau 'TIER4_HOUGH_STITCH')."""
+        """Mengatur engine pelacakan kontur ('LEGACY', 'TIER1_VITERBI', atau 'TIER4_HOUGH_STITCH')."""
         eng = str(engine_name).strip().upper()
         if "TIER4" in eng or "HOUGH" in eng or "STITCH" in eng:
             self.tracker_engine = "TIER4_HOUGH_STITCH"
-        elif "TIER3" in eng or "UNWARP" in eng or "PERSPECTIVE" in eng or "SEG" in eng:
-            if self.seg_model is None:
-                self._load_seg_model()
-            self.tracker_engine = "TIER3_UNWARP"
+        elif "TIER3" in eng or "SEG" in eng or "UNWARP" in eng or "PERSPECTIVE" in eng:
+            print("[HybridRibInspector] ⚠️ TIER3_UNWARP (YOLO-Seg) telah di-take out (preprocessing Perspective Transform tetap aktif); dialihkan ke TIER4_HOUGH_STITCH.")
+            self.tracker_engine = "TIER4_HOUGH_STITCH"
         elif "TIER2" in eng or "POSE" in eng:
-            if self.pose_model is None:
-                self._load_pose_model()
-            self.tracker_engine = "TIER2_YOLO_POSE" if self.pose_model is not None else "LEGACY"
+            print("[HybridRibInspector] ⚠️ TIER2_YOLO_POSE telah di-take out; dialihkan ke LEGACY.")
+            self.tracker_engine = "LEGACY"
         elif "TIER1" in eng or "VITERBI" in eng:
             self.tracker_engine = "TIER1_VITERBI"
         else:
@@ -599,7 +820,9 @@ class HybridRibInspector:
     def _reset_rib_session(self):
         """Mereset buffer sampel metrologi saat transisi ke sirip baru."""
         self.last_presence = False
+        self._dp_ratio_ema = 0.0
         self._last_unwarp_contour = None
+        self._last_unwarp_baseline = None
         self._prev_unwarp_anchor_y = None
         self.active_rib_frames = 0
         self.active_rib_ok_frames = 0
@@ -619,8 +842,70 @@ class HybridRibInspector:
         self._last_seg_xs = None
         self._last_seg_ys = None
         self._last_seg_cy = None
+        self._prev_tier3_cam_xs = None
+        self._prev_tier3_cam_ys = None
+        self._prev_tier3_unw_xs = None
+        self._prev_tier3_unw_ys = None
+        if hasattr(self, 'tier3_profile_history'):
+            self.tier3_profile_history.clear()
         self._last_hough_diag = None
         self._last_hough_patch = None
+        self._prev_hough_pguide = None
+        self._prev_hough_contour_ys = None
+        self.tier4_profile_history.clear()
+        self.tier4_fused_dev = None
+        self._kinematic_coasting_frames = 0
+
+    @staticmethod
+    def _fit_robust_guide_poly(anchor_xs, anchor_ys, default_y, max_abs_slope=0.035):
+        """
+        Menghitung garis pandu linear yang kebal outlier (anti-diagonal skew di tepi/rust):
+        1. Saring outlier vertikal terhadap median sebelum regresi awal (cegah rusaknya p_init).
+        2. Saring ulang residual OLS agar kurva tetap rapat pada bibir atas.
+        3. Clamp kemiringan ke batas fisik konveyor (±max_abs_slope) agar ekstrapolasi ke ujung tidak meleset.
+        """
+        if len(anchor_xs) < 2:
+            return np.array([0.0, float(default_y)], dtype=np.float64)
+
+        xs = np.asarray(anchor_xs, dtype=np.float64)
+        ys = np.asarray(anchor_ys, dtype=np.float64)
+        med_y = float(np.median(ys))
+
+        # Tahap 1: Klaster median awal (±16 px) sebelum fit OLS
+        mask1 = np.abs(ys - med_y) <= 16.0
+        if np.sum(mask1) >= 3:
+            xs, ys = xs[mask1], ys[mask1]
+
+        # Tahap 2: Regresi awal + saring residual
+        if len(xs) >= 3:
+            p_init = np.polyfit(xs, ys, 1)
+            resids = np.abs(ys - np.polyval(p_init, xs))
+            med_res = float(np.median(resids))
+            mask2 = resids <= max(6.5, med_res * 2.0)
+            if np.sum(mask2) >= 3:
+                xs, ys = xs[mask2], ys[mask2]
+
+        poly = np.polyfit(xs, ys, deg=1) if len(xs) >= 2 else np.array([0.0, med_y], dtype=np.float64)
+
+        # Tahap 3: Clamp kemiringan ke batas fisik agar tidak menukik di ujung kiri/kanan
+        if abs(poly[0]) > max_abs_slope:
+            clamped_m = float(np.clip(poly[0], -max_abs_slope, max_abs_slope))
+            med_x = float(np.median(xs))
+            med_y_clean = float(np.median(ys))
+            poly = np.array([clamped_m, med_y_clean - clamped_m * med_x], dtype=np.float64)
+        return poly
+
+    @staticmethod
+    def _normalize_flat_field_gray(gray_img, scale=128):
+        """Normalisasi iluminasi flat-field cepat via downscale 4x + GaussianBlur (~0.3ms vs ~57ms)."""
+        h_g, w_g = gray_img.shape[:2]
+        if h_g < 16 or w_g < 16:
+            return gray_img
+        sw, sh = max(8, w_g // 4), max(8, h_g // 4)
+        tiny = cv2.resize(gray_img, (sw, sh), interpolation=cv2.INTER_AREA)
+        bg_tiny = cv2.GaussianBlur(tiny, (0, 0), sigmaX=11.25, sigmaY=6.25)
+        bg = cv2.resize(bg_tiny, (w_g, h_g), interpolation=cv2.INTER_LINEAR)
+        return cv2.divide(gray_img, np.maximum(bg, 1), scale=scale)
 
     def reset_counters(self):
         """Mereset seluruh statistik hitungan sirip (Total Rib, OK, NG)."""
@@ -630,6 +915,7 @@ class HybridRibInspector:
         self.absence_frames = 0
         self._last_active_box = None
         self._last_active_cy = None
+        self._last_yolo_det = (False, None, 0.0, [])
         self._reset_rib_session()
 
     def set_mode(self, new_mode):
@@ -907,8 +1193,8 @@ class HybridRibInspector:
             gx = sx + x_limit_left
             gy_nom = float(np.polyval(p_guide, gx)) - y_min_g
             is_tip = (gx < x_limit_left + 120 or gx > x_limit_right - 120)
-            floor_g = 24.0 if is_tip else 6.0
-            ceil_g = 6.0
+            floor_g = 8.0 if is_tip else 7.0
+            ceil_g = 8.5 if is_tip else 6.0
             guide_pts.append((int(sx * scale_x), int(gy_nom * scale_y)))
             ceil_pts.append((int(sx * scale_x), int((gy_nom - ceil_g) * scale_y)))
             floor_pts.append((int(sx * scale_x), int((gy_nom + floor_g) * scale_y)))
@@ -1123,7 +1409,7 @@ class HybridRibInspector:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.38, contour_color, 1, cv2.LINE_AA)
 
         # 6. Label info HUD pada unwarp view
-        eng_label = f" | {self.tracker_engine} (YOLO-Seg + 90 Deg Metrology)" if self.tracker_engine == "TIER3_UNWARP" else ""
+        eng_label = f" | {self.tracker_engine} (90 Deg Perspective View)"
         cv2.putText(disp, f"TOP-DOWN 90 DEG UNWARP ({w_u}x{h_u} | Tilt {self.unwarp_tilt:.2f}x{eng_label})", (15, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(disp, "Rel Sejajar | [W]/[S]: Tilt | [K]/[J]: Posisi Y | [Z]: Ganti Preset | [T]: Ganti Engine",
@@ -1135,6 +1421,8 @@ class HybridRibInspector:
         """Memperbarui batas zona prime evaluasi sirip secara dinamis saat runtime."""
         self.prime_min_y = int(min_y)
         self.prime_max_y = int(max_y)
+        self._legacy_prime_min_y = int(min_y)
+        self._legacy_prime_max_y = int(max_y)
 
     def _letterbox_gpu(self, img_bgr, target_size):
         """
@@ -1269,24 +1557,34 @@ class HybridRibInspector:
         best_match_score = 0.0
         max_conf = 0.0
 
-        # Parameter Geometri Fisik Bilah Sirip pada Konveyor:
-        # 1. Lebar sirip riil konveyor: ~1214 px pada 1080p (toleransi 850px - 1500px)
-        #    Menolak struktur rangka bawah konveyor yang berukuran ekstrem (bw = 1917 px)
-        # 2. Batas lateral: bilah sirip tidak pernah menempel bezel kiri/kanan (x1 >= 115px, x2 <= 1805px)
-        # 3. Ketebalan vertikal fisik: 35px - 145px
-        # 4. Rasio aspek bilah tipis memanjang: 7.5 - 26.0
-        min_bw = int(0.35 * w_f)
-        max_bw = int(0.96 * w_f)
-        min_x1 = int(0.02 * w_f)
-        max_x2 = int(0.98 * w_f)
+        # Parameter Geometri Fisik Bilah Sirip pada Konveyor (Adaptive Conveyor Geometric Envelope):
+        # 1. Lebar sirip riil konveyor: fleksibel mencakup sudut dekat/lebar (672px - 1824px pada 1080p)
+        #    Menolak struktur rangka bawah konveyor (bw > 1850px) & plat slat dasar (Y1 > 540px, CY > 572px)
+        # 2. Batas lateral: fleksibel mengikuti sudut pandang/jarak kamera (x1 >= 38px, x2 <= 1881px)
+        # 3. Ketebalan vertikal fisik bilah tegak: 18px - 194px
+        # 4. Rasio aspek bilah tipis memanjang: 5.0 - 35.0
+        min_bw = int(0.35 * w_f)   # ~672 px
+        max_bw = int(0.95 * w_f)   # ~1824 px (mengakomodasi bilah sirip pada kamera FOV lebar)
+        min_x1 = int(0.02 * w_f)   # ~38 px
+        max_x2 = int(0.98 * w_f)   # ~1881 px
         min_bh = max(18, int(0.018 * h_f))
-        max_bh = int(0.20 * h_f)
-        nominal_w = int(0.635 * w_f)
+        max_bh = int(0.18 * h_f)   # ~194 px
+        nominal_w = int(0.70 * w_f)
 
         try:
+            # S6: 3-Level Hysteresis Detection Threshold (Diperketat untuk anti-false detection real-time):
+            # - Level 1 Cold Start (discovery): max(min(conf_thresh, 0.48), 0.42) → tolak noise kamera live awal
+            # - Level 2 Early Active (<5 frame): max(conf_thresh * 0.72, 0.36) → tahan drop transisi awal
+            # - Level 3 Stable Active (≥5 frame): max(conf_thresh * 0.64, 0.34) → cegah flicker tanpa over-sensitif
+            if self.active_rib_frames == 0:
+                eval_conf = max(min(self.conf_thresh, 0.48), 0.42)   # Level 1: Discovery ketat
+            elif self.active_rib_frames < 5:
+                eval_conf = max(self.conf_thresh * 0.72, 0.36)       # Level 2: Early Active
+            else:
+                eval_conf = max(self.conf_thresh * 0.64, 0.34)       # Level 3: Stable Active
             predict_kwargs = {
                 "source": infer_img,
-                "conf": self.conf_thresh,
+                "conf": eval_conf,
                 "iou": self.iou_thresh,
                 "device": self.device,
                 "agnostic_nms": True,
@@ -1327,15 +1625,16 @@ class HybridRibInspector:
                         ar = bw / max(1.0, float(bh))
 
                         # Filter validitas bilah sirip:
-                        # 1. Batasi CY maksimum ke 680 px untuk melenyapkan balok rangka bawah mesin konveyor (Y > 750 px)
-                        # 2. Pastikan lebar dan rasio aspek bilah wajar
+                        # 1. Batasi CY maksimum ke 572 px (0.53 * h_f) untuk menolak gerbang plat slat (Y > 565 px)
+                        # 2. Batasi Y1 maksimum ke 540 px (0.50 * h_f) untuk menolak 100% plat slat dasar bawah (Y1 > 600 px)
+                        # 3. Pastikan lebar bilah memenuhi batas fisik sirip riil adaptif (bw <= 1824 px)
                         is_valid = (
                             (min_bw <= bw <= max_bw) and
                             (x1 >= min_x1 and x2 <= max_x2) and
                             (min_bh <= bh <= max_bh) and
-                            (5.5 <= ar <= 35.0) and
-                            (cy >= zy1 - 35) and (cy <= min(zy2 + 15, int(0.64 * h_f))) and
-                            (y1 <= int(0.61 * h_f))
+                            (5.0 <= ar <= 35.0) and
+                            (y1 >= zy1 - max(12, int(0.017 * h_f))) and (cy >= zy1 + max(10, int(0.014 * h_f))) and (cy <= min(zy2 + 15, int(0.53 * h_f))) and
+                            (y1 <= int(0.50 * h_f))
                         )
 
                         if is_valid:
@@ -1344,11 +1643,11 @@ class HybridRibInspector:
                                 "conf": conf,
                                 "centroid": (int((x1 + x2) / 2), cy)
                             })
-                            # Seleksi berbasis kombinasi skor deteksi, kemiripan lebar, dan kedekatan ke prime zone
+                            # Seleksi berbasis kombinasi skor deteksi, kemiripan lebar nominal (1214px), dan kedekatan ke prime zone
                             prime_mid = (self.prime_min_y + self.prime_max_y) // 2
                             dist_to_prime = abs(cy - prime_mid)
                             w_dev = abs(bw - nominal_w) / float(nominal_w)
-                            match_score = conf * (1.0 - min(0.4, w_dev)) - (dist_to_prime / 1200.0)
+                            match_score = conf * max(0.1, 1.0 - 2.0 * w_dev) - (dist_to_prime / 800.0)
                             if match_score > best_match_score:
                                 best_match_score = match_score
                                 best_box = [x1, y1, x2, y2]
@@ -1368,6 +1667,17 @@ class HybridRibInspector:
         Memeriksa keberadaan bilah tegak 3D dengan tinggi H in [50, 220] px
         (+Sobel Y pada puncak atas bilah vs -Sobel Y pada kaki/bayangan bilah).
         Dioptimalkan dengan evaluasi khusus pada ROI zona konveyor (hemat komputasi 75%).
+
+        PENINGKATAN ANTI-FALSE DETECTION:
+          S1A – Morphological Background Subtraction: menghilangkan bias iluminasi horizontal
+                yang menyebabkan threshold Sobel-Y meledak saat cahaya ambient berfluktuasi.
+          S3  – Adaptive Sobel Threshold: threshold top/bot dihitung dari percentile distribusi
+                gradien ROI sehingga naik-turun otomatis mengikuti kondisi pencahayaan.
+          S4  – EMA Dual Polarity Ratio: meratakan keputusan biner antar frame, menolak
+                spike false-positive dari noda oli atau flicker 1–2 frame.
+          S5  – Spatial Consistency Gate: valid_points harus tersebar merata ≥ 60% lebar zona,
+                sehingga noda terlokalisasi (oli, bayangan) tidak memicu deteksi.
+
         :param frame: Frame citra BGR
         :param zone_rect: (zx1, zy1, zx2, zy2)
         :return: (is_detected, dual_box, median_height, valid_ratio, None)
@@ -1381,9 +1691,34 @@ class HybridRibInspector:
         # Optimasi Downscale 2x: Memangkas komputasi Sobel-Y & looping CPU dari ~10ms menjadi ~2.9ms
         small_bgr = cv2.resize(crop_bgr, (w_c // 2, h_c // 2), interpolation=cv2.INTER_LINEAR)
         crop_gray = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
-        sy_crop = cv2.Sobel(crop_gray, cv2.CV_32F, 0, 1, ksize=3)
-        pos_sy = np.clip(sy_crop, 0, 255)
-        neg_sy = np.clip(-sy_crop, 0, 255)
+
+        # ── S1A: Gaussian Illumination Flat-Field Normalization (Fast 4x Downscale) ─
+        try:
+            crop_gray = self._normalize_flat_field_gray(crop_gray, scale=128)
+        except Exception:
+            pass  # fallback ke crop_gray asli jika error
+
+        # ── S3: Hitung Adaptive Threshold dari Distribusi Gradien ROI ────────
+        # Ambil distribusi Sobel-Y seluruh ROI untuk estimasi kondisi pencahayaan.
+        # Percentile ke-82 dari distribusi positif → threshold 'top_val' adaptif.
+        # Clamp [12, 32] agar tidak terlalu longgar saat gelap / terlalu ketat saat terang.
+        sy_full = cv2.Sobel(crop_gray, cv2.CV_32F, 0, 1, ksize=3)
+        pos_all = sy_full[sy_full > 4.0]
+        neg_all = -sy_full[sy_full < -4.0]
+        if len(pos_all) > 20:
+            # [ANTI-FALSE-DET] Percentile 82→85 & clamp bawah 12→16: threshold lebih konservatif
+            # sehingga gradien shadow celah slat saat cahaya rendah tidak lolos gate deteksi
+            _dp_top_thresh = float(np.clip(np.percentile(pos_all, 85), 16.0, 32.0))
+        else:
+            _dp_top_thresh = 18.0  # fallback ke default
+        if len(neg_all) > 20:
+            # [ANTI-FALSE-DET] Clamp bawah 14→18: bot threshold tidak terlalu longgar saat gelap
+            _dp_bot_thresh = float(np.clip(np.percentile(neg_all, 85), 18.0, 36.0))
+        else:
+            _dp_bot_thresh = 20.0  # fallback ke default
+
+        pos_sy = np.clip(sy_full, 0, 255)
+        neg_sy = np.clip(-sy_full, 0, 255)
 
         h_crop, w_crop = crop_gray.shape[:2]
         scan_xs_rel = np.arange(30, max(31, w_crop - 30), 8)
@@ -1409,11 +1744,49 @@ class HybridRibInspector:
                     bot_y = zy1 + (b_lo + bot_offset) * 2
                     h_rib = bot_y - top_y
 
-                    if top_val >= 18.0 and bot_val >= 20.0 and (50 <= h_rib <= 220):
+                    # S3: Gunakan adaptive threshold (bukan fixed 18.0 / 20.0)
+                    if top_val >= _dp_top_thresh and bot_val >= _dp_bot_thresh and (50 <= h_rib <= 220):
                         valid_points.append((zx1 + x_rel * 2, top_y, bot_y, h_rib))
 
-        ratio = len(valid_points) / float(len(scan_xs_rel)) if len(scan_xs_rel) > 0 else 0.0
-        dual_detected = bool(ratio >= 0.35)
+        # Konsistensi Cluster Horizontal (S5b): Saring titik yang sebaris dengan bibir rib dominan
+        # (±34px dari median top_y) agar edge acak antar celah slat tereliminasi.
+        if len(valid_points) >= 5:
+            _med_ty_cluster = float(np.median([p[1] for p in valid_points]))
+            _clustered = [p for p in valid_points if abs(p[1] - _med_ty_cluster) <= 34.0]
+            if len(_clustered) >= 3:
+                valid_points = _clustered
+
+        raw_ratio = len(valid_points) / float(len(scan_xs_rel)) if len(scan_xs_rel) > 0 else 0.0
+
+        # ── S4: EMA Smoothing pada Dual Polarity Ratio ───────────────────────
+        # Meratakan rasio antar frame: menolak spike 1-frame (noda, pantulan sesaat)
+        # tanpa menunda deteksi rib nyata (alpha=0.55 → memory ~2 frame)
+        self._dp_ratio_ema = self._dp_alpha * raw_ratio + (1.0 - self._dp_alpha) * self._dp_ratio_ema
+        smoothed_ratio = self._dp_ratio_ema
+
+        # ── S5: Spatial Consistency Gate ─────────────────────────────────────
+        # Valid points harus tersebar merata sepanjang ≥ 60% lebar zona konveyor.
+        # Noda oli atau bayangan terlokalisasi hanya mengisi < 30% → ditolak.
+        spatial_ok = True
+        if valid_points and len(valid_points) >= 3:
+            xs_vp = [p[0] for p in valid_points]
+            span_vp = max(xs_vp) - min(xs_vp)
+            zone_width = zx2 - zx1
+            # Span harus ≥ 60% lebar zona aktif
+            if zone_width > 0 and span_vp < zone_width * 0.60:
+                spatial_ok = False
+            # Distribusi merata: minimal 3 dari 4 kuadran lateral harus ada valid_point
+            if spatial_ok and zone_width > 0:
+                q_w = max(1.0, zone_width / 4.0)
+                quadrants = [0, 0, 0, 0]
+                for xp in xs_vp:
+                    q_idx = min(3, int((xp - zx1) / q_w))
+                    quadrants[q_idx] = 1
+                if sum(quadrants) < 3:
+                    spatial_ok = False
+
+        # Keputusan deteksi: EMA ratio ≥ 0.38 DAN distribusi spasial memadai
+        dual_detected = bool(smoothed_ratio >= 0.38 and spatial_ok)
         dual_box = None
         med_height = 0.0
 
@@ -1425,7 +1798,7 @@ class HybridRibInspector:
             med_bot = int(np.median([p[2] for p in valid_points]))
             dual_box = [min_x, med_top, max_x, med_bot]
 
-        return dual_detected, dual_box, med_height, ratio, None
+        return dual_detected, dual_box, med_height, raw_ratio, None
 
     def _track_steger_viterbi(self, gray, active_box, search_x1, search_x2, h_f, w_f):
         """
@@ -1450,97 +1823,119 @@ class HybridRibInspector:
         """
         bx1, by1, bx2, by2 = active_box
         
-        # 1. Validasi Fisika 7 Titik Anchor di Area Tengah Sirip (Contrast Gate)
-        step_fracs = [0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
+        # 1. Validasi Fisika 11 Titik Anchor Rentang Lebar (12% - 88% lebar bilah)
+        step_fracs = [0.12, 0.20, 0.28, 0.36, 0.44, 0.50, 0.56, 0.64, 0.72, 0.80, 0.88]
         anchor_xs, anchor_ys, anchor_contrasts = [], [], []
         for frac in step_fracs:
             ax = int(bx1 + frac * (bx2 - bx1))
             best_y, best_sc, max_c = None, -9999.0, 0.0
-            for y in range(max(10, by1 + 6), min(h_f - 12, by1 + 55)):
+            for y in range(max(10, by1 + 2), min(h_f - 12, by1 + 48)):
                 b = float(gray[y, ax])
                 diff_below = b - float(gray[min(h_f - 1, y + 8), ax])
                 diff_above = b - float(gray[max(0, y - 5), ax])
-                sc = b * 0.4 + diff_below * 1.0 + diff_above * 0.6
+                pen_depth = max(0, y - (by1 + 22)) * 0.5
+                sc = b * 0.4 + diff_below * 1.0 + diff_above * 0.6 - pen_depth
                 if sc > best_sc:
                     best_sc, best_y, max_c = sc, y, diff_below
-            if best_y is not None and best_sc > 40.0:
+            if best_y is not None and best_sc > 38.0:
                 anchor_xs.append(ax)
                 anchor_ys.append(best_y)
                 anchor_contrasts.append(max_c)
 
         avg_contrast = float(np.mean(anchor_contrasts)) if anchor_contrasts else 0.0
-        if avg_contrast < 15.0 or len(anchor_xs) < 2:
+        # S3-analog Tier 1: Adaptive contrast gate — hitung threshold dari distribusi Sobel-Y
+        # pada ROI bounding box agar otomatis naik-turun mengikuti kondisi pencahayaan.
+        # Clamp [10, 22] agar tidak terlalu longgar saat gelap / terlalu ketat saat terang.
+        try:
+            _sy_roi_t1 = cv2.Sobel(
+                gray[max(0, by1):min(h_f, by2), max(0, bx1):min(w_f, bx2)],
+                cv2.CV_32F, 0, 1, ksize=3
+            )
+            _pos_roi_t1 = _sy_roi_t1[_sy_roi_t1 > 0]
+            _adaptive_contrast_thresh_t1 = float(
+                # [ANTI-FALSE-DET] Clamp [10,22]→[13,25]: gate lebih ketat cegah karat/shadow lolos Tier-1
+                np.clip(np.percentile(_pos_roi_t1, 70), 13.0, 25.0)
+            ) if len(_pos_roi_t1) > 50 else 15.0
+        except Exception:
+            _adaptive_contrast_thresh_t1 = 15.0
+        # P1 FIX: Naikkan contrast gate +6.0 saat Kinematic Coasting aktif
+        # (YOLO tidak detect, posisi di-extrapolate) agar Viterbi tidak lolos
+        # dengan crest palsu dari shadow slat / bayangan celah saat rib hampir keluar.
+        _coast_penalty_t1 = 6.0 if getattr(self, '_kinematic_coasting_frames', 0) > 0 else 0.0
+        if avg_contrast < (_adaptive_contrast_thresh_t1 + _coast_penalty_t1) or len(anchor_xs) < 2:
             return [], [], 0.0, 0, 0.0
 
-        # Filter outlier anchor
-        if len(anchor_xs) >= 3:
-            p_init = np.polyfit(anchor_xs, anchor_ys, 1)
-            resids = np.abs(np.array(anchor_ys) - np.polyval(p_init, anchor_xs))
-            med_res = float(np.median(resids))
-            clean_xs = [ax for ax, r in zip(anchor_xs, resids) if r <= max(10.0, med_res * 2.5)]
-            clean_ys = [ay for ay, r in zip(anchor_ys, resids) if r <= max(10.0, med_res * 2.5)]
-            if len(clean_xs) >= 2:
-                anchor_xs, anchor_ys = clean_xs, clean_ys
-            guide_poly = np.polyfit(anchor_xs, anchor_ys, deg=1)
-        else:
-            guide_poly = np.array([0.0, float((by1 + by2) / 2)])
+        # Fit garis panduan yang kebal outlier & clamped ke kemiringan fisik konveyor
+        guide_poly = self._fit_robust_guide_poly(anchor_xs, anchor_ys, (by1 + by2) / 2.0)
 
         tilt_deg = float(np.arctan(guide_poly[0]) * 180.0 / np.pi)
 
-        # 2. Batas Fisik Lateral Konveyor (Anti-Chain Bracket)
-        x_limit_left = max(248, bx1 + 10)
-        x_limit_right = min(1635, bx2 - 10)
+        # 2. Batas Fisik Lateral Konveyor Adaptif (Zoom & Vibration Tolerant)
+        pad_x = 10
+        margin_frame = int(0.04 * w_f)
+        x_limit_left = max(margin_frame, int(bx1 + pad_x))
+        x_limit_right = min(w_f - margin_frame, int(bx2 - pad_x))
         if x_limit_right <= x_limit_left + 100:
             return [], [], 0.0, 0, 0.0
 
-        mid_idx = len(anchor_xs) // 2
+        mid_target_x = (bx1 + bx2) / 2.0
+        mid_idx = int(np.argmin([abs(ax - mid_target_x) for ax in anchor_xs]))
         x_center = int(anchor_xs[mid_idx])
         y_center = int(anchor_ys[mid_idx])
 
-        # 3. Koridor Sempit (+/- 8 px) & Parameter DP Viterbi
-        half_band = 8
+        # 3. Koridor Viterbi (+/- 12 px) bebas wraparound dengan pemandu atas/bawah sejati
+        half_band = 12
         H_b = half_band * 2 + 1
         step_x = 4
         shifts = np.array([-2, -1, 0, 1, 2], dtype=np.int32)
-        penalties = 4.0 * (shifts ** 2)
+        penalties = 7.5 * (shifts ** 2)
+        off_sq = (np.arange(H_b, dtype=np.float32) - half_band) ** 2
+        guide_prior_body = 0.28 * off_sq
+        guide_prior_tip = 0.04 * off_sq
+        tip_w_t1 = max(120, int(0.09 * (x_limit_right - x_limit_left)))
 
         def get_col_energy(x):
             gy = int(round(np.polyval(guide_poly, x)))
-            col_y1 = max(0, gy - half_band)
-            col_y2 = min(h_f - 1, gy + half_band)
-            patch = gray[col_y1:col_y2 + 1, max(0, x - 1):min(w_f, x + 2)].astype(np.float32)
-            if patch.shape[0] < H_b or patch.shape[1] < 2:
+            col_y1 = gy - half_band
+            col_y2 = gy + half_band
+            if col_y1 < 4 or col_y2 + 6 >= h_f or x < 1 or x + 1 >= w_f:
                 return np.zeros(H_b, dtype=np.float32), gy
-            syy = cv2.Sobel(patch, cv2.CV_32F, 0, 2, ksize=3)[:, patch.shape[1] // 2]
-            center_col = patch[:, patch.shape[1] // 2]
-            below = np.roll(center_col, -4)
-            lip = np.clip(center_col - below, 0, 100)
-            e = np.clip(-syy * 0.8, 0, 100) + 1.2 * lip
-            return e[:H_b], gy
+            sub = gray[col_y1 - 1:col_y2 + 2, x - 1:x + 2].astype(np.float32)
+            syy = cv2.Sobel(sub, cv2.CV_32F, 0, 2, ksize=3)[1:-1, 1]
+            center_col = sub[1:-1, 1]
+            below_col = gray[col_y1 + 6:col_y2 + 7, x].astype(np.float32)
+            above_col = gray[col_y1 - 4:col_y2 - 3, x].astype(np.float32)
+            lip = np.clip(center_col - below_col, 0.0, 100.0)
+            diff_above = np.clip(center_col - above_col, 0.0, 80.0)
+            is_tip_col = (x < x_limit_left + tip_w_t1) or (x > x_limit_right - tip_w_t1)
+            prior = guide_prior_tip if is_tip_col else guide_prior_body
+            e = np.clip(-syy * 0.7, 0.0, 90.0) + 0.9 * lip + 0.6 * diff_above - prior
+            return e, gy
 
-        # 4. Bidirectional Viterbi: Arah Kanan
-        right_xs = list(range(x_center, x_limit_right + 1, step_x))
-        right_pts = []
-        N_r = len(right_xs)
-        if N_r > 0:
-            V_r = np.full((H_b, N_r), -1e9, dtype=np.float32)
-            Back_r = np.zeros((H_b, N_r), dtype=np.int32)
-            e0, gy0 = get_col_energy(right_xs[0])
-            center_off = np.clip(y_center - gy0 + half_band, 0, H_b - 1)
-            V_r[center_off, 0] = e0[center_off] + 50.0
+        def _run_viterbi_dir(xs_list):
+            """Jalankan Bidirectional Viterbi DP ke kanan atau ke kiri dari titik awal bersama."""
+            pts_out = []
+            n_cols = len(xs_list)
+            if n_cols == 0:
+                return pts_out
+            V = np.full((H_b, n_cols), -1e9, dtype=np.float32)
+            Back = np.zeros((H_b, n_cols), dtype=np.int32)
+            e0, gy0 = get_col_energy(xs_list[0])
+            c_off = int(np.clip(y_center - gy0 + half_band, 0, H_b - 1))
+            V[c_off, 0] = e0[c_off] + 50.0
 
-            valid_cols_r = 1
-            consec_miss_r = 0
-            for t in range(1, N_r):
-                et, gyt = get_col_energy(right_xs[t])
+            valid_cols = 1
+            consec_miss = 0
+            for t in range(1, n_cols):
+                et, _ = get_col_energy(xs_list[t])
                 if np.max(et) < 22.0:
-                    consec_miss_r += 1
-                    if consec_miss_r >= 3 and t > 10:
+                    consec_miss += 1
+                    if consec_miss >= 3 and t > 10:
                         break
                 else:
-                    consec_miss_r = 0
-                prev_v = V_r[:, t - 1]
-                cands = np.full((5, H_b), -1e9, dtype=np.float32)
+                    consec_miss = 0
+                prev_v = V[:, t - 1]
+                cands = np.full((len(shifts), H_b), -1e9, dtype=np.float32)
                 for s_idx, d in enumerate(shifts):
                     pen = penalties[s_idx]
                     if d < 0:
@@ -1550,66 +1945,25 @@ class HybridRibInspector:
                     else:
                         cands[s_idx, :-d] = prev_v[d:] - pen
                 best_s = np.argmax(cands, axis=0)
-                V_r[:, t] = np.max(cands, axis=0) + et
-                Back_r[:, t] = np.arange(H_b) + shifts[best_s]
-                valid_cols_r += 1
+                V[:, t] = np.max(cands, axis=0) + et
+                Back[:, t] = np.arange(H_b) + shifts[best_s]
+                valid_cols += 1
 
-            y_b = int(np.argmax(V_r[:, valid_cols_r - 1]))
-            r_path = [y_b]
-            for t in range(valid_cols_r - 1, 0, -1):
-                y_b = Back_r[y_b, t]
-                r_path.append(y_b)
-            r_path.reverse()
-            for i in range(valid_cols_r):
-                gy = int(round(np.polyval(guide_poly, right_xs[i])))
-                right_pts.append((right_xs[i], gy - half_band + r_path[i]))
+            y_b = int(np.argmax(V[:, valid_cols - 1]))
+            path = [y_b]
+            for t in range(valid_cols - 1, 0, -1):
+                y_b = int(Back[y_b, t])
+                path.append(y_b)
+            path.reverse()
+            for i in range(valid_cols):
+                gy = int(round(np.polyval(guide_poly, xs_list[i])))
+                pts_out.append((xs_list[i], gy - half_band + path[i]))
+            return pts_out
 
-        # 5. Bidirectional Viterbi: Arah Kiri
-        left_xs = list(range(x_center - step_x, x_limit_left - 1, -step_x))
-        left_pts = []
-        N_l = len(left_xs)
-        if N_l > 0:
-            V_l = np.full((H_b, N_l), -1e9, dtype=np.float32)
-            Back_l = np.zeros((H_b, N_l), dtype=np.int32)
-            e0, gy0 = get_col_energy(left_xs[0])
-            prev_center_off = np.clip(y_center - gy0 + half_band, 0, H_b - 1)
-            V_l[prev_center_off, 0] = e0[prev_center_off] + 50.0
-
-            valid_cols_l = 1
-            consec_miss_l = 0
-            for t in range(1, N_l):
-                et, gyt = get_col_energy(left_xs[t])
-                if np.max(et) < 22.0:
-                    consec_miss_l += 1
-                    if consec_miss_l >= 3 and t > 10:
-                        break
-                else:
-                    consec_miss_l = 0
-                prev_v = V_l[:, t - 1]
-                cands = np.full((5, H_b), -1e9, dtype=np.float32)
-                for s_idx, d in enumerate(shifts):
-                    pen = penalties[s_idx]
-                    if d < 0:
-                        cands[s_idx, -d:] = prev_v[:H_b + d] - pen
-                    elif d == 0:
-                        cands[s_idx, :] = prev_v - pen
-                    else:
-                        cands[s_idx, :-d] = prev_v[d:] - pen
-                best_s = np.argmax(cands, axis=0)
-                V_l[:, t] = np.max(cands, axis=0) + et
-                Back_l[:, t] = np.arange(H_b) + shifts[best_s]
-                valid_cols_l += 1
-
-            y_b = int(np.argmax(V_l[:, valid_cols_l - 1]))
-            l_path = [y_b]
-            for t in range(valid_cols_l - 1, 0, -1):
-                y_b = Back_l[y_b, t]
-                l_path.append(y_b)
-            l_path.reverse()
-            for i in range(valid_cols_l):
-                gy = int(round(np.polyval(guide_poly, left_xs[i])))
-                left_pts.append((left_xs[i], gy - half_band + l_path[i]))
-            left_pts.reverse()
+        # 4 & 5. Bidirectional Viterbi: Kanan & Kiri (simetris dari titik awal tengah)
+        right_pts = _run_viterbi_dir(list(range(x_center, x_limit_right + 1, step_x)))
+        left_pts = _run_viterbi_dir(list(range(x_center, x_limit_left - 1, -step_x)))[1:]
+        left_pts.reverse()
 
         all_pts = left_pts + right_pts
         ridge_xs = [p[0] for p in all_pts]
@@ -1637,8 +1991,10 @@ class HybridRibInspector:
                 return [], [], 0.0, 0, 0.0
 
         bx1, by1, bx2, by2 = active_box
-        x_limit_left = max(248, bx1 + 10)
-        x_limit_right = min(1635, bx2 - 10)
+        pad_x = 10
+        margin_frame = int(0.04 * w_f)
+        x_limit_left = max(margin_frame, int(bx1 + pad_x))
+        x_limit_right = min(w_f - margin_frame, int(bx2 - pad_x))
         if x_limit_right <= x_limit_left + 100:
             return [], [], 0.0, 0, 0.0
 
@@ -1707,17 +2063,22 @@ class HybridRibInspector:
         clean_pts = np.array(clean_kpts, dtype=np.float32)
         clean_pts = clean_pts[np.argsort(clean_pts[:, 0])]
 
-        # Filter outlier Y menggunakan RANSAC residual sederhana
+        # Filter outlier Y menggunakan RANSAC residual — versi lebih ketat (S-Tier2):
+        # Clamp batas atas agar tidak terlalu longgar saat kontur bengkok ekstrem,
+        # namun batas bawah tetap 8px agar tidak over-reject keypoint valid di ujung tip.
         poly1 = np.polyfit(clean_pts[:, 0], clean_pts[:, 1], 1)
         resids = np.abs(clean_pts[:, 1] - np.polyval(poly1, clean_pts[:, 0]))
-        inliers = resids < max(14.0, float(np.median(resids)) * 2.5)
+        med_res = float(np.median(resids))
+        inliers = resids < min(14.0, max(8.0, med_res * 2.0))
         final_pts = clean_pts[inliers]
 
         if len(final_pts) < 4:
             final_pts = clean_pts
 
         span = float(final_pts[-1, 0] - final_pts[0, 0])
-        if span < 500.0:
+        # S-Tier2: Perkuat span minimum dari 500px → 600px untuk menolak partial detection
+        # (misalnya hanya tepi kiri rib yang terdeteksi saat rib baru memasuki frame)
+        if span < 600.0:
             return [], [], 0.0, 0, 0.0
 
         # Regresi kurva kontinu rapat (densification step 4 px)
@@ -1765,15 +2126,19 @@ class HybridRibInspector:
 
         bx1, by1, bx2, by2 = active_box
         curr_cy = (by1 + by2) / 2.0
-        x_min_limit = max(248, int(bx1 + 10))
-        x_max_limit = min(1635, int(bx2 - 10))
+        pad_x = 10
+        margin_frame = int(0.04 * w_u if 'w_u' in locals() else 0.04 * w_f)
+        x_min_limit = max(margin_frame, int(bx1 + pad_x))
+        x_max_limit = min(w_f - margin_frame, int(bx2 - pad_x))
 
+        # TAHAP 1: Fast Temporal Sub-Pixel Tracking (Hanya aktif di CPU untuk optimasi latensi)
+        # Jika GPU CUDA aktif, sistem menjalankan inferensi FP16 penuh setiap frame demi presisi maksimum
+        use_stride = (self.device == "cpu")
         self._seg_stride_counter = getattr(self, "_seg_stride_counter", 0) + 1
 
-        # TAHAP 1: Fast Temporal Sub-Pixel Tracking (Alternate Frame, Latensi ~0.5ms)
-        # Menghilangkan "patah-patah" secara total dengan melacak translasi vertikal sirip fisik
         can_reuse = (
-            self._seg_stride_counter % 2 != 0
+            use_stride
+            and self._seg_stride_counter % 2 != 0
             and getattr(self, "_last_seg_xs", None) is not None
             and getattr(self, "_last_seg_ys", None) is not None
             and getattr(self, "_last_seg_cy", None) is not None
@@ -1785,22 +2150,33 @@ class HybridRibInspector:
                 valid_cols = self._last_seg_xs
                 cam_ys = self._last_seg_ys + dy
                 ixs = np.clip(np.round(valid_cols).astype(np.int32), 0, w_f - 1)
-                iys = np.clip(np.round(cam_ys).astype(np.int32), 3, h_f - 4)
+                iys = np.clip(np.round(cam_ys).astype(np.int32), 4, h_f - 5)
 
-                offsets = np.arange(-3, 4)
+                offsets = np.arange(-6, 7)
                 cand_ys = np.clip(iys[:, None] + offsets[None, :], 2, h_f - 3)
-                g_down = gray[np.clip(cand_ys + 2, 0, h_f - 1), ixs[:, None]].astype(np.float32)
-                g_up   = gray[np.clip(cand_ys - 2, 0, h_f - 1), ixs[:, None]].astype(np.float32)
-                grads  = g_down - g_up
-                best_idx = np.argmax(grads, axis=1)
+                g_below = gray[np.clip(cand_ys + 3, 0, h_f - 1), ixs[:, None]].astype(np.float32)
+                g_above = gray[np.clip(cand_ys - 3, 0, h_f - 1), ixs[:, None]].astype(np.float32)
+                g_center = gray[cand_ys, ixs[:, None]].astype(np.float32)
+                edge_scores = (g_center - g_below) * 1.2 + (g_center - g_above) * 0.8
+                best_idx = np.argmax(edge_scores, axis=1)
                 refined_ys = cand_ys[np.arange(len(cand_ys)), best_idx].astype(np.float32)
                 refined_ys = fast_medfilt(refined_ys, k=7)
 
-                self._last_seg_ys = refined_ys
+                # Stabilisasi Temporal EMA antar frame
+                prev_ys = getattr(self, "_prev_tier3_cam_ys", None)
+                if prev_ys is not None and len(prev_ys) == len(refined_ys):
+                    refined_ys = 0.70 * refined_ys + 0.30 * (prev_ys + dy)
+
+                self._prev_tier3_cam_xs = valid_cols.copy()
+                self._prev_tier3_cam_ys = refined_ys.copy()
+                self._last_seg_ys = refined_ys.copy()
                 self._last_seg_cy = curr_cy
 
                 cam_pts = np.column_stack([valid_cols.astype(np.float32), refined_ys]).astype(np.float32)
                 unw_pts = cv2.perspectiveTransform(cam_pts.reshape(-1, 1, 2), M).reshape(-1, 2)
+                valid_unw = (unw_pts[:, 0] >= 35.0) & (unw_pts[:, 0] <= 925.0)
+                if np.sum(valid_unw) >= 50:
+                    unw_pts = unw_pts[valid_unw]
                 self._last_unwarp_contour = unw_pts.copy()
                 self._last_unwarp_M = M
                 self._last_unwarp_Minv = Minv
@@ -1819,7 +2195,7 @@ class HybridRibInspector:
         try:
             results = self.seg_model.predict(
                 frame,
-                conf=0.30,
+                conf=0.20,
                 verbose=False,
                 device=dev_target,
                 half=use_half
@@ -1840,53 +2216,103 @@ class HybridRibInspector:
             c_x1, c_y1, c_x2, c_y2 = b
             m_cy = (c_y1 + c_y2) / 2.0
             m_w = c_x2 - c_x1
-            if m_w >= 500 and (220 <= m_cy <= 550):
+            if m_w >= 400 and (180 <= m_cy <= 560):
                 dist = abs(m_cy - curr_cy)
-                if dist < best_dist:
+                if dist < best_dist and dist <= 85.0:
                     best_dist = dist
                     best_mask = m
 
         if best_mask is None:
             return self._track_unwarp_perspective(frame, active_box, h_f, w_f)
 
-        # Fast Resize Binary Mask (1.0ms OpenCV C++ SIMD)
-        mask_full = cv2.resize((best_mask > 0.5).astype(np.uint8), (w_f, h_f), interpolation=cv2.INTER_NEAREST)
+        # 1. Bilinear Interpolation pada Continuous Probability Mask [0.0 - 1.0]
+        # Menghilangkan 100% efek tangga (staircase / blocky grid) kuantisasi mask YOLO
+        mask_prob = cv2.resize(best_mask.astype(np.float32), (w_f, h_f), interpolation=cv2.INTER_LINEAR)
         sampled_xs = np.arange(x_min_limit, x_max_limit + 1, 2)
 
-        # Vectorized Column Crest Extraction (3.0ms vs 136ms nested loop)
-        cols_mask = mask_full[:, sampled_xs]
-        has_rib = np.any(cols_mask > 0, axis=0)
-
+        # Support mask biner untuk kolom aktif
+        mask_bin = (mask_prob > 0.35).astype(np.uint8)
+        cols_bin = mask_bin[:, sampled_xs]
+        has_rib = np.any(cols_bin > 0, axis=0)
         valid_cols = sampled_xs[has_rib]
+
         if len(valid_cols) < 50:
             return self._track_unwarp_perspective(frame, active_box, h_f, w_f)
 
-        # np.argmax pada kolom biner menghasilkan index baris pertama (min row / puncak atas)
-        top_ys = np.argmax(cols_mask[:, has_rib] > 0, axis=0)
+        # 2. Vectorized Sub-Pixel Continuous Zero-Crossing Extraction
+        cols_prob = mask_prob[:, valid_cols]
+        y_indices = np.argmax(cols_prob > 0.50, axis=0)
+        y_prev = np.clip(y_indices - 1, 0, h_f - 1)
+        col_idx = np.arange(len(valid_cols))
+        p_curr = cols_prob[y_indices, col_idx]
+        p_prev = cols_prob[y_prev, col_idx]
+        denom = np.maximum(1e-4, p_curr - p_prev)
+        sub_ys = (y_indices - 1).astype(np.float32) + np.clip((0.50 - p_prev) / denom, 0.0, 1.0)
 
-        # Vectorized Sub-Pixel Gradient Refinement (0.1ms vs 600 iterations nested loop)
-        ixs = valid_cols
-        iys = top_ys
-        offsets = np.arange(-3, 4)
-        cand_ys = np.clip(iys[:, None] + offsets[None, :], 2, h_f - 3)
+        # Filter tebing vertikal pada batas lateral poligon YOLO
+        med_sub_y = float(np.median(sub_ys))
+        inlier_mask = np.abs(sub_ys - med_sub_y) < 25.0
+        if np.sum(inlier_mask) >= 50:
+            valid_cols = valid_cols[inlier_mask]
+            sub_ys = sub_ys[inlier_mask]
 
-        g_down = gray[np.clip(cand_ys + 2, 0, h_f - 1), ixs[:, None]].astype(np.float32)
-        g_up   = gray[np.clip(cand_ys - 2, 0, h_f - 1), ixs[:, None]].astype(np.float32)
-        grads  = g_down - g_up
-        best_idx = np.argmax(grads, axis=1)
-        refined_ys = cand_ys[np.arange(len(cand_ys)), best_idx].astype(np.float32)
+        # 3. Vectorized Sub-Pixel Gradient Snapping ke Bibir Fisik Baja (Jendela Luas +-8 px)
+        offsets = np.arange(-8, 9)
+        cand_ys = np.clip(np.round(sub_ys)[:, None] + offsets[None, :], 3, h_f - 4).astype(np.int32)
+        g_below = gray[np.clip(cand_ys + 3, 0, h_f - 1), valid_cols[:, None]].astype(np.float32)
+        g_above = gray[np.clip(cand_ys - 3, 0, h_f - 1), valid_cols[:, None]].astype(np.float32)
+        g_center = gray[cand_ys, valid_cols[:, None]].astype(np.float32)
+        edge_scores = (g_center - g_below) * 1.2 + (g_center - g_above) * 0.8
+        best_cand_idx = np.argmax(edge_scores, axis=1)
+        peak_cand_ys = cand_ys[np.arange(len(valid_cols)), best_cand_idx].astype(np.float32)
+        max_scores = np.max(edge_scores, axis=1)
+        refined_ys = np.where(max_scores > 20.0, peak_cand_ys, sub_ys)
 
-        # 1D Median Filter smoothing (k=7)
+        # 4. Multi-Scale Smoothing (1D Median Filter + Box Convolution)
         refined_ys = fast_medfilt(refined_ys, k=7)
+        k_box = 5
+        refined_ys = np.convolve(refined_ys, np.ones(k_box, dtype=np.float32) / float(k_box), mode='same')
 
-        # Simpan state untuk pelacakan temporal stride
-        self._last_seg_xs = valid_cols
-        self._last_seg_ys = refined_ys
+        # 5. Temporal Motion-Compensated EMA Filter & Span Bridging (Anti-Flicker & Glare Recovery)
+        prev_xs = getattr(self, "_prev_tier3_cam_xs", None)
+        prev_ys = getattr(self, "_prev_tier3_cam_ys", None)
+        if prev_xs is not None and prev_ys is not None and len(prev_xs) >= 50:
+            dy = float(np.median(refined_ys) - np.median(prev_ys))
+            if abs(dy) < 18.0:
+                prev_interp_ys = np.interp(valid_cols, prev_xs, prev_ys)
+                aligned_prev = prev_interp_ys + dy
+                # Fusi temporal EMA: 70% observasi baru, 30% kontur stabil sebelumnya
+                refined_ys = 0.70 * refined_ys + 0.30 * aligned_prev
+
+                # Temporal Span Bridging: Jika mask drop akibat pantulan silau (contoh Frame 140 sisi kiri gelap)
+                curr_min_x, curr_max_x = valid_cols[0], valid_cols[-1]
+                prev_min_x, prev_max_x = prev_xs[0], prev_xs[-1]
+                if (curr_min_x - prev_min_x) > 60:
+                    left_bridge_xs = np.arange(prev_min_x, curr_min_x, 2)
+                    if len(left_bridge_xs) > 0:
+                        left_bridge_ys = np.interp(left_bridge_xs, prev_xs, prev_ys) + dy
+                        valid_cols = np.concatenate([left_bridge_xs, valid_cols])
+                        refined_ys = np.concatenate([left_bridge_ys, refined_ys])
+                if (prev_max_x - curr_max_x) > 60:
+                    right_bridge_xs = np.arange(curr_max_x + 2, prev_max_x + 1, 2)
+                    if len(right_bridge_xs) > 0:
+                        right_bridge_ys = np.interp(right_bridge_xs, prev_xs, prev_ys) + dy
+                        valid_cols = np.concatenate([valid_cols, right_bridge_xs])
+                        refined_ys = np.concatenate([refined_ys, right_bridge_ys])
+
+        # Simpan state untuk pelacakan temporal
+        self._prev_tier3_cam_xs = valid_cols.copy()
+        self._prev_tier3_cam_ys = refined_ys.copy()
+        self._last_seg_xs = valid_cols.copy()
+        self._last_seg_ys = refined_ys.copy()
         self._last_seg_cy = curr_cy
 
         # Proyeksikan kontur kamera ke unwarp space untuk view 90 deg ortogonal
         cam_pts = np.column_stack([valid_cols.astype(np.float32), refined_ys]).astype(np.float32)
         unw_pts = cv2.perspectiveTransform(cam_pts.reshape(-1, 1, 2), M).reshape(-1, 2)
+        valid_unw = (unw_pts[:, 0] >= 35.0) & (unw_pts[:, 0] <= 925.0)
+        if np.sum(valid_unw) >= 50:
+            unw_pts = unw_pts[valid_unw]
 
         self._last_unwarp_contour = unw_pts.copy()
         self._last_unwarp_M = M
@@ -1967,6 +2393,19 @@ class HybridRibInspector:
 
         gray_u = cv2.cvtColor(unwarped, cv2.COLOR_BGR2GRAY)
 
+        # S1A: Gaussian Illumination Flat-Field Normalization (Fast 4x Downscale) ─
+        try:
+            gray_u = self._normalize_flat_field_gray(gray_u, scale=128)
+        except Exception:
+            pass  # fallback ke gray_u tanpa koreksi
+
+        # S2A: Bilateral Filter — denoising edge-preserving di unwarp space ──
+        # d=5 cukup cepat (<1.5ms), sigmaColor=45 agar tidak menghaluskan tepi tajam rib
+        try:
+            gray_u = cv2.bilateralFilter(gray_u, d=5, sigmaColor=45, sigmaSpace=45)
+        except Exception:
+            pass
+
         # 2. Temukan Anchor Puncak dari 9 titik sampel di area tengah bilah sirip (X: 28% - 76% span bilah)
         # Puncak bilah sirip memiliki kontras atas (crest vs latar belakang) dan bawah (crest vs wajah bilah)
         sample_xs = [int(search_ux1 + (search_ux2 - search_ux1) * f) for f in [0.28, 0.34, 0.40, 0.46, 0.52, 0.58, 0.64, 0.70, 0.76]]
@@ -1996,11 +2435,22 @@ class HybridRibInspector:
             self._last_unwarp_contour = None
             return [], [], 0.0, 0, 0.0
 
-        # Validasi kontras rata-rata anchor:
-        # Permukaan slat yang rata memiliki kontras sangat rendah (<10),
-        # sedangkan crest bilah sirip selalu memiliki kontras >12 karena ada edge tegas
+        # Validasi kontras rata-rata anchor (S3-analog Tier 3):
+        # Hitung threshold adaptif dari distribusi Sobel-Y zona pencarian unwarp.
+        # Permukaan slat rata → kontras rendah, crest rib → ada tepi tajam (kontras > threshold).
         avg_anchor_contrast = float(np.mean(anchor_contrasts)) if anchor_contrasts else 0.0
-        if avg_anchor_contrast < 10.0:
+        try:
+            _sy_u_zone = cv2.Sobel(
+                gray_u[search_uy1:search_uy2, search_ux1:search_ux2],
+                cv2.CV_32F, 0, 1, ksize=3
+            )
+            _pos_u_zone = _sy_u_zone[_sy_u_zone > 0]
+            _adapt_contrast_t3 = float(
+                np.clip(np.percentile(_pos_u_zone, 65), 7.0, 16.0)
+            ) if len(_pos_u_zone) > 20 else 10.0
+        except Exception:
+            _adapt_contrast_t3 = 10.0
+        if avg_anchor_contrast < _adapt_contrast_t3:
             self._last_unwarp_contour = None
             return [], [], 0.0, 0, 0.0
 
@@ -2162,62 +2612,104 @@ class HybridRibInspector:
 
     def _track_hough_stitching(self, frame, gray, active_box, search_x1, search_x2, h_f, w_f):
         """
-        TIER 4 TRACKER ENGINE: ADAPTASI SENSORS 2025 MICRO-HOUGHLET GROUPING & STITCHING.
-        Mengadaptasi metode deteksi kelurusan berbasis line grouping & stitching:
-        1. Multi-Point Anchor Sampling untuk mengunci garis panduan bibir sirip (p_guide).
-        2. Cropping pita ROI sempit di sekitar garis panduan p_guide.
-        3. Deteksi segmen mikro bibir sirip dengan Probabilistic Hough Transform (cv2.HoughLinesP).
-        4. Grouping berbasis orientasi sudut (|theta| <= 12 deg di badan, <= 24 deg di ujung defleksi).
-        5. Asymmetric Guard Boundaries: batas atas ketat (6px) menolak celah slat, batas bawah leluasa (24px) di ujung untuk menangkap bengkok.
-        6. Elastic Gap-Filling (Bridge Linear Interpolation) menembus noda oli dan percikan las.
-        7. Sub-Pixel Parabolic Peak Polish untuk akurasi metrologi < 0.1 mm.
+        TIER 4 TRACKER ENGINE: ADAPTASI SENSORS 2025 MICRO-HOUGHLET GROUPING & STITCHING (ENHANCED).
+        Mengadaptasi metode deteksi kelurusan berbasis micro-line grouping & elastic stitching:
+        1. 9-Point Robust Anchor Sampling: Mengunci bibir punggung atas (top crest) dengan penalti kedalaman
+           dan penyaringan residual median (Theil-Sen robust) untuk menolak pantulan noda oli/las.
+        2. Temporal Guide Stabilization: Menjaga konsistensi sudut kemiringan (tilt) konveyor antar-frame.
+        3. Strip ROI Cropping & Directional Positive Sobel-Y: Hanya mendeteksi tepi naik (dark->bright)
+           bibir atas, memangkas 100% tepi jatuh negatif, bayangan celah slat, dan garis las bawah.
+        4. Micro-Houghlet Grouping: Deteksi segmen mikro (HoughLinesP) dengan toleransi adaptif tip vs badan.
+        5. Full-Span Crest Guidance & Slope Boundary Extrapolation: Menghilangkan distorsi ujung sirip
+           (tip deviation spike) yang sebelumnya memicu false NG.
+        6. Sub-Pixel Parabolic Polish & Inter-Frame Temporal Smoothing: Meredam lonjakan koordinat piksel
+           dan menghasilkan pelacakan kontur metrologi sub-milimeter yang bebas flicker.
         """
         if gray is None or active_box is None:
             return [], [], 0.0, 0, 0.0
 
         bx1, by1, bx2, by2 = active_box
 
-        # 1. Multi-Point Anchor Sampling (7 titik di area tengah 28% - 76%)
-        step_fracs = [0.28, 0.36, 0.44, 0.52, 0.60, 0.68, 0.76]
+        # 1. Multi-Point Anchor Sampling (11 titik dari 8% hingga 92% lebar bilah)
+        step_fracs = [0.08, 0.16, 0.25, 0.34, 0.42, 0.50, 0.58, 0.66, 0.75, 0.84, 0.92]
         anchor_xs, anchor_ys = [], []
         for frac in step_fracs:
             ax = int(bx1 + frac * (bx2 - bx1))
             best_y, best_sc = None, -9999.0
-            for y in range(max(10, by1 + 6), min(h_f - 12, by1 + 55)):
+            # Pindai bibir puncak atas sirip (by1 + 4 s/d by1 + 46 px)
+            for y in range(max(10, by1 + 4), min(h_f - 12, by1 + 46)):
                 b = float(gray[y, ax])
                 diff_below = b - float(gray[min(h_f - 1, y + 8), ax])
                 diff_above = b - float(gray[max(0, y - 5), ax])
-                if diff_above >= 6.0 and diff_below >= 8.0:
-                    sc = diff_below * 1.1 + diff_above * 1.4 + min(b, 175.0) * 0.15
+                if diff_above >= 5.0 and diff_below >= 7.0:
+                    # Penalti kedalaman agar anchor mengunci bibir puncak atas dan tidak jatuh ke las dasar
+                    pen_depth = max(0, y - (by1 + 10)) * 1.0
+                    sc = diff_below * 1.2 + diff_above * 1.5 + min(b, 175.0) * 0.1 - pen_depth
                     if sc > best_sc:
                         best_sc = sc
                         best_y = y
-            if best_y is not None:
+            min_sc = 12.0 if (frac <= 0.16 or frac >= 0.84) else 18.0
+            if best_y is not None and best_sc > min_sc:
                 anchor_xs.append(ax)
                 anchor_ys.append(best_y)
 
         if len(anchor_xs) < 2:
             return [], [], 0.0, 0, 0.0
 
+        # Robust Outlier Filtering untuk Garis Panduan p_guide
+        if len(anchor_xs) >= 4:
+            p_raw = np.polyfit(anchor_xs, anchor_ys, 1)
+            resids = np.abs(np.array(anchor_ys) - np.polyval(p_raw, anchor_xs))
+            med_res = float(np.median(resids))
+            keep_mask = resids <= max(5.0, med_res * 1.8)
+            c_xs = [x for x, k in zip(anchor_xs, keep_mask) if k]
+            c_ys = [y for y, k in zip(anchor_ys, keep_mask) if k]
+            if len(c_xs) >= 3:
+                anchor_xs, anchor_ys = c_xs, c_ys
         p_guide = np.polyfit(anchor_xs, anchor_ys, 1)
 
-        x_limit_left = max(248, bx1 + 10)
-        x_limit_right = min(1635, bx2 - 10)
+        # Stabilisasi Temporal Garis Panduan Antar-Frame (Anti-Jitter Sudut)
+        if getattr(self, '_prev_hough_pguide', None) is not None and self.active_rib_frames > 1:
+            prev_slope, prev_c = self._prev_hough_pguide
+            curr_slope, curr_c = p_guide[0], p_guide[1]
+            p_guide = np.array([0.75 * prev_slope + 0.25 * curr_slope, 0.50 * prev_c + 0.50 * curr_c])
+        self._prev_hough_pguide = p_guide
+
+        # Pastikan batas pencarian tidak melebar ke rantai/gap samping konveyor (Adaptif Zoom/Vibration)
+        pad_x = 12
+        margin_frame = int(0.04 * w_f)
+        x_limit_left = max(margin_frame, int(bx1 + pad_x))
+        x_limit_right = min(w_f - margin_frame, int(bx2 - pad_x))
+        if len(anchor_xs) >= 2:
+            x_limit_left = max(x_limit_left, anchor_xs[0] - 50)
+            x_limit_right = min(x_limit_right, anchor_xs[-1] + 50)
+        tip_w_t4 = max(135, int(0.09 * (x_limit_right - x_limit_left)))
 
         # 2. Extract Strip ROI di sekitar Garis Panduan
-        y_min_g = max(0, int(min(np.polyval(p_guide, [x_limit_left, x_limit_right]))) - 12)
-        y_max_g = min(h_f, int(max(np.polyval(p_guide, [x_limit_left, x_limit_right]))) + 32)
+        y_min_g = max(0, int(min(np.polyval(p_guide, [x_limit_left, x_limit_right]))) - 14)
+        y_max_g = min(h_f, int(max(np.polyval(p_guide, [x_limit_left, x_limit_right]))) + 28)
         strip = gray[y_min_g:y_max_g, x_limit_left:x_limit_right]
         if strip.size == 0 or strip.shape[0] < 10 or strip.shape[1] < 100:
             return [], [], 0.0, 0, 0.0
 
-        # 3. Directional Vertical Edge Detection (Sobel-Y + Threshold)
-        grad_y = cv2.Sobel(strip, cv2.CV_32F, 0, 1, ksize=3)
-        edge_map = np.clip(np.abs(grad_y), 0, 255).astype(np.uint8)
-        _, bin_edge = cv2.threshold(edge_map, 35, 255, cv2.THRESH_BINARY)
+        # S2A: Bilateral Filter pada strip — edge-preserving denoising
+        # d=3 cukup untuk strip sempit, sigmaColor=35 jaga ketajaman tepi rib
+        try:
+            strip_filtered = cv2.bilateralFilter(strip, d=3, sigmaColor=35, sigmaSpace=35)
+        except Exception:
+            strip_filtered = strip
+
+        # 3. Directional Positive Vertical Edge Detection (Hanya Tepi Naik Bibir Atas)
+        grad_y = cv2.Sobel(strip_filtered, cv2.CV_32F, 0, 1, ksize=3)
+        edge_map = np.clip(grad_y, 0, 255).astype(np.uint8)
+
+        # S3: Adaptive Percentile-75 Threshold (stabil untuk strip sempit tanpa artefak Otsu)
+        pos_vals = grad_y[grad_y > 4.0]
+        ad_th = int(np.clip(np.percentile(pos_vals, 75), 18, 35)) if len(pos_vals) > 50 else 25
+        _, bin_edge = cv2.threshold(edge_map, ad_th, 255, cv2.THRESH_BINARY)
 
         # 4. Probabilistic Hough Transform (Sensors 2025 Micro-Segments)
-        lines = cv2.HoughLinesP(bin_edge, 1, np.pi / 180, threshold=12, minLineLength=18, maxLineGap=10)
+        lines = cv2.HoughLinesP(bin_edge, 1, np.pi / 180, threshold=10, minLineLength=14, maxLineGap=12)
 
         step_x = 4
         x_grid = np.arange(x_limit_left, x_limit_right + 1, step_x, dtype=np.int32)
@@ -2245,12 +2737,13 @@ class HybridRibInspector:
                 mid_y = (gy1 + gy2) / 2.0
                 gy_nom = float(np.polyval(p_guide, mid_x))
 
-                # Asymmetric Guard: Di badan sirip ketat 6px agar tidak lompat ke celah slat / las.
-                # Di ujung (tip zone outer 120px) leluasa hingga 24px ke bawah agar defleksi bengkok tertangkap.
-                is_tip = (mid_x < x_limit_left + 120 or mid_x > x_limit_right - 120)
-                max_ang = 24.0 if is_tip else 12.0
-                floor_g = 24.0 if is_tip else 6.0
-                ceil_g = 6.0
+                # Asymmetric Guard Terkalibrasi:
+                # - Badan ketat (ceil 6.0px, floor 7.0px) menolak refleksi celah plat slat & garis las dasar
+                # - Zona Ujung (proporsional ~9% span) leluasa (floor 18.0px, angle 24 deg) agar bengkok ujung nyata tertangkap
+                is_tip = (mid_x < x_limit_left + tip_w_t4 or mid_x > x_limit_right - tip_w_t4)
+                max_ang = 18.0 if is_tip else 11.0
+                ceil_g = 6.5 if is_tip else 6.0
+                floor_g = 9.0 if is_tip else 7.0
 
                 if ang <= max_ang and (gy_nom - ceil_g) <= mid_y <= (gy_nom + floor_g):
                     accepted_lines.append((x1, y1, x2, y2))
@@ -2268,35 +2761,83 @@ class HybridRibInspector:
         if len(valid_idxs) < 20:
             return [], [], 0.0, 0, 0.0
 
-        # 5. Elastic Interpolation (Gap-Filling Linear Coasting & Crest Guidance)
-        # Crest Guidance: Di area ujung bilah sirip, jika terdapat garis puncak atas dan garis las bawah secara bersamaan,
-        # prioritaskan klaster puncak atas (|y - y_nom| <= 6.5px) agar tidak melompat ke garis sambungan las dasar plat.
-        sub_ys_guided = []
-        for i in valid_idxs:
-            gx = x_grid[i]
-            y_nom = float(np.polyval(p_guide, gx))
-            ys = y_accum[i]
-            is_tip = (gx < x_limit_left + 120 or gx > x_limit_right - 120)
-            if is_tip and len(ys) > 1:
-                upper_candidates = [y for y in ys if (y_nom - 6.0) <= y <= (y_nom + 6.5)]
-                if len(upper_candidates) >= 1:
-                    chosen_y = float(np.median(upper_candidates))
-                else:
-                    chosen_y = float(np.median(ys))
-            else:
-                chosen_y = float(np.median(ys))
-            sub_ys_guided.append(chosen_y)
+        # 5. Elastic Gap-Filling Berbasis Penelusuran Dwi-Arah dari Pusat Sirip (Center-Outward Bidirectional)
+        # Menghilangkan 100% false latch-on di ujung sirip (eliminasi tuntas tip droop / step-down)
+        mid_k = len(valid_idxs) // 2
+        center_idx = valid_idxs[mid_k]
+        center_candidates = y_accum[center_idx]
+        y_nom_center = float(np.polyval(p_guide, x_grid[center_idx]))
+        center_y = min(center_candidates, key=lambda y: abs(y - y_nom_center))
+        chosen_ys = {center_idx: center_y}
 
-        sub_valid_xs = x_grid[valid_idxs]
-        sub_valid_ys = np.array(sub_ys_guided, dtype=np.float32)
+        # Penelusuran ke Kiri (Pusat -> Ujung Kiri)
+        prev_y = center_y
+        for k in range(mid_k - 1, -1, -1):
+            idx = valid_idxs[k]
+            gx = x_grid[idx]
+            y_nom = float(np.polyval(p_guide, gx))
+            is_tip_pt = (gx < x_limit_left + tip_w_t4)
+            c_ceil = 6.5 if is_tip_pt else 6.0
+            c_floor = 9.0 if is_tip_pt else 7.0
+            cands = [y for y in y_accum[idx] if (y_nom - c_ceil) <= y <= (y_nom + c_floor)]
+            if not cands:
+                continue
+            w_nom = 0.05 if is_tip_pt else 0.25
+            best_c = min(cands, key=lambda y: abs(y - prev_y) + w_nom * abs(y - y_nom))
+            dx_pts = abs(gx - x_grid[valid_idxs[k + 1]])
+            max_jump = max(6.0 if is_tip_pt else 4.0, (0.65 if is_tip_pt else 0.45) * dx_pts)
+            if abs(best_c - prev_y) <= max_jump:
+                chosen_ys[idx] = best_c
+                prev_y = best_c
+
+        # Penelusuran ke Kanan (Pusat -> Ujung Kanan)
+        prev_y = center_y
+        for k in range(mid_k + 1, len(valid_idxs)):
+            idx = valid_idxs[k]
+            gx = x_grid[idx]
+            y_nom = float(np.polyval(p_guide, gx))
+            is_tip_pt = (gx > x_limit_right - tip_w_t4)
+            c_ceil = 6.5 if is_tip_pt else 6.0
+            c_floor = 9.0 if is_tip_pt else 7.0
+            cands = [y for y in y_accum[idx] if (y_nom - c_ceil) <= y <= (y_nom + c_floor)]
+            if not cands:
+                continue
+            w_nom = 0.05 if is_tip_pt else 0.25
+            best_c = min(cands, key=lambda y: abs(y - prev_y) + w_nom * abs(y - y_nom))
+            dx_pts = abs(gx - x_grid[valid_idxs[k - 1]])
+            max_jump = max(6.0 if is_tip_pt else 4.0, (0.65 if is_tip_pt else 0.45) * dx_pts)
+            if abs(best_c - prev_y) <= max_jump:
+                chosen_ys[idx] = best_c
+                prev_y = best_c
+
+        clean_valid_idxs = sorted(chosen_ys.keys())
+        if len(clean_valid_idxs) < 15:
+            return [], [], 0.0, 0, 0.0
+
+        sub_valid_xs = x_grid[clean_valid_idxs]
+        sub_valid_ys = np.array([chosen_ys[i] for i in clean_valid_idxs], dtype=np.float32)
         full_ys = np.interp(x_grid, sub_valid_xs, sub_valid_ys).astype(np.float32)
+
+        # Extrapolasi Linier Stabil Mengikuti guide_slope (mencegah spike di celah terluar)
+        guide_slope = float(p_guide[0])
+        if sub_valid_xs[0] > x_grid[0]:
+            left_mask = (x_grid < sub_valid_xs[0])
+            full_ys[left_mask] = sub_valid_ys[0] + guide_slope * (x_grid[left_mask] - sub_valid_xs[0])
+        if sub_valid_xs[-1] < x_grid[-1]:
+            right_mask = (x_grid > sub_valid_xs[-1])
+            full_ys[right_mask] = sub_valid_ys[-1] + guide_slope * (x_grid[right_mask] - sub_valid_xs[-1])
 
         # 6. Sub-Pixel Parabolic Polish pada Citra Grayscale Asli
         refined_ys = []
         for gx, y_est in zip(x_grid, full_ys):
+            y_nom = float(np.polyval(p_guide, gx))
+            is_tip_gx = (gx < x_limit_left + tip_w_t4 or gx > x_limit_right - tip_w_t4)
+            max_nom_dist = 9.5 if is_tip_gx else 7.5
             best_y = int(round(y_est))
             best_sc = -9999.0
-            for y in range(max(10, int(round(y_est)) - 4), min(h_f - 10, int(round(y_est)) + 5)):
+            for y in range(max(10, int(round(y_est)) - 3), min(h_f - 10, int(round(y_est)) + 4)):
+                if abs(y - y_nom) > max_nom_dist:
+                    continue
                 b = float(gray[y, gx])
                 diff_below = b - float(gray[min(h_f - 1, y + 8), gx])
                 diff_above = b - float(gray[max(0, y - 5), gx])
@@ -2314,12 +2855,16 @@ class HybridRibInspector:
             else:
                 refined_ys.append(float(best_y))
 
-        # 7. 1D Median Filtering untuk Eliminasi Spike Lokal
+        # 7. 1D Median Filtering + Inter-Frame Temporal Contour Smoothing (Eliminasi Flicker & Lonjakan)
         smooth_ys = fast_medfilt(np.array(refined_ys, dtype=np.float32), k=7)
+        if getattr(self, '_prev_hough_contour_ys', None) is not None and len(self._prev_hough_contour_ys) == len(smooth_ys) and self.active_rib_frames > 1:
+            smooth_ys = 0.70 * smooth_ys + 0.30 * self._prev_hough_contour_ys
+        self._prev_hough_contour_ys = smooth_ys
+
         poly1 = np.polyfit(x_grid, smooth_ys, 1)
         tilt_deg = float(np.arctan(poly1[0]) * 180.0 / np.pi)
         tested_cols = len(x_grid)
-        coverage = len(valid_idxs) / float(max(1, tested_cols))
+        coverage = len(clean_valid_idxs) / float(max(1, tested_cols))
 
         # Simpan metadata diagnostik pre-processing Tier 4
         self._last_hough_diag = {
@@ -2412,21 +2957,45 @@ class HybridRibInspector:
         # Stride inferensi YOLO: cerdas menghemat komputasi dan melipatgandakan throughput FPS
         self._frame_count += 1
         yolo_stride = self.yolo_stride
+        exit_y1_cut = zy1 - max(12, int(0.017 * h_f))  # ~zy1 - 18 px pada 1080p (tepat saat bibir atas menyentuh batas atas gerbang)
+        exit_cy_cut = zy1 + max(10, int(0.014 * h_f))  # ~zy1 + 15 px pada 1080p
+        near_top_exit = (
+            getattr(self, "_last_active_box", None) is not None
+            and self._last_active_box[1] <= (exit_y1_cut + 24)
+        )
+        run_yolo = (yolo_stride <= 1) or (self._frame_count % yolo_stride == 0) or near_top_exit
 
         if self.mode in ["HYBRID", "YOLO_ONLY"]:
-            if self._frame_count % yolo_stride == 0 or not self._last_yolo_det[0]:
+            if run_yolo:
                 yolo_det, yolo_box, yolo_conf, all_yolo_boxes = self.detect_yolo_zone(frame, focus_zone)
                 self._last_yolo_det = (yolo_det, yolo_box, yolo_conf, all_yolo_boxes)
             else:
                 yolo_det, yolo_box, yolo_conf, all_yolo_boxes = self._last_yolo_det
+                vy_shift = int(round(getattr(self, "_conveyor_vy_ema", 0.0)))
+                if yolo_box is not None and vy_shift != 0:
+                    yolo_box = [yolo_box[0], yolo_box[1] + vy_shift, yolo_box[2], yolo_box[3] + vy_shift]
+                    shifted_all = []
+                    for yb in (all_yolo_boxes or []):
+                        if isinstance(yb, dict) and yb.get("box") is not None:
+                            b0 = yb["box"]
+                            yb_new = dict(yb)
+                            yb_new["box"] = [b0[0], b0[1] + vy_shift, b0[2], b0[3] + vy_shift]
+                            if "centroid" in yb and yb["centroid"] is not None:
+                                yb_new["centroid"] = (yb["centroid"][0], yb["centroid"][1] + vy_shift)
+                            shifted_all.append(yb_new)
+                        else:
+                            shifted_all.append(yb)
+                    all_yolo_boxes = shifted_all
+                    self._last_yolo_det = (yolo_det, yolo_box, yolo_conf, all_yolo_boxes)
 
-        if self.mode in ["HYBRID", "DUAL_POLARITY_ONLY"]:
-            # Optimasi CPU: Di mode HYBRID, jika YOLO telah mendeteksi rib dengan pasti (yolo_det=True),
-            # lewati pemindaian CPU Dual-Polarity penuh untuk menghemat ~10-15ms latensi per-frame.
-            # Jalankan Dual-Polarity hanya saat mode DUAL_POLARITY_ONLY atau saat discovery (yolo_det=False).
+        needs_dual = (
+            self.mode == "DUAL_POLARITY_ONLY"
+            or (self.mode == "HYBRID" and self.tracker_engine == "TIER4_HOUGH_STITCH" and not yolo_det)
+        )
+        if needs_dual:
             run_dual = (
                 self.mode == "DUAL_POLARITY_ONLY"
-                or (not yolo_det and (self._frame_count % self._dual_stride == 0 or not self._last_yolo_det[0]))
+                or (self._frame_count % self._dual_stride == 0)
             )
             if run_dual:
                 dual_det, dual_box, dual_h, dual_ratio, _ = self.detect_dual_polarity_zone(frame, focus_zone)
@@ -2434,35 +3003,80 @@ class HybridRibInspector:
             else:
                 dual_det, dual_box, dual_h, dual_ratio, _ = self._last_dual_det
 
-        # 2. Gating Keputusan Awal & Pemilihan Box Kontinu (Anti-Jump)
+        # 2. Gating Keputusan Awal & Pemilihan Box Kontinu (Anti-Jump & Kinematic Tracking)
+        reason = ""
         if self.mode in ["HYBRID", "YOLO_ONLY"]:
-            if all_yolo_boxes and len(all_yolo_boxes) > 0:
+            if getattr(self, "_last_active_cy", None) is not None and getattr(self, "_last_active_box", None) is not None:
+                # KONDISI A: Sedang dalam sesi pelacakan aktif suatu bilah sirip (Identity Locked)
+                expected_cy = self._last_active_cy + self._conveyor_vy_ema
                 best_tracked_box = None
                 min_track_dist = float("inf")
 
-                # Prioritas 1: Lanjutkan pelacakan bilah yang sama jika masih ada di dekat posisi terakhir (|ΔY| <= 55 px)
-                if getattr(self, "_last_active_cy", None) is not None:
+                if all_yolo_boxes and len(all_yolo_boxes) > 0:
                     for yb in all_yolo_boxes:
                         b = yb.get("box") if isinstance(yb, dict) else yb
                         if b is not None:
                             cy_cand = (b[1] + b[3]) // 2
-                            dist = abs(cy_cand - self._last_active_cy)
-                            if dist <= 55 and dist < min_track_dist:
+                            dist = abs(cy_cand - expected_cy)
+                            # Toleransi pelacakan spasial kontinuitas: <= 65px dari proyeksi kinematik
+                            if dist <= 65 and dist < min_track_dist:
                                 min_track_dist = dist
                                 best_tracked_box = b
                                 yolo_conf = yb.get("conf", yolo_conf) if isinstance(yb, dict) else yolo_conf
 
                 if best_tracked_box is not None:
+                    cy_trk = (best_tracked_box[1] + best_tracked_box[3]) // 2
+                    if best_tracked_box[1] < exit_y1_cut or cy_trk < exit_cy_cut:
+                        best_tracked_box = None
+
+                if best_tracked_box is not None:
+                    # Deteksi AI solid terkonfirmasi
                     active_box = best_tracked_box
                     yolo_det = True
-                elif getattr(self, "_last_active_cy", None) is not None:
-                    # Sedang dalam sesi pelacakan aktif bilah:
-                    # JANGAN melompat ke bilah lain yang jauh (|ΔY| > 55 px).
-                    # Biarkan active_box = None agar masuk ke Hysteresis Buffer untuk bilah ini!
-                    active_box = None
-                    yolo_det = False
+                    self._kinematic_coasting_frames = 0
+                    inst_cy = (best_tracked_box[1] + best_tracked_box[3]) // 2
+                    inst_vy = float(inst_cy - self._last_active_cy)
+                    if abs(inst_vy) <= 15.0:
+                        self._conveyor_vy_ema = 0.80 * self._conveyor_vy_ema + 0.20 * inst_vy
                 else:
-                    # Belum ada bilah yang dilacak (kondisi cold start): pilih box terdekat ke Prime Zone
+                    # AI drop sesaat (akibat pantulan cahaya, bayangan oli, atau flicker)
+                    # Cek apakah bilah sirip aktif sudah keluar dari gerbang inspeksi atas
+                    prev_cy = self._last_active_cy
+                    prev_box = self._last_active_box
+                    vy = self._conveyor_vy_ema
+                    is_past_exit = (
+                        (prev_box[1] + min(0.0, vy)) < exit_y1_cut
+                        or (prev_cy <= (zy1 + 35) and vy <= 0.5)
+                    )
+                    if is_past_exit:
+                        # Bilah lama telah tuntas keluar! Beralih mulus ke bilah baru jika ada
+                        prime_mid_y = (self.prime_min_y + self.prime_max_y) // 2
+                        new_cands = [yb for yb in all_yolo_boxes if ((yb["box"][1]+yb["box"][3])//2) > (zy1 + 45)] if all_yolo_boxes else []
+                        if new_cands:
+                            best_new_box = min(new_cands, key=lambda yb: abs((yb["box"][1] + yb["box"][3])//2 - prime_mid_y))
+                            active_box = best_new_box["box"]
+                            yolo_conf = best_new_box["conf"]
+                            yolo_det = True
+                            self._reset_rib_session()
+                        else:
+                            active_box = None
+                            yolo_det = False
+                    elif self.active_rib_frames >= 2 and self._kinematic_coasting_frames < self._max_kinematic_coasting:
+                        # Bilah sudah terkonfirmasi (≥2 frame) & masih di zona kerja: jalankan Kinematic Extrapolation
+                        self._kinematic_coasting_frames += 1
+                        old_b = self._last_active_box
+                        proj_y1 = int(round(old_b[1] + vy))
+                        proj_y2 = int(round(old_b[3] + vy))
+                        active_box = [old_b[0], proj_y1, old_b[2], proj_y2]
+                        yolo_det = True
+                        yolo_conf = max(0.35, yolo_conf * 0.96)
+                        reason = f"HYBRID: Kinematic Coast (Y={(proj_y1+proj_y2)//2}, vy={vy:.1f}px/f, coast={self._kinematic_coasting_frames}/{self._max_kinematic_coasting})"
+                    else:
+                        active_box = None
+                        yolo_det = False
+            else:
+                # KONDISI B: Cold Start (Mencari bilah pertama saat konveyor beroperasi)
+                if all_yolo_boxes and len(all_yolo_boxes) > 0:
                     prime_mid_y = (self.prime_min_y + self.prime_max_y) // 2
                     best_prime_box = None
                     min_prime_dist = float("inf")
@@ -2477,24 +3091,23 @@ class HybridRibInspector:
                                 yolo_conf = yb.get("conf", yolo_conf) if isinstance(yb, dict) else yolo_conf
                     active_box = best_prime_box if best_prime_box is not None else yolo_box
                     yolo_det = (active_box is not None)
-            elif getattr(self, "_last_active_cy", None) is not None:
-                active_box = None
-                yolo_det = False
-            else:
-                active_box = yolo_box
+                else:
+                    active_box = yolo_box
+                    yolo_det = (active_box is not None)
 
             is_candidate = yolo_det
-            reason = f"HYBRID: YOLO({yolo_conf:.2f})" if self.mode == "HYBRID" else f"YOLO ONLY: Conf={yolo_conf:.2f}"
+            if not reason:
+                reason = f"HYBRID: YOLO({yolo_conf:.2f})" if self.mode == "HYBRID" else f"YOLO ONLY: Conf={yolo_conf:.2f}"
         else:  # DUAL_POLARITY_ONLY
             is_candidate = dual_det
             reason = f"DUAL-POLARITY ONLY: Ratio={dual_ratio*100:.0f}%, H={dual_h:.0f}px"
             active_box = dual_box
 
         # Evaluasi batas gerbang inspeksi:
-        # Sudahi inspeksi hanya jika sentroid bilah (tengah objek) benar-benar telah keluar gerbang
+        # Sudahi inspeksi tepat sebelum bibir atas sirip melewati garis keluar atas (cegah ghost slash di tepi perspektif)
         if active_box is not None:
             cy_chk = (active_box[1] + active_box[3]) // 2
-            if cy_chk < zy1 or cy_chk > zy2:
+            if active_box[1] < exit_y1_cut or cy_chk < exit_cy_cut or cy_chk > zy2:
                 is_candidate = False
                 active_box = None
 
@@ -2503,25 +3116,43 @@ class HybridRibInspector:
             curr_cy = (active_box[1] + active_box[3]) // 2
             if getattr(self, "_last_active_cy", None) is not None:
                 delta_y = abs(curr_cy - self._last_active_cy)
-                # Jika koordinat Y melompat lebih dari 45 px (baik naik maupun turun):
-                # Ini adalah BILAH SIRIP BARU yang terpisah secara fisik!
-                if delta_y > 45:
+                # Jika koordinat Y melompat lebih dari 70 px (transisi fisik ke bilah baru):
+                if delta_y > 70:
                     self._reset_rib_session()
             self._last_active_cy = curr_cy
             self._last_active_box = active_box
 
         # 3. KONDISI: PLAT DATAR MELINTAS (TIDAK ADA CANDIDATE RIB)
         if not is_candidate or active_box is None:
-            if self.active_rib_frames > 0:
+            exited_gate = False
+            if getattr(self, "_last_active_box", None) is not None and self._last_active_cy is not None:
+                vy_ema = getattr(self, "_conveyor_vy_ema", -2.5)
+                if (
+                    (self._last_active_box[1] + min(0.0, vy_ema)) < (exit_y1_cut + 2)
+                    or (self._last_active_cy <= (zy1 + 35) and vy_ema <= 0.5)
+                    or self._last_active_cy >= (zy2 - 10)
+                ):
+                    exited_gate = True
+
+            if self.active_rib_frames > 0 and not exited_gate:
                 self.absence_frames += 1
                 if self.absence_frames < self.max_absence_tolerance:
                     # Hysteresis buffer: Tahan sesi transit aktif (mencegah fragmentasi akibat flicker 1-5 frame)
+                    _buf_pv = float(np.median(self.prime_pv_samples)) if self.prime_pv_samples else 0.0
+                    _buf_sag = float(np.median(self.prime_sagitta_samples)) if self.prime_sagitta_samples else 0.0
+                    _buf_idev = float(np.median(self.prime_inner_dev_samples)) if self.prime_inner_dev_samples else 0.0
+                    _buf_tdev = float(np.median(self.prime_tip_dev_samples)) if self.prime_tip_dev_samples else 0.0
+                    _buf_sev = self.compute_ng_severity(
+                        _buf_pv, _buf_sag, _buf_idev, _buf_tdev,
+                        is_ng=(self.current_rib_status == "NG")
+                    ) if self.current_rib_status == "NG" else "OK"
                     return {
                         "status": self.current_rib_status if self.current_rib_status else "WAIT",
                         "object_type": "RIB_SIRIP",
                         "is_rib_present": True,
                         "is_ok": (self.current_rib_status == "OK"),
                         "is_ng": (self.current_rib_status == "NG"),
+                        "ng_severity": _buf_sev,
                         "rib_count": self.rib_count,
                         "ok_count": self.ok_count,
                         "ng_count": self.ng_count,
@@ -2530,13 +3161,13 @@ class HybridRibInspector:
                         "message": f"Sirip dalam transit (Buffer {self.absence_frames}/{self.max_absence_tolerance})",
                         "detection_reason": "Transit Hysteresis",
                         "confidence": float(yolo_conf if yolo_conf > 0 else (dual_ratio if self.mode == "DUAL_POLARITY_ONLY" else 0.0)),
-                        "pv_flatness": float(np.median(self.prime_pv_samples)) if self.prime_pv_samples else 0.0,
-                        "sagitta": float(np.median(self.prime_sagitta_samples)) if self.prime_sagitta_samples else 0.0,
+                        "pv_flatness": _buf_pv,
+                        "sagitta": _buf_sag,
                         "max_deviation": 0.0,
-                        "inner_dev": float(np.median(self.prime_inner_dev_samples)) if self.prime_inner_dev_samples else 0.0,
-                        "tip_dev": float(np.median(self.prime_tip_dev_samples)) if self.prime_tip_dev_samples else 0.0,
+                        "inner_dev": _buf_idev,
+                        "tip_dev": _buf_tdev,
                         "coverage": 1.0,
-                        "active_box": None,
+                        "active_box": self._last_active_box if self._last_active_box is not None else active_box,
                         "zone_rect": zone_rect,
                         "yolo_boxes": all_yolo_boxes,
                         "elapsed_ms": (time.time() - t0) * 1000
@@ -2617,36 +3248,25 @@ class HybridRibInspector:
                 "elapsed_ms": (time.time() - t0) * 1000
             }
 
-        # 4. KONTUR TRACKING DENGAN SAKELAR MUTUALLY EXCLUSIVE 5-WAY (NOL BEBAN GANDA)
+        # 4. KONTUR TRACKING DENGAN SAKELAR MUTUALLY EXCLUSIVE 3-WAY (NOL BEBAN GANDA)
+        # (TIER2_YOLO_POSE & TIER3 YOLO-Segmentation telah di-take out;
+        #  Preprocessing Perspective Transform tetap aktif untuk visualisasi Top-Down 90 Deg.)
         if self.tracker_engine == "TIER4_HOUGH_STITCH":
             # ==================================================================
-            # PILIHAN D: ADAPTASI SENSORS 2025 MICRO-HOUGHLET GROUPING & STITCHING (TIER 4)
+            # PILIHAN B: ADAPTASI SENSORS 2025 MICRO-HOUGHLET GROUPING & STITCHING (TIER 4)
             # ==================================================================
             self._last_unwarp_contour = None
+            # P2 FIX: Fallback ke dual_box jika YOLO tidak detect (active_box=None).
+            _t4_active_box = active_box
+            if _t4_active_box is None and dual_det and dual_box is not None:
+                _t4_active_box = dual_box
+                reason = "TIER4: Fallback Dual-Polarity Box (YOLO miss)"
             ridge_xs, ridge_ys, coverage, tested_cols, hough_tilt = self._track_hough_stitching(
-                frame, gray, active_box, search_x1, search_x2, h_f, w_f
-            )
-        elif self.tracker_engine == "TIER3_UNWARP":
-            # ==================================================================
-            # PILIHAN C: DEEP LEARNING YOLO-SEGMENTATION + ORTHOGONAL UNWARP TRACKING
-            # (Metode Legacy, Viterbi, & Pose 100% DI-BYPASS / MATI TOTAL - Nol Beban Ganda)
-            # ==================================================================
-            ridge_xs, ridge_ys, coverage, tested_cols, unwarp_tilt = self._track_yolo_segmentation(
-                frame, gray, active_box, h_f, w_f
-            )
-        elif self.tracker_engine == "TIER2_YOLO_POSE":
-            # ==================================================================
-            # PILIHAN B: DEEP LEARNING 13-KEYPOINTS YOLO-POSE + SUB-PIXEL POLISH
-            # (Metode Legacy, Viterbi, & Unwarp 100% DI-BYPASS / MATI TOTAL - Nol Beban Ganda)
-            # ==================================================================
-            self._last_unwarp_contour = None
-            ridge_xs, ridge_ys, coverage, tested_cols, pose_tilt = self._track_yolo_pose(
-                frame, gray, active_box, h_f, w_f
+                frame, gray, _t4_active_box, search_x1, search_x2, h_f, w_f
             )
         elif self.tracker_engine == "TIER1_VITERBI":
             # ==================================================================
             # PILIHAN A: ANCHOR-GUIDED TIGHT-RIBBON STEGER-VITERBI (TIER 1)
-            # (Metode Legacy, Pose, & Unwarp 100% DI-BYPASS / MATI TOTAL - Nol Beban Ganda)
             # ==================================================================
             self._last_unwarp_contour = None
             ridge_xs, ridge_ys, coverage, tested_cols, viterbi_tilt = self._track_steger_viterbi(
@@ -2655,11 +3275,10 @@ class HybridRibInspector:
         else:
             # ==================================================================
             # METODE EKSISTING: SLOPE-AWARE ANCHOR & GUIDED CREST TRACKING (LEGACY)
-            # (Metode Tier 1, 2, & 3 100% DI-BYPASS / MATI TOTAL - Nol Beban Ganda)
             # ==================================================================
             self._last_unwarp_contour = None
-            # Multi-point anchor sampling (9 titik di area 22% - 78% lebar konveyor)
-            step_fracs = [0.22, 0.28, 0.35, 0.42, 0.50, 0.58, 0.65, 0.72, 0.78]
+            # Multi-point anchor sampling (11 titik lebar 12% - 88% agar slope tepi akurat & anti-ekstrapolasi miring)
+            step_fracs = [0.12, 0.20, 0.28, 0.36, 0.44, 0.50, 0.56, 0.64, 0.72, 0.80, 0.88]
             anchor_xs = []
             anchor_ys = []
             anchor_contrasts = []
@@ -2669,13 +3288,14 @@ class HybridRibInspector:
                 best_y = None
                 best_sc = -9999.0
                 max_c = 0.0
-                # Cari tepat di puncak bilah sirip (by1 + 6 s/d by1 + 55), mengecualikan celah plat di atasnya
-                for y in range(max(10, by1 + 6), min(h_f - 12, by1 + 55)):
+                # Prioritaskan bibir puncak sejati bilah sirip di area atas ROI dengan penalti kedalaman ringan
+                for y in range(max(10, by1 + 2), min(h_f - 12, by1 + 48)):
                     b = float(gray[y, ax])
                     diff_below = b - float(gray[min(h_f - 1, y + 8), ax])
                     diff_above = b - float(gray[max(0, y - 5), ax])
                     if diff_above >= 8.0 and diff_below >= 10.0:
-                        sc = diff_below * 1.1 + diff_above * 1.4 + min(b, 175.0) * 0.15
+                        pen_depth = max(0.0, float(y - (by1 + 22))) * 0.5
+                        sc = diff_below * 1.1 + diff_above * 1.4 + min(b, 175.0) * 0.15 - pen_depth
                         if sc > best_sc:
                             best_sc = sc
                             best_y = y
@@ -2685,9 +3305,22 @@ class HybridRibInspector:
                     anchor_ys.append(best_y)
                     anchor_contrasts.append(max_c)
 
-            # Validasi Fisika: Bilah sirip wajib memiliki kontras bibir vs wajah bilah >= 15.0
+            # Validasi Fisika: Adaptive contrast gate (S3-analog Default/Legacy)
             avg_contrast = float(np.mean(anchor_contrasts)) if len(anchor_contrasts) > 0 else 0.0
-            if avg_contrast < 15.0 or len(anchor_xs) < 2:
+            # Hitung threshold adaptif dari distribusi Sobel-Y ROI bounding box
+            try:
+                _sy_roi_def = cv2.Sobel(
+                    gray[max(0, by1):min(h_f, by2), max(0, bx1):min(w_f, bx2)],
+                    cv2.CV_32F, 0, 1, ksize=3
+                )
+                _pos_roi_def = _sy_roi_def[_sy_roi_def > 0]
+                _adapt_contrast_def = float(
+                    # [ANTI-FALSE-DET] Clamp [10,22]→[13,25]: konsisten dengan Tier-1, cegah karat/shadow lolos Legacy
+                    np.clip(np.percentile(_pos_roi_def, 70), 13.0, 25.0)
+                ) if len(_pos_roi_def) > 50 else 15.0
+            except Exception:
+                _adapt_contrast_def = 15.0
+            if avg_contrast < _adapt_contrast_def or len(anchor_xs) < 2:
                 if self.active_rib_frames > 0:
                     self.absence_frames += 1
                     if self.absence_frames < self.max_absence_tolerance:
@@ -2729,6 +3362,7 @@ class HybridRibInspector:
                     "sagitta": 0.0,
                     "max_deviation": 0.0,
                     "inner_dev": 0.0,
+                    "tip_dev": 0.0,
                     "coverage": 0.0,
                     "active_box": None,
                     "zone_rect": zone_rect,
@@ -2736,21 +3370,81 @@ class HybridRibInspector:
                     "elapsed_ms": (time.time() - t0) * 1000
                 }
 
-            # Filter anchor outliers (Theil-Sen / robust median fit) agar garis panduan 100% konsisten pada bibir rib
-            if len(anchor_xs) >= 3:
-                p_init = np.polyfit(anchor_xs, anchor_ys, 1)
-                resids = np.abs(np.array(anchor_ys) - np.polyval(p_init, anchor_xs))
-                med_res = float(np.median(resids))
-                clean_xs = [ax for ax, r in zip(anchor_xs, resids) if r <= max(8.0, med_res * 2.2)]
-                clean_ys = [ay for ay, r in zip(anchor_ys, resids) if r <= max(8.0, med_res * 2.2)]
-                if len(clean_xs) >= 3:
-                    anchor_xs, anchor_ys = clean_xs, clean_ys
-                guide_poly = np.polyfit(anchor_xs, anchor_ys, deg=1)
-            else:
-                guide_poly = np.array([0.0, float((by1 + by2) / 2)])
+            # Garis pandu linear robust (median pre-filter + residual filter + clamp kemiringan fisik)
+            guide_poly = self._fit_robust_guide_poly(anchor_xs, anchor_ys, (by1 + by2) / 2.0)
+            g_m, g_c = float(guide_poly[0]), float(guide_poly[1])
 
-            # Helper sub-pixel polish parabolik lokal
+            # Titik awal pelacakan terdekat ke tengah bounding box (stabil meski anchor tidak simetris)
+            mid_target_x = (bx1 + bx2) / 2.0
+            mid_idx = int(np.argmin([abs(ax - mid_target_x) for ax in anchor_xs]))
+            x_center = int(anchor_xs[mid_idx])
+
+            # Jangkauan pelacakan lateral adaptif (Zoom & Vibration Tolerant Tip-to-Tip Coverage)
+            pad_x = 10
+            margin_frame = int(0.04 * w_f)
+            x_limit_left = max(margin_frame, int(bx1 + pad_x))
+            x_limit_right = min(w_f - margin_frame, int(bx2 - pad_x))
+            tip_w_legacy = max(120, int(0.09 * (x_limit_right - x_limit_left)))
+
+            # Grid kolom step-4 sejajar x_center agar vektorisasi band 100% identik dengan loop skalar
+            x_grid_start = max(0, x_center - max(0, (x_center - x_limit_left) // 4) * 4)
+            x_grid_end = min(w_f - 1, x_center + max(0, (x_limit_right - x_center) // 4) * 4)
+            gy_a = g_m * x_grid_start + g_c
+            gy_b = g_m * x_grid_end + g_c
+            roi_y1 = max(10, min(by1 - 24, int(np.floor(min(gy_a, gy_b) - 20))))
+            roi_y2 = min(h_f - 10, max(by2 + 20, int(np.ceil(max(gy_a, gy_b) + 24))))
+            if roi_y2 <= roi_y1 + 2:
+                roi_y1 = max(10, min(h_f - 15, roi_y1))
+                roi_y2 = min(h_f - 10, roi_y1 + 5)
+
+            pad_top = roi_y1 - 1
+            pad_bot = roi_y2 + 1
+
+            # [ANTI-FALSE-DET CM-2] Bilateral Filter pada ROI strip sebelum scan kolom Legacy:
+            # Meratakan bintik karat & goresan permukaan metal tanpa menghaluskan tepi tajam bibir rib.
+            # d=5 cukup cepat (<1ms), sigma=25 menjaga ketajaman gradien deviasi ujung/tip bending asli.
+            _roi_strip_raw = gray[pad_top:pad_bot + 1, x_grid_start:x_grid_end + 1]
+            try:
+                _roi_strip_filt = cv2.bilateralFilter(_roi_strip_raw, d=5, sigmaColor=25, sigmaSpace=25)
+            except Exception:
+                _roi_strip_filt = _roi_strip_raw  # fallback tanpa filter jika error
+
+            # [ANTI-FALSE-DET CM-1] Gap Dark-Stripe Mask Terkalibrasi:
+            # Hanya celah gelap nyata (< 35) yang diblokir, dan bebaskan zona tip (outer 15% per sisi)
+            # agar deviasi ujung asli (bending tip) tidak salah terbaca sebagai celah dan tidak dipaksa coasting lurus.
+            _gap_col_brightness_full = np.median(_roi_strip_filt, axis=0)
+            _gap_mask_full = (_gap_col_brightness_full < 35).astype(np.uint8)
+            _tip_zone_px = int(0.15 * len(_gap_mask_full))
+            if _tip_zone_px > 0:
+                _gap_mask_full[:_tip_zone_px] = 0        # bebaskan ujung kiri
+                _gap_mask_full[-_tip_zone_px:] = 0       # bebaskan ujung kanan
+
+            # Morphological dilation: gap yang sempit (< 8px) diabaikan, gap nyata (>= 8px) diblokir
+            _gap_mask_full = cv2.dilate(_gap_mask_full.reshape(1, -1),
+                                        cv2.getStructuringElement(cv2.MORPH_RECT, (8, 1))).flatten()
+            # Downsample ke step-4 agar sinkron dengan indeks kolom `col` di loop
+            _gap_mask_cols = _gap_mask_full[::4]
+
+            gb_sub = _roi_strip_filt[:, ::4].astype(np.float32)  # step-4 agar sinkron dengan x_grid
+            gb_sub_b = gray[pad_top + 8:pad_bot + 9, x_grid_start:x_grid_end + 1:4].astype(np.float32)
+            sub_band = gb_sub * 0.4 + (gb_sub - gb_sub_b) * 1.2
+            gb = gb_sub[1:-1]
+            gb_b = gb_sub_b[1:-1]
+            gb_a = gray[roi_y1 - 5:roi_y2 - 4, x_grid_start:x_grid_end + 1:4].astype(np.float32)
+            edge_band = np.minimum(gb, 175.0) * 0.2 + (gb - gb_b) * 1.1 + (gb - gb_a) * 1.3
+            ys_band = np.arange(roi_y1, roi_y2 + 1, dtype=np.float32)
+            n_band_cols = edge_band.shape[1]
+
             def _subpixel_crest(gx_val, gy_int):
+                col = (gx_val - x_grid_start) // 4
+                ry = gy_int - pad_top
+                if 1 <= ry <= sub_band.shape[0] - 2 and 0 <= col < n_band_cols:
+                    s_m1 = float(sub_band[ry - 1, col])
+                    s_0 = float(sub_band[ry, col])
+                    s_p1 = float(sub_band[ry + 1, col])
+                    denom = 2.0 * (s_m1 - 2.0 * s_0 + s_p1)
+                    offset = (s_m1 - s_p1) / denom if abs(denom) > 1e-4 else 0.0
+                    return gy_int + max(-0.5, min(0.5, offset))
                 if 2 < gy_int < h_f - 10:
                     s_m1 = float(gray[gy_int - 1, gx_val]) * 0.4 + (float(gray[gy_int - 1, gx_val]) - float(gray[min(h_f - 1, gy_int + 7), gx_val])) * 1.2
                     s_0  = float(gray[gy_int, gx_val]) * 0.4 + (float(gray[gy_int, gx_val]) - float(gray[min(h_f - 1, gy_int + 8), gx_val])) * 1.2
@@ -2760,143 +3454,87 @@ class HybridRibInspector:
                     return gy_int + max(-0.5, min(0.5, offset))
                 return float(gy_int)
 
-            # Titik awal pelacakan dari pusat bilah (paling bebas distorsi dan bayangan)
-            mid_idx = len(anchor_xs) // 2
-            x_center = int(anchor_xs[mid_idx])
             y_center = _subpixel_crest(x_center, int(round(anchor_ys[mid_idx])))
-            initial_slope = float(guide_poly[0])
+            initial_slope = g_m
 
-            # Jangkauan pelacakan lateral penuh (Tip-to-Tip Coverage)
-            x_limit_left = max(248, bx1 + 10)
-            x_limit_right = min(1635, bx2 - 10)
+            def _trace_outward(direction, x_limit):
+                """Telusuri kontur puncak ke kiri (-1) atau kanan (+1) dengan momentum bridging simetris."""
+                step_x = 4 * direction
+                pts = [(x_center, y_center)]
+                cur_y = float(y_center)
+                rolling_slope = initial_slope
+                bridging_buffer = []
+                consec_misses = 0
 
-            # 1. Telusuri ke arah kanan dari tengah (Elastic Outward + Momentum Gap Bridging)
-            right_pts = [(x_center, y_center)]
-            cur_y = float(y_center)
-            rolling_slope = initial_slope
-            bridging_buffer = []
-            consec_misses = 0
+                for x in range(x_center + step_x, x_limit + direction, step_x):
+                    gy = g_m * x + g_c
+                    is_tip = (x > x_limit - tip_w_legacy) if direction > 0 else (x < x_limit + tip_w_legacy)
+                    y_pred = cur_y + rolling_slope * step_x
 
-            for x in range(x_center + 4, x_limit_right + 1, 4):
-                gy = float(np.polyval(guide_poly, x))
-                is_tip = (x > x_limit_right - 120)
-                y_pred = cur_y + rolling_slope * 4.0
+                    # Guard bebas bias di ujung (ceiling diperlonggar ke 14px agar tidak terpaksa turun ke sisi berkarat)
+                    ceiling_guard = 14.0 if is_tip else 8.0
+                    floor_guard = 18.0 if is_tip else 7.5
+                    step_guard = 6.0 if is_tip else 3.5
+                    max_step = 5.0 if is_tip else 3.2
 
-                # Asymmetric guard boundaries (atap ketat 6px cegah celah slat, lantai leluasa 32px di tip untuk tangkap defleksi)
-                ceiling_guard = 6.0
-                floor_guard = 32.0 if is_tip else 14.0
-                step_guard = 8.0 if is_tip else 5.0
-                max_step = 6.5 if is_tip else 4.5
+                    y_low = max(roi_y1, int(round(max(gy - ceiling_guard, cur_y - step_guard))))
+                    y_high = min(roi_y2, int(round(min(gy + floor_guard, cur_y + step_guard))))
 
-                y_low = max(10, int(round(max(gy - ceiling_guard, cur_y - step_guard))))
-                y_high = min(h_f - 10, int(round(min(gy + floor_guard, cur_y + step_guard))))
+                    best_y = None
+                    best_sc = -9999.0
+                    best_g = 0.0
+                    col = (x - x_grid_start) // 4
 
-                best_y = None
-                best_sc = -9999.0
-                for y in range(y_low, y_high + 1):
-                    b = float(gray[y, x])
-                    diff_below = b - float(gray[min(h_f - 1, y + 8), x])
-                    diff_above = b - float(gray[max(0, y - 5), x])
-                    edge_score = min(b, 175.0) * 0.2 + diff_below * 1.1 + diff_above * 1.3
-                    pen_pred = 0.05 * ((y - y_pred) ** 2)
-                    pen_guide = (0.01 if is_tip else 0.04) * ((y - gy) ** 2)
-                    pen_up = max(0.0, gy - y) * 2.0
-                    sc = edge_score - pen_pred - pen_guide - pen_up
-                    if sc > best_sc:
-                        best_sc = sc
-                        best_y = y
+                    # [ANTI-FALSE-DET P6] Gap Dark-Stripe Guard:
+                    # Jika kolom ini terdeteksi sebagai celah antar slat (brightness rendah), paksa coast —
+                    # jangan latch ke tepi gelap celah yang akan menciptakan spike deviasi palsu.
+                    _col_in_gap = (0 <= col < len(_gap_mask_cols) and _gap_mask_cols[col] > 0)
 
-                if best_y is not None and best_sc >= 20.0 and gray[best_y, x] >= 35 and abs(best_y - cur_y) <= max_step:
-                    sub_y = _subpixel_crest(x, best_y)
-                    # Backfill titik jembatan (gap bridging) dengan interpolasi mulus
-                    if len(bridging_buffer) > 0:
-                        start_x, start_y = right_pts[-1]
-                        end_x, end_y = x, sub_y
-                        for bx, _ in bridging_buffer:
-                            interp_y = start_y + (end_y - start_y) * ((bx - start_x) / float(end_x - start_x))
-                            right_pts.append((bx, interp_y))
-                        bridging_buffer.clear()
+                    if not _col_in_gap and y_high >= y_low and 0 <= col < n_band_cols:
+                        yl_r = y_low - roi_y1
+                        yh_r = y_high - roi_y1
+                        yv = ys_band[yl_r:yh_r + 1]
+                        pen_g = 0.008 if is_tip else 0.03
+                        sc_arr = edge_band[yl_r:yh_r + 1, col] - 0.08 * ((yv - y_pred) ** 2) - pen_g * ((yv - gy) ** 2)
+                        idx_best = int(np.argmax(sc_arr))
+                        best_sc = float(sc_arr[idx_best])
+                        best_y = y_low + idx_best
+                        best_g = float(gb[yl_r + idx_best, col])
 
-                    step_slope = (sub_y - cur_y) / 4.0
-                    rolling_slope = 0.70 * rolling_slope + 0.30 * step_slope
-                    cur_y = sub_y
-                    right_pts.append((x, cur_y))
-                    consec_misses = 0
-                else:
-                    consec_misses += 1
-                    if consec_misses <= 15:
-                        # Momentum coasting sepanjang jalur aman
-                        coast_y = np.clip(cur_y + rolling_slope * 4.0, gy - ceiling_guard, gy + floor_guard)
-                        cur_y = float(coast_y)
-                        bridging_buffer.append((x, cur_y))
+                    if best_y is not None and best_sc >= 20.0 and best_g >= 35.0 and abs(best_y - cur_y) <= max_step:
+                        sub_y = _subpixel_crest(x, best_y)
+                        if len(bridging_buffer) > 0:
+                            start_x, start_y = pts[-1]
+                            end_x, end_y = x, sub_y
+                            for bx, _ in bridging_buffer:
+                                interp_y = start_y + (end_y - start_y) * ((bx - start_x) / float(end_x - start_x))
+                                pts.append((bx, interp_y))
+                            bridging_buffer.clear()
+
+                        step_slope = (sub_y - cur_y) / float(step_x)
+                        rolling_slope = 0.70 * rolling_slope + 0.30 * step_slope
+                        cur_y = sub_y
+                        pts.append((x, cur_y))
+                        consec_misses = 0
                     else:
-                        break
+                        consec_misses += 1
+                        if consec_misses <= 15:
+                            coast_y = np.clip(cur_y + rolling_slope * step_x, gy - ceiling_guard, gy + floor_guard)
+                            cur_y = float(coast_y)
+                            bridging_buffer.append((x, cur_y))
+                        else:
+                            break
+                return pts
 
-            # 2. Telusuri ke arah kiri dari tengah (Elastic Outward + Momentum Gap Bridging)
-            left_pts = []
-            cur_y = float(y_center)
-            rolling_slope = initial_slope
-            bridging_buffer = []
-            consec_misses = 0
-
-            for x in range(x_center - 4, x_limit_left - 1, -4):
-                gy = float(np.polyval(guide_poly, x))
-                is_tip = (x < x_limit_left + 120)
-                y_pred = cur_y - rolling_slope * 4.0
-
-                ceiling_guard = 6.0
-                floor_guard = 32.0 if is_tip else 14.0
-                step_guard = 8.0 if is_tip else 5.0
-                max_step = 6.5 if is_tip else 4.5
-
-                y_low = max(10, int(round(max(gy - ceiling_guard, cur_y - step_guard))))
-                y_high = min(h_f - 10, int(round(min(gy + floor_guard, cur_y + step_guard))))
-
-                best_y = None
-                best_sc = -9999.0
-                for y in range(y_low, y_high + 1):
-                    b = float(gray[y, x])
-                    diff_below = b - float(gray[min(h_f - 1, y + 8), x])
-                    diff_above = b - float(gray[max(0, y - 5), x])
-                    edge_score = min(b, 175.0) * 0.2 + diff_below * 1.1 + diff_above * 1.3
-                    pen_pred = 0.05 * ((y - y_pred) ** 2)
-                    pen_guide = (0.01 if is_tip else 0.04) * ((y - gy) ** 2)
-                    pen_up = max(0.0, gy - y) * 2.0
-                    sc = edge_score - pen_pred - pen_guide - pen_up
-                    if sc > best_sc:
-                        best_sc = sc
-                        best_y = y
-
-                if best_y is not None and best_sc >= 20.0 and gray[best_y, x] >= 35 and abs(best_y - cur_y) <= max_step:
-                    sub_y = _subpixel_crest(x, best_y)
-                    if len(bridging_buffer) > 0:
-                        start_x, start_y = (left_pts[-1] if len(left_pts) > 0 else (x_center, y_center))
-                        end_x, end_y = x, sub_y
-                        for bx, _ in bridging_buffer:
-                            interp_y = start_y + (end_y - start_y) * ((bx - start_x) / float(end_x - start_x))
-                            left_pts.append((bx, interp_y))
-                        bridging_buffer.clear()
-
-                    step_slope = (cur_y - sub_y) / 4.0
-                    rolling_slope = 0.70 * rolling_slope + 0.30 * step_slope
-                    cur_y = sub_y
-                    left_pts.append((x, cur_y))
-                    consec_misses = 0
-                else:
-                    consec_misses += 1
-                    if consec_misses <= 15:
-                        coast_y = np.clip(cur_y - rolling_slope * 4.0, gy - ceiling_guard, gy + floor_guard)
-                        cur_y = float(coast_y)
-                        bridging_buffer.append((x, cur_y))
-                    else:
-                        break
-
+            right_pts = _trace_outward(+1, x_limit_right)
+            left_pts = _trace_outward(-1, x_limit_left)[1:]
             left_pts.reverse()
             all_pts = left_pts + right_pts
             ridge_xs = [p[0] for p in all_pts]
             ridge_ys = [p[1] for p in all_pts]
             tested_span = max(1, (x_limit_right - x_limit_left) // 4)
             coverage = len(ridge_xs) / float(tested_span)
+
         if len(ridge_xs) < 50 or coverage < 0.35:
             if self.active_rib_frames > 0:
                 self.absence_frames += 1
@@ -2918,7 +3556,7 @@ class HybridRibInspector:
                         "inner_dev": float(np.median(self.prime_inner_dev_samples)) if self.prime_inner_dev_samples else 0.0,
                         "tip_dev": float(np.median(self.prime_tip_dev_samples)) if self.prime_tip_dev_samples else 0.0,
                         "coverage": coverage,
-                        "active_box": None,
+                        "active_box": self._last_active_box if self._last_active_box is not None else active_box,
                         "zone_rect": zone_rect,
                         "yolo_boxes": all_yolo_boxes,
                         "elapsed_ms": (time.time() - t0) * 1000
@@ -2941,6 +3579,7 @@ class HybridRibInspector:
                 "sagitta": 0.0,
                 "max_deviation": 0.0,
                 "inner_dev": 0.0,
+                "tip_dev": 0.0,
                 "coverage": coverage,
                 "active_box": None,
                 "zone_rect": zone_rect,
@@ -2975,7 +3614,28 @@ class HybridRibInspector:
             u_pts = self._last_unwarp_contour
             u_xs = u_pts[:, 0].astype(np.float32)
             u_ys = u_pts[:, 1].astype(np.float32)
+
+            # Robust outlier filter: buang titik yang bocor ke celah slat / bayangan di luar ujung fisik bilah
+            med_u_y = float(np.median(u_ys))
+            rib_mask_u = np.abs(u_ys - med_u_y) <= 18.0
+            if np.sum(rib_mask_u) >= 50:
+                u_xs = u_xs[rib_mask_u]
+                u_ys = u_ys[rib_mask_u]
+
             smooth_u_ys = fast_medfilt(u_ys, k=9)
+            k_box = 5
+            smooth_u_ys = np.convolve(smooth_u_ys, np.ones(k_box, dtype=np.float32) / float(k_box), mode='same')
+
+            # Stabilisasi Temporal EMA pada Kontur Unwarp (Zero-Flicker View)
+            prev_uxs = getattr(self, "_prev_tier3_unw_xs", None)
+            prev_uys = getattr(self, "_prev_tier3_unw_ys", None)
+            if prev_uxs is not None and prev_uys is not None and len(prev_uxs) >= 20:
+                prev_interp_uys = np.interp(u_xs, prev_uxs, prev_uys)
+                dy_u = float(np.median(smooth_u_ys) - np.median(prev_interp_uys))
+                if abs(dy_u) < 25.0:
+                    smooth_u_ys = 0.65 * smooth_u_ys + 0.35 * (prev_interp_uys + dy_u)
+            self._prev_tier3_unw_xs = u_xs.copy()
+            self._prev_tier3_unw_ys = smooth_u_ys.copy()
 
             if simulate_bending:
                 u_span_len = float(u_xs[-1] - u_xs[0])
@@ -3035,8 +3695,23 @@ class HybridRibInspector:
                 inner_dev = 0.0
                 tip_dev = 0.0
             else:
-                pv = float(np.percentile(dev_u, 98) - np.percentile(dev_u, 2))
-                max_dev = float(np.max(np.abs(dev_u)))
+                # Fusi profil temporal unwarp (Multi-Frame Median Consensus)
+                norm_grid_u = np.linspace(u_xs[0], u_xs[-1], 200)
+                dev_resampled_u = np.interp(norm_grid_u, u_xs, dev_u)
+                if not hasattr(self, 'tier3_profile_history'):
+                    self.tier3_profile_history = []
+                if is_in_prime:
+                    self.tier3_profile_history.append(dev_resampled_u)
+                    if len(self.tier3_profile_history) > 20:
+                        self.tier3_profile_history = self.tier3_profile_history[-20:]
+
+                if len(self.tier3_profile_history) >= 3 and is_in_prime:
+                    fused_dev_u = np.median(np.array(self.tier3_profile_history), axis=0)
+                    pv = float(np.percentile(fused_dev_u, 98) - np.percentile(fused_dev_u, 2))
+                    max_dev = float(np.max(np.abs(fused_dev_u)))
+                else:
+                    pv = float(np.percentile(dev_u, 98) - np.percentile(dev_u, 2))
+                    max_dev = float(np.max(np.abs(dev_u)))
 
                 # Evaluasi deviasi ujung vs badan di ruang unwarp (tip zone difokuskan ke 60px ujung)
                 # Menghindari dilusi percentiles oleh badan sirip lurus (kasus Frame 456 tekukan kiri)
@@ -3088,7 +3763,9 @@ class HybridRibInspector:
             med_top_y = int(np.median(smooth_ys))
             self.active_rib_frames += 1
 
-            full_span_valid = (w_span >= 680.0 and coverage >= 0.55)
+            is_tier4 = (self.tracker_engine == "TIER4_HOUGH_STITCH")
+            min_cov = 0.35 if is_tier4 else 0.55
+            full_span_valid = (w_span >= 680.0 and coverage >= min_cov)
 
             # Baseline Estimator (Theil-Sen Subsampled)
             step_eval = max(1, n_pts // 30)
@@ -3110,7 +3787,35 @@ class HybridRibInspector:
                 baseline = np.polyval(poly1, r_xs)
 
             dev = smooth_ys - baseline
-            is_in_prime = (self._legacy_prime_min_y <= med_top_y <= self._legacy_prime_max_y)
+            # Proyeksi Preprocessing Perspective Transform (90 Deg Top-Down):
+            # Selalu perbarui _last_unwarp_contour & _last_unwarp_baseline agar jendela
+            # Perspective Transform View menampilkan kontur hasil pelacakan LEGACY / TIER 1.
+            if not is_tier4:
+                try:
+                    if getattr(self, "unwarp_M", None) is None:
+                        self.unwarp_rib_zone(frame)
+                    _uM = getattr(self, "unwarp_M", None)
+                    if _uM is not None and len(r_xs) > 10:
+                        _cam_c = np.column_stack([r_xs, smooth_ys]).astype(np.float32).reshape(-1, 1, 2)
+                        _unw_c = cv2.perspectiveTransform(_cam_c, _uM).reshape(-1, 2)
+                        _cam_b = np.column_stack([r_xs, baseline]).astype(np.float32).reshape(-1, 1, 2)
+                        _unw_b = cv2.perspectiveTransform(_cam_b, _uM).reshape(-1, 2)
+                        _vmask = (_unw_c[:, 0] >= 25.0) & (_unw_c[:, 0] <= float(self.canonical_w - 25))
+                        if np.sum(_vmask) >= 20:
+                            self._last_unwarp_contour = _unw_c[_vmask].copy()
+                            self._last_unwarp_baseline = _unw_b[_vmask, 1].copy()
+                        else:
+                            self._last_unwarp_contour = _unw_c.copy()
+                            self._last_unwarp_baseline = _unw_b[:, 1].copy()
+                except Exception:
+                    pass
+
+            if is_tier4:
+                p_min = min(self.prime_min_y, self._legacy_prime_min_y)
+                p_max = max(self.prime_max_y, self._legacy_prime_max_y)
+                is_in_prime = (p_min <= med_top_y <= p_max)
+            else:
+                is_in_prime = (self._legacy_prime_min_y <= med_top_y <= self._legacy_prime_max_y)
 
             if not full_span_valid:
                 # Kontur belum membentang utuh -> Tahan penilaian metrologi, hindari lonjakan Sagitta palsu
@@ -3120,28 +3825,92 @@ class HybridRibInspector:
                 inner_dev = 0.0
                 tip_dev = 0.0
             else:
-                pv = float(np.percentile(dev, 98) - np.percentile(dev, 2))
-                max_dev = float(np.max(np.abs(dev)))
+                # SOLUSI 1: TEMPORAL MULTI-FRAME PROFILE FUSION KHUSUS TIER 4
+                if is_tier4 and is_in_prime and len(r_xs) >= 40:
+                    # Normalisasi profil span [0.0, 1.0] agar bebas dari variasi panjang bilah, FOV kamera, & perspective skew
+                    norm_grid = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+                    r_norm_x = (r_xs - r_xs[0]) / max(1.0, float(r_xs[-1] - r_xs[0]))
+                    dev_resampled = np.interp(norm_grid, r_norm_x, dev).astype(np.float32)
+                    self.tier4_profile_history.append(dev_resampled)
+                    if len(self.tier4_profile_history) > 20:
+                        self.tier4_profile_history = self.tier4_profile_history[-20:]
 
-                # Evaluasi Deviasi Badan vs Ujung (Tip) Pure Default Legacy (75px):
-                tip_zone_px = 75.0
-                left_tip_mask = (r_xs < (r_xs[0] + tip_zone_px))
-                right_tip_mask = (r_xs > (r_xs[-1] - tip_zone_px))
-                tip_mask = left_tip_mask | right_tip_mask
+                    # Jika sudah ada minimal 3 sampel di prime zone, gunakan Fused Profile
+                    if len(self.tier4_profile_history) >= 3:
+                        fused_dev = np.median(np.array(self.tier4_profile_history), axis=0)
+                        self.tier4_fused_dev = fused_dev
 
-                left_tip_dev = float(np.percentile(np.abs(dev[left_tip_mask]), 95)) if np.any(left_tip_mask) and np.sum(left_tip_mask) >= 4 else 0.0
-                right_tip_dev = float(np.percentile(np.abs(dev[right_tip_mask]), 95)) if np.any(right_tip_mask) and np.sum(right_tip_mask) >= 4 else 0.0
-                tip_dev = max(left_tip_dev, right_tip_dev)
+                        # Hitung metrologi kelurusan dari Fused Profile (100% bebas noise instan)
+                        pv = float(np.percentile(fused_dev, 98) - np.percentile(fused_dev, 2))
+                        max_dev = float(np.max(np.abs(fused_dev)))
 
-                inner_mask = ~tip_mask
-                if np.any(inner_mask):
-                    inner_dev = float(np.percentile(np.abs(dev[inner_mask]), 98))
+                        poly2_fused = np.polyfit(norm_grid, fused_dev, deg=2)
+                        sagitta = abs(float(poly2_fused[0])) * 0.25
+                        quad_fused_dev = fused_dev - np.polyval(poly2_fused, norm_grid)
+
+                        # Zona ujung fisik terkalibrasi (margin bevel 1.8% terluar dikecualikan agar chamfer sudut tidak spike)
+                        # Tip diukur dari residual kuadratik agar lengkungan perspektif seragam tidak memicu False NG.
+                        left_tip_mask = (norm_grid >= 0.018) & (norm_grid < 0.095)
+                        right_tip_mask = (norm_grid <= 0.982) & (norm_grid > 0.905)
+                        tip_mask = (norm_grid < 0.095) | (norm_grid > 0.905)
+
+                        left_tip_dev = float(np.percentile(np.abs(quad_fused_dev[left_tip_mask]), 95)) if np.any(left_tip_mask) else 0.0
+                        right_tip_dev = float(np.percentile(np.abs(quad_fused_dev[right_tip_mask]), 95)) if np.any(right_tip_mask) else 0.0
+                        tip_dev = max(left_tip_dev, right_tip_dev)
+
+                        inner_mask = ~tip_mask
+                        inner_dev = float(np.percentile(np.abs(fused_dev[inner_mask]), 98)) if np.any(inner_mask) else max_dev
+
+                        # Sinkronkan kembali smooth_ys ke kontur yang sudah difusi agar tampilan GUI tenang dan mulus
+                        fused_dev_at_rxs = np.interp(r_norm_x, norm_grid, fused_dev)
+                        smooth_ys = (baseline + fused_dev_at_rxs).astype(np.float32)
+                        if getattr(self, "_last_hough_diag", None) is not None and isinstance(self._last_hough_diag, dict):
+                            self._last_hough_diag["smooth_ys"] = smooth_ys
+                    else:
+                        pv = float(np.percentile(dev_resampled, 98) - np.percentile(dev_resampled, 2))
+                        max_dev = float(np.max(np.abs(dev_resampled)))
+                        poly2 = np.polyfit(norm_grid, dev_resampled, deg=2)
+                        sagitta = abs(float(poly2[0])) * 0.25
+                        quad_res_dev = dev_resampled - np.polyval(poly2, norm_grid)
+                        left_tip_mask = (norm_grid >= 0.018) & (norm_grid < 0.095)
+                        right_tip_mask = (norm_grid <= 0.982) & (norm_grid > 0.905)
+                        tip_mask = (norm_grid < 0.095) | (norm_grid > 0.905)
+                        left_tip_dev = float(np.percentile(np.abs(quad_res_dev[left_tip_mask]), 95)) if np.any(left_tip_mask) else 0.0
+                        right_tip_dev = float(np.percentile(np.abs(quad_res_dev[right_tip_mask]), 95)) if np.any(right_tip_mask) else 0.0
+                        tip_dev = max(left_tip_dev, right_tip_dev)
+                        inner_mask = ~tip_mask
+                        inner_dev = float(np.percentile(np.abs(dev_resampled[inner_mask]), 98)) if np.any(inner_mask) else max_dev
                 else:
-                    inner_dev = max_dev
-
-                # Regresi Polinomial Parabola Orde-2 (Kelengkungan Sagitta)
-                poly2 = np.polyfit(r_xs, smooth_ys, deg=2)
-                sagitta = abs(float(poly2[0])) * ((w_span / 2.0) ** 2)
+                    # Metrologi default untuk LEGACY & TIER 1
+                    # Margin bevel_skip_px=18.0 mengecualikan bevel/chamfer sudut terluar pabrik (cegah false NG F477)
+                    # sementara bent tip struktural (seperti F1224 sepanjang ~150px) tetap tertangkap penuh di zona [18..92]px.
+                    # Anti-Distorsi Ujung: PV dihitung dari bagian DALAM 80% kontur (buang 10% ujung kiri/kanan).
+                    # Ujung kontur rentan terhadap bayangan celah slat, karat tepi, dan area kurang kontras →
+                    # 1–2 titik outlier di ujung bisa mendistorsi PV global (contoh: PV=22px padahal inner_dev=4.8px).
+                    _n_pv = len(r_xs)
+                    _inner_start_pv = max(0, int(_n_pv * 0.10))
+                    _inner_end_pv   = min(_n_pv, int(_n_pv * 0.90))
+                    _dev_inner_pv   = dev[_inner_start_pv:_inner_end_pv]
+                    if len(_dev_inner_pv) >= 20:
+                        pv = float(np.percentile(_dev_inner_pv, 98) - np.percentile(_dev_inner_pv, 2))
+                    else:
+                        pv = float(np.percentile(dev, 98) - np.percentile(dev, 2))
+                    max_dev = float(np.max(np.abs(dev)))
+                    # Evaluasi TipDev relatif terhadap baseline kuadratik (poly2) agar kelengkungan perspektif
+                    # atau arching global bilah lurus (Sagitta ~7-11px) tidak salah terdeteksi sebagai tekukan ujung lokal.
+                    poly2 = np.polyfit(r_xs, smooth_ys, deg=2)
+                    sagitta = abs(float(poly2[0])) * ((w_span / 2.0) ** 2)
+                    quad_dev = smooth_ys - np.polyval(poly2, r_xs)
+                    bevel_skip_px = 18.0
+                    tip_zone_px = 92.0
+                    left_tip_mask = (r_xs >= (r_xs[0] + bevel_skip_px)) & (r_xs < (r_xs[0] + tip_zone_px))
+                    right_tip_mask = (r_xs <= (r_xs[-1] - bevel_skip_px)) & (r_xs > (r_xs[-1] - tip_zone_px))
+                    tip_mask = (r_xs < (r_xs[0] + tip_zone_px)) | (r_xs > (r_xs[-1] - tip_zone_px))
+                    left_tip_dev = float(np.percentile(np.abs(quad_dev[left_tip_mask]), 95)) if np.any(left_tip_mask) and np.sum(left_tip_mask) >= 4 else 0.0
+                    right_tip_dev = float(np.percentile(np.abs(quad_dev[right_tip_mask]), 95)) if np.any(right_tip_mask) and np.sum(right_tip_mask) >= 4 else 0.0
+                    tip_dev = max(left_tip_dev, right_tip_dev)
+                    inner_mask = ~tip_mask
+                    inner_dev = float(np.percentile(np.abs(dev[inner_mask]), 98)) if np.any(inner_mask) else max_dev
 
                 # Hanya kumpulkan sampel metrologi jika berada di zona prime konveyor dan kontur utuh!
                 if is_in_prime:
@@ -3149,18 +3918,24 @@ class HybridRibInspector:
                     self.prime_sagitta_samples.append(sagitta)
                     self.prime_inner_dev_samples.append(inner_dev)
                     self.prime_tip_dev_samples.append(tip_dev)
+                    # Sliding window cap untuk semua engine: pertahankan maksimal 25 sampel terbaru
+                    # agar sampel transisi awal tergeser setelah rib stabil di tengah zona prime.
+                    if len(self.prime_pv_samples) > 25:
+                        self.prime_pv_samples = self.prime_pv_samples[-25:]
+                        self.prime_sagitta_samples = self.prime_sagitta_samples[-25:]
+                        self.prime_inner_dev_samples = self.prime_inner_dev_samples[-25:]
+                        self.prime_tip_dev_samples = self.prime_tip_dev_samples[-25:]
 
         # KONSENSUS METROLOGI PRIME ZONE
-        # Threshold minimum sampel bersifat engine-specific:
-        # - TIER3_UNWARP: 5 sampel (prime zone terkalibrasi Y=305-385px bebas distorsi lensa & seam)
-        # - LEGACY / TIER1 / TIER2: 3 sampel (prime zone 340-460px, perilaku asli terbukti stabil)
-        is_tier3_for_consensus = (self.tracker_engine == "TIER3_UNWARP")
-        min_samples_required = 5 if is_tier3_for_consensus else 3
+        # - TIER4_HOUGH_STITCH: 4 sampel agar profil fusi stabil
+        # - LEGACY / TIER1: 8 sampel di zona prime planar [355..435px] agar lonjakan noise awal transisi
+        #   tidak langsung mengunci status NG prematur (aman untuk video redup & cepat berdurasi 13-18 sampel/rib).
+        min_samples_required = 4 if self.tracker_engine == "TIER4_HOUGH_STITCH" else 8
         sample_count = len(self.prime_pv_samples)
+        is_tier3_for_consensus = False
 
         if not is_tier3_for_consensus:
-            # Pure Default Legacy (100% identik dengan implementasi asli Git HEAD)
-            if sample_count >= 3:
+            if sample_count >= min_samples_required:
                 eval_pv = float(np.median(self.prime_pv_samples))
                 eval_sag = float(np.median(self.prime_sagitta_samples))
                 eval_idev = float(np.median(self.prime_inner_dev_samples))
@@ -3169,7 +3944,7 @@ class HybridRibInspector:
                 eval_pv, eval_sag, eval_idev, eval_tdev = pv, sagitta, inner_dev, tip_dev
 
             curv_defect = (eval_sag > self.sagitta_thresh and eval_pv > self.pv_thresh) or (eval_sag > 14.5)
-            dev_defect = (eval_idev > self.dev_thresh and eval_pv > self.pv_thresh) or (eval_idev > 12.0)
+            dev_defect = (eval_idev > self.dev_thresh)
             tip_defect = (eval_tdev > self.tip_thresh)
             flat_defect = (eval_pv > 18.0)
             transit_is_ok = not (curv_defect or dev_defect or tip_defect or flat_defect)
@@ -3184,17 +3959,22 @@ class HybridRibInspector:
                 eval_pv, eval_sag, eval_idev, eval_tdev = pv, sagitta, inner_dev, tip_dev
 
             curv_defect = (eval_sag > self.sagitta_thresh and eval_pv > self.pv_thresh) or (eval_sag > 14.5)
-            dev_defect = (eval_idev > self.dev_thresh and eval_pv > self.pv_thresh) or (eval_idev > 12.0)
-            tip_defect = (eval_tdev > self.tip_thresh)
+            dev_defect = (eval_idev > self.dev_thresh)
+            _tier3_tip_thresh = max(self.tip_thresh, 12.0)
+            tip_defect = (eval_tdev > _tier3_tip_thresh)
             flat_defect = (eval_pv > 18.0)
             transit_is_ok = not (curv_defect or dev_defect or tip_defect or flat_defect)
 
-        if transit_is_ok:
-            self.active_consec_ok += 1
-            self.active_consec_ng = 0
-        else:
-            self.active_consec_ng += 1
-            self.active_consec_ok = 0
+        # Pembaruan suara konsensus & transisi status hanya diizinkan saat bilah berada di dalam
+        # Prime Zone dengan span utuh, sehingga distorsi/foreshortening saat keluar tidak membalik vonis.
+        can_update_vote = bool(is_in_prime and full_span_valid)
+        if can_update_vote:
+            if transit_is_ok:
+                self.active_consec_ok += 1
+                self.active_consec_ng = 0
+            else:
+                self.active_consec_ng += 1
+                self.active_consec_ok = 0
 
         # Registrasi Objek & Pembaruan Status Berbasis Konsensus Transaksional
         if sample_count < min_samples_required:
@@ -3205,23 +3985,46 @@ class HybridRibInspector:
             # Sampel prime zone cukup → Tentukan status definitif berbasis konsensus
             new_status = "OK" if transit_is_ok else "NG"
             if self.current_rib_status is None:
-                self.rib_count += 1
-                self.current_rib_status = new_status
-                if new_status == "OK":
-                    self.ok_count += 1
+                # Butuh minimal 2 konfirmasi berturut-turut di Prime Zone untuk registrasi status pertama kali
+                if can_update_vote and ((new_status == "OK" and self.active_consec_ok >= 2) or (new_status == "NG" and self.active_consec_ng >= 2)):
+                    self.rib_count += 1
+                    self.current_rib_status = new_status
+                    if new_status == "OK":
+                        self.ok_count += 1
+                    else:
+                        self.ng_count += 1
                 else:
-                    self.ng_count += 1
-            elif self.current_rib_status != new_status:
-                if self.current_rib_status == "OK" and new_status == "NG":
+                    status = "WAIT"
+                    eval_msg = f"Menunggu Konfirmasi Status ({self.active_consec_ok} OK / {self.active_consec_ng} NG)"
+            elif can_update_vote and self.current_rib_status != new_status:
+                # Anti-flicker & Deadband Hysteresis:
+                # - OK -> NG: butuh 3 frame konfirmasi berturut-turut di Prime Zone
+                # - NG -> OK: hanya jika seluruh metrik turun di bawah deadband histeresis (<= 0.96 * thresh)
+                #   selama >= 5 frame berturut-turut di Prime Zone, cukup untuk memulihkan rib lurus (mis. #10/#12)
+                #   tanpa membalik kasus cacat ujung nyata yang bertahan >7.4px (mis. Rib #3, Fwd #27).
+                if self.current_rib_status == "OK" and new_status == "NG" and self.active_consec_ng >= 3:
                     self.current_rib_status = "NG"
                     self.ok_count = max(0, self.ok_count - 1)
                     self.ng_count += 1
-                elif self.current_rib_status == "NG" and new_status == "OK":
-                    self.current_rib_status = "OK"
-                    self.ng_count = max(0, self.ng_count - 1)
-                    self.ok_count += 1
+                elif self.current_rib_status == "NG" and new_status == "OK" and self.active_consec_ok >= 5:
+                    hyst_ok = (
+                        eval_tdev <= 0.96 * self.tip_thresh
+                        and eval_idev <= 0.96 * self.dev_thresh
+                        and eval_pv <= 0.96 * 18.0
+                        and eval_sag <= 0.96 * 14.5
+                        and not (eval_sag > 0.96 * self.sagitta_thresh and eval_pv > 0.96 * self.pv_thresh)
+                    )
+                    if hyst_ok:
+                        self.current_rib_status = "OK"
+                        self.ng_count = max(0, self.ng_count - 1)
+                        self.ok_count += 1
 
             status = self.current_rib_status if self.current_rib_status is not None else "WAIT"
+            # Hitung severity level bending (LOW/MEDIUM/HIGH) konsisten dengan vonis aktual
+            ng_severity = self.compute_ng_severity(
+                eval_pv, eval_sag, eval_idev, eval_tdev, is_ng=(status == "NG")
+            ) if status == "NG" else "OK"
+
             if status == "OK":
                 self.last_ng_reason = None
                 eval_msg = f"SIRIP LURUS (OK) | Top Y={med_top_y}px | PV={eval_pv:.1f}px, Sag={eval_sag:.1f}px, Dev={eval_idev:.1f}px, Tip={eval_tdev:.1f}px"
@@ -3236,9 +4039,13 @@ class HybridRibInspector:
                 if tip_defect:
                     ng_reasons.append(f"TipDev={eval_tdev:.1f}>{self.tip_thresh:.1f}px")
                 self.last_ng_reason = " | ".join(ng_reasons) if ng_reasons else f"TipDev={eval_tdev:.1f}>{self.tip_thresh:.1f}px"
-                eval_msg = f"SIRIP BENGKOK (NG) | {self.last_ng_reason}"
+                eval_msg = f"SIRIP BENGKOK (NG - {ng_severity}) | {self.last_ng_reason}"
             else:
                 eval_msg = f"Menunggu Konfirmasi Status ({self.active_consec_ok} OK / {self.active_consec_ng} NG | Span={w_span:.0f}px)"
+
+        # Pastikan ng_severity selalu terdefinisi di cabang sample_count < min_samples_required
+        if sample_count < min_samples_required:
+            ng_severity = "OK"
 
         self.last_presence = True
 
@@ -3258,7 +4065,8 @@ class HybridRibInspector:
             "is_rib_present": True,
             "is_ok": (status == "OK"),
             "is_ng": (status == "NG"),
-            "final_consensus_ready": bool(sample_count >= 3),
+            "ng_severity": ng_severity,          # 'OK' | 'LOW' | 'MEDIUM' | 'HIGH'
+            "final_consensus_ready": bool(sample_count >= min_samples_required and self.current_rib_status is not None),
             "rib_count": self.rib_count,
             "mode": self.mode,
             "tracker_engine": self.tracker_engine,
@@ -3271,6 +4079,7 @@ class HybridRibInspector:
             "inner_dev": eval_idev,
             "tip_dev": eval_tdev,
             "coverage": coverage,
+            "active_rib_frames": self.active_rib_frames,
             "rib_height": 110,
             "active_box": refined_box,
             "zone_rect": zone_rect,
@@ -3378,21 +4187,27 @@ class HybridRibInspector:
         hud = np.zeros((260, 1000, 3), dtype=np.uint8)
         hud[:] = (18, 18, 22)
 
-        # Badge Status Utama (OK, NG, WAIT)
+        # Badge Status Utama (OK, NG, WAIT) + Indikator Severity Bending (LOW/MEDIUM/HIGH)
+        ng_sev = res.get("ng_severity", "OK")
         cv2.rectangle(hud, (15, 12), (180, 70), badge_bg, -1)
-        stat_x = 55 if len(status) == 2 else (35 if len(status) == 4 else 45)
-        cv2.putText(hud, status, (stat_x, 54), cv2.FONT_HERSHEY_DUPLEX, 1.3, (255, 255, 255), 3, cv2.LINE_AA)
+        if status == "NG" and ng_sev in ("LOW", "MEDIUM", "HIGH"):
+            cv2.putText(hud, status, (66, 46), cv2.FONT_HERSHEY_DUPLEX, 1.15, (255, 255, 255), 3, cv2.LINE_AA)
+            sev_colors = {
+                "LOW": (0, 215, 255),     # Kuning-oranye (peringatan awal)
+                "MEDIUM": (0, 140, 255),  # Oranye pekat (sedang)
+                "HIGH": (255, 255, 255),  # Putih kontras di atas merah (parah)
+            }
+            sev_txt = f"LEVEL: {ng_sev}"
+            sev_x = 58 if ng_sev != "MEDIUM" else 44
+            cv2.putText(hud, sev_txt, (sev_x, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.42, sev_colors.get(ng_sev, (255, 255, 255)), 1, cv2.LINE_AA)
+        else:
+            stat_x = 55 if len(status) == 2 else (35 if len(status) == 4 else 45)
+            cv2.putText(hud, status, (stat_x, 54), cv2.FONT_HERSHEY_DUPLEX, 1.3, (255, 255, 255), 3, cv2.LINE_AA)
 
-        # Status Teks Header & Indikator Sakelar Engine (5-Way Toggle)
+        # Status Teks Header & Indikator Sakelar Engine (3-Way Toggle)
         if self.tracker_engine == "TIER4_HOUGH_STITCH":
             engine_str = "TIER 4 (MICRO-HOUGHLET STITCHING)"
             engine_col = (255, 180, 50)
-        elif self.tracker_engine == "TIER3_UNWARP":
-            engine_str = "TIER 3 (YOLO-SEGMENTATION + UNWARP)"
-            engine_col = (0, 220, 255)
-        elif self.tracker_engine == "TIER2_YOLO_POSE":
-            engine_str = "TIER 2 (YOLO-POSE)"
-            engine_col = (255, 120, 255)
         elif self.tracker_engine == "TIER1_VITERBI":
             engine_str = "TIER 1 (VITERBI V2)"
             engine_col = (0, 255, 200)
@@ -3491,7 +4306,7 @@ def main():
     print("  - [SPACE] / [P] : Pause / Play Video (Jeda atau Lanjutkan)")
     print("  - [D] / [→]     : Maju 1 Frame (Step Forward saat Video Dijeda)")
     print("  - [A] / [←]     : Mundur 1 Frame (Step Backward saat Video Dijeda)")
-    print("  - [T] / [E]     : Toggle Tracker Engine (DEFAULT LEGACY <-> TIER 1 VITERBI <-> TIER 2 POSE <-> TIER 3 UNWARP <-> TIER 4 HOUGH STITCH)")
+    print("  - [T] / [E]     : Toggle Tracker Engine (DEFAULT LEGACY <-> TIER 1 VITERBI <-> TIER 4 HOUGH STITCH)")
     print("  - [M]           : Beralih Mode (HYBRID <-> YOLO_ONLY <-> DUAL_POLARITY_ONLY)")
     print("  - [O] / [F]     : Buka File Dialog Explorer (Pilih Video / Foto Baru)")
     print("  - [V]           : Beralih ke Video Berikutnya dalam Playlist")

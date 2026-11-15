@@ -338,11 +338,12 @@ class CombinedTopInspector:
         min_cov_slat = 0.25
 
         # 2. Parameter Default Sirip (Rib)
-        rib_pv = 14.0
+        rib_pv = 11.4
         rib_sag = 11.5
-        rib_dev = 8.5
-        rib_tip = 9.5
+        rib_dev = 8.0
+        rib_tip = 7.0
         rib_conf = 0.55
+        rib_sev_zones = None
 
         # Polygon cache
         self.slat_polygon = None
@@ -399,6 +400,7 @@ class CombinedTopInspector:
                 rib_dev = float(th.get("rib_dev_threshold", th.get("rib_max_dev_threshold", rib_dev)))
                 rib_tip = float(th.get("rib_tip_threshold", rib_tip))
                 rib_conf = float(th.get("rib_conf_threshold", rib_conf))
+                rib_sev_zones = th.get("rib_severity_zones", None)
                 self.config_rib_prime_min = th.get("rib_prime_min_y", None)
                 self.config_rib_prime_max = th.get("rib_prime_max_y", None)
 
@@ -464,6 +466,16 @@ class CombinedTopInspector:
         )
         self.rib_inspector.scale_factor_mm_per_px = self.scale_factor_mm_per_px
         self.rib_inspector.scale_factor_y_mm_per_px = self.scale_factor_y_mm_per_px
+        if rib_sev_zones:
+            self.rib_inspector._severity_zones = rib_sev_zones
+
+        # Fase 2: Muat adaptive threshold dari Rib_Dataset jika db_bridge sudah tersedia,
+        # difilter per profil kamera agar dataset posisi berbeda tidak tercampur
+        if self.db_bridge is not None and hasattr(self.db_bridge, "db_path"):
+            self.rib_inspector.load_adaptive_thresholds(
+                db_path=self.db_bridge.db_path,
+                camera_profile=self.active_profile_name or None
+            )
 
         # Konfigurasi Prime Zone Sirip (Adaptif & Fleksibel)
         cfg_pmin = getattr(self, "config_rib_prime_min", None)
@@ -471,7 +483,7 @@ class CombinedTopInspector:
         if cfg_pmin is not None and cfg_pmax is not None:
             self.rib_inspector.set_prime_zone(cfg_pmin, cfg_pmax)
         else:
-            self.rib_inspector.set_prime_zone(360, 430)
+            self.rib_inspector.set_prime_zone(355, 435)
 
         # Variabel State Kalibrasi Cepat Konveyor (Quick Re-Alignment)
         self.is_calibrating = False
@@ -608,9 +620,11 @@ class CombinedTopInspector:
                 self.rib_inspector.dev_thresh = float(dev_val)
             if "rib_tip_threshold" in th:
                 self.rib_inspector.tip_thresh = float(th["rib_tip_threshold"])
+            if "rib_severity_zones" in th:
+                self.rib_inspector._severity_zones = th["rib_severity_zones"]
 
-            pmin = th.get("rib_prime_min_y", 360)
-            pmax = th.get("rib_prime_max_y", 430)
+            pmin = th.get("rib_prime_min_y", 355)
+            pmax = th.get("rib_prime_max_y", 435)
             self.rib_inspector.set_prime_zone(pmin, pmax)
 
             if "slat_polygon" in cfg and len(cfg["slat_polygon"]) >= 4:
@@ -649,7 +663,12 @@ class CombinedTopInspector:
                 with open(self.config_path, "w") as f:
                     json.dump(cfg_default, f, indent=2)
 
-                self.active_profile_name = "DEFAULT_STABIL"
+                self.active_profile_name = cfg_default.get("profile_name", "DEFAULT_STABIL")
+                if self.db_bridge is not None and hasattr(self.db_bridge, "db_path"):
+                    self.rib_inspector.load_adaptive_thresholds(
+                        db_path=self.db_bridge.db_path,
+                        camera_profile=self.active_profile_name or None
+                    )
                 self.profile_banner_text = "PROFIL PULIH: DEFAULT STABIL (Tanpa Rektifikasi)"
                 self.profile_banner_timer = 90
                 print("\n" + "=" * 70)
@@ -682,7 +701,12 @@ class CombinedTopInspector:
                 with open(self.config_path, "w") as f:
                     json.dump(cfg_calib, f, indent=2)
 
-                self.active_profile_name = "HASIL_KALIBRASI"
+                self.active_profile_name = cfg_calib.get("profile_name", "HASIL_KALIBRASI")
+                if self.db_bridge is not None and hasattr(self.db_bridge, "db_path"):
+                    self.rib_inspector.load_adaptive_thresholds(
+                        db_path=self.db_bridge.db_path,
+                        camera_profile=self.active_profile_name or None
+                    )
                 self.profile_banner_text = "PROFIL AKTIF: HASIL KALIBRASI (Rektifikasi Aktif)"
                 self.profile_banner_timer = 90
                 print("\n" + "=" * 70)
@@ -1317,7 +1341,10 @@ class CombinedTopInspector:
                     sample_strip = frame_for_slat[sample_y1:sample_y2, max(0, bx1):min(w_f, bx2)]
 
                 if sample_strip.size > 0:
-                    med_col = np.median(sample_strip.reshape(-1, 3), axis=0).astype(np.uint8)
+                    sub_strip = sample_strip[::2, ::8]
+                    if sub_strip.size == 0:
+                        sub_strip = sample_strip
+                    med_col = np.median(sub_strip.reshape(-1, 3), axis=0).astype(np.uint8)
                 else:
                     med_col = np.array([80, 80, 80], dtype=np.uint8)
 
@@ -1632,32 +1659,36 @@ class CombinedTopInspector:
         if self._screen_buf is None:
             self._screen_buf = np.zeros((820, 1000, 3), dtype=np.uint8)
 
-        # Zero-copy canvas: langsung resize frame ke canvas atas (1000 x 520) tanpa copy 1080p
+        sx = 1000.0 / float(w_f)
+        sy = 520.0 / float(h_f)
         main_resized = self._screen_buf[:520, :]
         if getattr(self, "rect_matrix", None) is not None:
             if self.rect_matrix.shape == (3, 3):
-                frame_warped = cv2.warpPerspective(
+                m_disp = self.rect_matrix.copy()
+                m_disp[0, :] *= sx
+                m_disp[1, :] *= sy
+                cv2.warpPerspective(
                     frame,
-                    self.rect_matrix,
-                    (w_f, h_f),
+                    m_disp,
+                    (1000, 520),
+                    dst=main_resized,
                     flags=cv2.INTER_LINEAR,
                     borderMode=cv2.BORDER_REPLICATE
                 )
             else:
-                frame_warped = cv2.warpAffine(
+                m_disp = self.rect_matrix.copy()
+                m_disp[0, :] *= sx
+                m_disp[1, :] *= sy
+                cv2.warpAffine(
                     frame,
-                    self.rect_matrix,
-                    (w_f, h_f),
+                    m_disp,
+                    (1000, 520),
+                    dst=main_resized,
                     flags=cv2.INTER_LINEAR,
                     borderMode=cv2.BORDER_REPLICATE
                 )
-            cv2.resize(frame_warped, (1000, 520), dst=main_resized, interpolation=cv2.INTER_LINEAR)
         else:
             cv2.resize(frame, (1000, 520), dst=main_resized, interpolation=cv2.INTER_LINEAR)
-
-        # Faktor skala koordinat dari resolusi citra asli (w_f, h_f) ke tampilan (1000, 520)
-        sx = 1000.0 / float(w_f)
-        sy = 520.0 / float(h_f)
 
         slat_res = inspect_result.get("slat_res", {})
         rib_res = inspect_result.get("rib_res", {})
@@ -1919,8 +1950,8 @@ class CombinedTopInspector:
         # ----------------------------------------------------------------------
         cv2.rectangle(hud, (495, 96), (985, 184), (28, 28, 36), -1)
         cv2.rectangle(hud, (495, 96), (985, 184), (60, 60, 75), 1)
-        if getattr(self.rib_inspector, "tracker_engine", "LEGACY") == "TIER2_YOLO_POSE":
-            eng_badge = "POSE"
+        if getattr(self.rib_inspector, "tracker_engine", "LEGACY") == "TIER4_HOUGH_STITCH":
+            eng_badge = "HOUGH"
         elif getattr(self.rib_inspector, "tracker_engine", "LEGACY") == "TIER1_VITERBI":
             eng_badge = "VITERBI"
         else:
@@ -1933,6 +1964,8 @@ class CombinedTopInspector:
         r_dev = rib_res.get("inner_dev", 0.0) if rib_res else 0.0
         r_tip = rib_res.get("tip_dev", 0.0) if rib_res else 0.0
         r_stat = rib_res.get("status", "WAIT") if rib_res else "WAIT"
+        r_sev = rib_res.get("ng_severity", "OK") if rib_res else "OK"
+        r_stat_disp = f"{r_stat}:{r_sev}" if (r_stat == "NG" and r_sev in ("LOW", "MEDIUM", "HIGH")) else r_stat
 
         rpv_c = (0, 255, 0) if r_pv <= self.rib_inspector.pv_thresh else (0, 0, 255)
         rsag_c = (0, 255, 0) if r_sag <= self.rib_inspector.sagitta_thresh else (0, 0, 255)
@@ -1951,8 +1984,8 @@ class CombinedTopInspector:
                     (505, 158), cv2.FONT_HERSHEY_SIMPLEX, 0.44, rdev_c, 1, cv2.LINE_AA)
         rib_conf = float(rib_res.get("confidence", 0.0) or 0.0)
         conf_r_str = f" | Conf: {rib_conf:.2f}" if rib_conf > 0 else ""
-        cv2.putText(hud, f"QC SIRIP RIB: #{self.rib_inspector.rib_count:02d}{conf_r_str} | OK: {self.rib_inspector.ok_count} | NG: {self.rib_inspector.ng_count} | [{r_stat}]",
-                    (505, 178), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 240, 180), 2, cv2.LINE_AA)
+        cv2.putText(hud, f"QC SIRIP RIB: #{self.rib_inspector.rib_count:02d}{conf_r_str} | OK: {self.rib_inspector.ok_count} | NG: {self.rib_inspector.ng_count} | [{r_stat_disp}]",
+                    (505, 178), cv2.FONT_HERSHEY_SIMPLEX, 0.47, (180, 240, 180), 2, cv2.LINE_AA)
 
         # ----------------------------------------------------------------------
         # FOOTER PANDUAN KONTROL & PINTASAN KEYBOARD (DIBESARKAN)
@@ -2001,6 +2034,9 @@ def main():
     print(f"  2. HybridRibInspector     -> hybrid_rib_inspector.py (Zona Deteksi Sirip - {pipeline.rib_inspector.device_info})")
     print("=" * 78)
 
+    # Inisialisasi daftar video playlist
+    sorted_videos = []
+
     # Cek sumber dari argumen atau dari .env
     current_source = args.source
     if not current_source:
@@ -2020,7 +2056,6 @@ def main():
             os.path.join(os.path.expanduser("~"), "Videos"),
             os.path.join(os.path.expanduser("~"), "Pictures"),
         ]
-        sorted_videos = []
         for sdir in search_dirs:
             if os.path.exists(sdir):
                 for f in sorted(os.listdir(sdir)):
@@ -2039,6 +2074,18 @@ def main():
     if not current_source:
         print("[ERROR] Tidak ada file video yang valid. Keluar.")
         return
+
+    # Jika sumber berupa file video, pastikan folder tersebut menjadi basis playlist
+    if isinstance(current_source, str) and os.path.isfile(current_source):
+        src_dir = os.path.dirname(os.path.abspath(current_source))
+        if os.path.exists(src_dir):
+            for f in sorted(os.listdir(src_dir)):
+                if f.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
+                    p = os.path.abspath(os.path.join(src_dir, f))
+                    if p not in sorted_videos:
+                        sorted_videos.append(p)
+        if current_source not in sorted_videos:
+            sorted_videos.append(os.path.abspath(current_source))
 
     # Untuk sumber video: gunakan AsyncFrameGrabber agar frame decode non-blocking
     grabber = None
