@@ -193,6 +193,53 @@ def finalize_pending_rib_dataset(recorder, previous):
     return recorder.finalize(result, rib_number, slat_number)
 
 
+def record_rib_dataset_step(
+    recorder,
+    inspector,
+    frame,
+    inspect_res,
+    avg_fps,
+    frame_idx,
+    total_frames,
+    last_rib_no,
+    previous,
+):
+    """Advance rib dataset state for one inspected frame with lazy annotation rendering."""
+    if recorder is None or not inspector or not inspector.is_db_enabled():
+        return last_rib_no, previous
+    active_profile = getattr(inspector, "active_profile_name", None)
+    if active_profile:
+        recorder.camera_profile = active_profile
+    rib_result = rib_result_for_dataset(
+        inspect_res.get("rib_res", {}), inspector.rib_inspector
+    )
+    current_rib_no = int(rib_result.get("rib_count", 0) or 0)
+    current_status = str(rib_result.get("status", "WAIT")).upper()
+    slat_number = getattr(inspector.slat_inspector, "slat_count", None)
+    if current_rib_no < last_rib_no:
+        finalize_pending_rib_dataset(recorder, previous)
+        recorder.start_new_session()
+        last_rib_no = 0
+        previous = None
+    if current_rib_no > last_rib_no:
+        if last_rib_no > 0 and previous is not None:
+            previous_result, previous_rib_no, previous_slat_no = previous
+            recorder.finalize(previous_result, previous_rib_no, previous_slat_no)
+        last_rib_no = current_rib_no
+    if current_status in {"OK", "NG"} and current_rib_no > 0:
+        if recorder.should_observe(rib_result, current_rib_no):
+            annotated = inspector.render_combined_dashboard(
+                frame=frame,
+                inspect_result=inspect_res,
+                fps=avg_fps,
+                frame_idx=frame_idx,
+                total_frames=total_frames,
+            )
+            recorder.observe(rib_result, frame, annotated, current_rib_no, slat_number)
+        previous = (dict(rib_result), current_rib_no, slat_number)
+    return last_rib_no, previous
+
+
 # Video Default CAM-01 Top Inspection (Plat Slat & Bilah Rib)
 ENV_TOP_VIDEO = os.environ.get("TOP_CAMERA_SOURCE")
 CANDIDATE_TOP_VIDEOS = [
@@ -824,6 +871,7 @@ def _run_top_worker(
             os.path.join(os.path.dirname(resolve_db_path()), "dataset_captures"),
             source_label="CAM-01 TOP",
             camera_profile=getattr(inspector, "active_profile_name", None),
+            async_write=True,
         )
     except Exception as e_dataset:
         dataset_recorder = None
@@ -899,33 +947,17 @@ def _run_top_worker(
             curr_stat = inspect_res.get("status", "WAIT")
             status_buf.value = curr_stat.encode("utf-8")[:63]
 
-            if dataset_recorder is not None and inspector.is_db_enabled():
-                rib_result = rib_result_for_dataset(
-                    inspect_res.get("rib_res", {}), inspector.rib_inspector
-                )
-                current_rib_no = int(rib_result.get("rib_count", 0) or 0)
-                current_status = str(rib_result.get("status", "WAIT")).upper()
-                slat_number = getattr(inspector.slat_inspector, "slat_count", None)
-                if current_rib_no < dataset_last_rib_no:
-                    finalize_pending_rib_dataset(dataset_recorder, dataset_previous)
-                    dataset_recorder.start_new_session()
-                    dataset_last_rib_no = 0
-                    dataset_previous = None
-                if current_rib_no > dataset_last_rib_no:
-                    if dataset_last_rib_no > 0 and dataset_previous is not None:
-                        previous_result, previous_rib_no, previous_slat_no = dataset_previous
-                        dataset_recorder.finalize(previous_result, previous_rib_no, previous_slat_no)
-                    dataset_last_rib_no = current_rib_no
-                if current_status in {"OK", "NG"} and current_rib_no > 0:
-                    annotated = inspector.render_combined_dashboard(
-                        frame=frame,
-                        inspect_result=inspect_res,
-                        fps=avg_fps,
-                        frame_idx=frame_count,
-                        total_frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0,
-                    )
-                    dataset_recorder.observe(rib_result, frame, annotated, current_rib_no, slat_number)
-                    dataset_previous = (dict(rib_result), current_rib_no, slat_number)
+            dataset_last_rib_no, dataset_previous = record_rib_dataset_step(
+                dataset_recorder,
+                inspector,
+                frame,
+                inspect_res,
+                avg_fps,
+                frame_count,
+                int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0,
+                dataset_last_rib_no,
+                dataset_previous,
+            )
 
             # Render Visual jika mode dual (Decoupled GUI Rendering)
             hud = None
@@ -1070,6 +1102,8 @@ def _run_top_worker(
         stop_event.set()
     finally:
         finalize_pending_rib_dataset(dataset_recorder, dataset_previous)
+        if dataset_recorder is not None:
+            dataset_recorder.close()
         cap.release()
         if mode == "dual":
             cv2.destroyWindow(win_name)
@@ -1479,6 +1513,7 @@ def _run_threaded_engine(args):
                 os.path.join(os.path.dirname(resolve_db_path()), "dataset_captures"),
                 source_label="CAM-01 TOP",
                 camera_profile=getattr(top_inspector, "active_profile_name", None),
+                async_write=True,
             )
         except Exception as e_dataset:
             print(f"[WARN] Perekam dataset rib tidak aktif: {e_dataset}")
@@ -1661,37 +1696,17 @@ def _run_threaded_engine(args):
 
                 # Satu bukti raw/annotated untuk setiap rib yang sudah final.
                 # Vonis detektor tidak diubah; perekam hanya mengarsipkan hasilnya.
-                if top_dataset_recorder is not None and top_inspector and top_inspector.is_db_enabled():
-                    rib_result = rib_result_for_dataset(
-                        inspect_res.get("rib_res", {}), top_inspector.rib_inspector
-                    )
-                    current_rib_no = int(rib_result.get("rib_count", 0) or 0)
-                    current_status = str(rib_result.get("status", "WAIT")).upper()
-                    slat_number = getattr(top_inspector.slat_inspector, "slat_count", None)
-                    if current_rib_no < dataset_last_rib_no:
-                        finalize_pending_rib_dataset(top_dataset_recorder, dataset_previous)
-                        top_dataset_recorder.start_new_session()
-                        dataset_last_rib_no = 0
-                        dataset_previous = None
-                    if current_rib_no > dataset_last_rib_no:
-                        if dataset_last_rib_no > 0 and dataset_previous is not None:
-                            previous_result, previous_rib_no, previous_slat_no = dataset_previous
-                            top_dataset_recorder.finalize(
-                                previous_result, previous_rib_no, previous_slat_no
-                            )
-                        dataset_last_rib_no = current_rib_no
-                    if current_status in {"OK", "NG"} and current_rib_no > 0:
-                        annotated = top_inspector.render_combined_dashboard(
-                            frame=frame,
-                            inspect_result=inspect_res,
-                            fps=avg_f,
-                            frame_idx=top_state["frames"] + 1,
-                            total_frames=total_f_top,
-                        )
-                        top_dataset_recorder.observe(
-                            rib_result, frame, annotated, current_rib_no, slat_number
-                        )
-                        dataset_previous = (dict(rib_result), current_rib_no, slat_number)
+                dataset_last_rib_no, dataset_previous = record_rib_dataset_step(
+                    top_dataset_recorder,
+                    top_inspector,
+                    frame,
+                    inspect_res,
+                    avg_f,
+                    top_state["frames"] + 1,
+                    total_f_top,
+                    dataset_last_rib_no,
+                    dataset_previous,
+                )
 
                 # Push data ke top_state untuk dirender asinkron oleh Main GUI Thread (Zero-Overhead di Thread AI)
                 with top_lock:
@@ -1710,6 +1725,8 @@ def _run_threaded_engine(args):
                 time.sleep(0.01)
 
         finalize_pending_rib_dataset(top_dataset_recorder, dataset_previous)
+        if top_dataset_recorder is not None:
+            top_dataset_recorder.close()
 
     # Worker Thread 2: Side Inspector
     def _side_loop():

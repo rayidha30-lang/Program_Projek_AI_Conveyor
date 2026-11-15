@@ -108,6 +108,95 @@ class RibDatasetRecorderTests(unittest.TestCase):
             self.assertNotEqual(first_id, second_id)
             self.assertEqual(store.sample_count(), 2)
 
+    def test_should_observe_only_accepts_strictly_better_eligible_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, recorder = self.make_recorder(directory)
+            frame = np.full((12, 12, 3), 50, dtype=np.uint8)
+            self.assertFalse(recorder.should_observe(rib_result(status="WAIT"), 1))
+            self.assertFalse(recorder.should_observe(rib_result(active_frames=14), 1))
+            self.assertTrue(recorder.should_observe(rib_result(coverage=0.80, confidence=0.50), 1))
+            recorder.observe(rib_result(coverage=0.80, confidence=0.50), frame, frame, 1, 1)
+            self.assertFalse(recorder.should_observe(rib_result(coverage=0.80, confidence=0.50), 1))
+            self.assertTrue(recorder.should_observe(rib_result(coverage=0.90, confidence=0.10), 1))
+
+    def test_recorder_survives_slat_number_change_mid_transit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, recorder = self.make_recorder(directory)
+            best = np.full((12, 12, 3), (40, 50, 60), dtype=np.uint8)
+            trailing = np.full((12, 12, 3), (10, 10, 10), dtype=np.uint8)
+            recorder.observe(rib_result(coverage=0.95, confidence=0.90), best, best, 5, 1)
+            recorder.observe(rib_result(coverage=0.70, confidence=0.50), trailing, trailing, 5, 2)
+
+            dataset_id = recorder.finalize(rib_result(coverage=0.70, confidence=0.50), 5, 2)
+            self.assertIsNotNone(dataset_id)
+            evidence = store.evidence_for(int(dataset_id))
+            written = cv2.imread(evidence["raw_image_path"])
+            self.assertEqual(written[0, 0].tolist(), [40, 50, 60])
+            self.assertEqual(store.fetch_sample(int(dataset_id))["slat_number"], 1)
+
+    def test_finalize_preserves_best_frame_geometry_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, recorder = self.make_recorder(directory)
+            frame = np.full((12, 12, 3), 70, dtype=np.uint8)
+            best_res = rib_result(status="OK", coverage=0.95, confidence=0.90, active_frames=18)
+            best_res["pv_flatness"] = 4.25
+            best_res["sagitta"] = 1.75
+            recorder.observe(best_res, frame, frame, 3, 1)
+
+            end_res = rib_result(status="NG", coverage=0.60, confidence=0.40, active_frames=26)
+            end_res["pv_flatness"] = 18.5
+            end_res["sagitta"] = 9.9
+            dataset_id = recorder.finalize(end_res, 3, 1)
+            self.assertIsNotNone(dataset_id)
+
+            sample = store.fetch_sample(int(dataset_id))
+            self.assertEqual(sample["model_label"], "NG")
+            self.assertEqual(sample["active_frames"], 26)
+            self.assertAlmostEqual(sample["pv_flatness"], 4.25)
+            self.assertAlmostEqual(sample["sagitta"], 1.75)
+
+    def test_async_write_persists_evidence_after_flush(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = DatasetReviewStore(os.path.join(directory, "review.db"))
+            recorder = RibDatasetRecorder(
+                store,
+                os.path.join(directory, "captures"),
+                session_id="async-session",
+                async_write=True,
+            )
+            frame = np.full((12, 12, 3), 120, dtype=np.uint8)
+            res = rib_result(status="OK")
+            recorder.observe(res, frame, frame, 4, 2)
+            recorder.finalize(res, 4, 2)
+            recorder.flush()
+            recorder.close()
+            self.assertEqual(store.sample_count(), 1)
+            self.assertEqual(store.evidence_count(), 1)
+
+    def test_recorder_ignores_transit_hysteresis_frames_without_box_or_contour(self):
+        """Empty hysteresis buffer frames with coverage=1.0 must never overwrite real rib frames."""
+        with tempfile.TemporaryDirectory() as directory:
+            store, recorder = self.make_recorder(directory)
+            real_frame = np.full((12, 12, 3), (40, 50, 60), dtype=np.uint8)
+            hysteresis_frame = np.full((12, 12, 3), (10, 10, 10), dtype=np.uint8)
+
+            real_res = rib_result(status="OK", coverage=0.92, confidence=0.85)
+            real_res["active_box"] = (10, 10, 100, 40)
+            recorder.observe(real_res, real_frame, real_frame, 6, 2)
+
+            hyst_res = rib_result(status="OK", coverage=1.0, confidence=0.99)
+            hyst_res["active_box"] = None
+            hyst_res["detection_reason"] = "Transit Hysteresis"
+            hyst_res.pop("ys_contour", None)
+            self.assertFalse(recorder.should_observe(hyst_res, 6))
+            recorder.observe(hyst_res, hysteresis_frame, hysteresis_frame, 6, 2)
+
+            dataset_id = recorder.finalize(hyst_res, 6, 2)
+            self.assertIsNotNone(dataset_id)
+            evidence = store.evidence_for(int(dataset_id))
+            written = cv2.imread(evidence["raw_image_path"])
+            self.assertEqual(written[0, 0].tolist(), [40, 50, 60])
+
 
 if __name__ == "__main__":
     unittest.main()

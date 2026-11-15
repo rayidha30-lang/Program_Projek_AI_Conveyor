@@ -295,7 +295,7 @@ class CombinedTopInspector:
         rib_model_path=None,
         device=None,
         enable_db=False,
-        force_default_on_start=True
+        force_default_on_start=False
     ):
         base_dir = os.path.dirname(CURRENT_DIR)
         if config_path is None:
@@ -310,12 +310,18 @@ class CombinedTopInspector:
         self.motion_calibrator = None
         self.device = device
 
-        # Geometri Acuan Emas (Golden Reference)
+        # Geometri Acuan Emas (Golden Reference - Trapesium Perspektif Posisi 3)
         self.ref_left_rail_px = 188.0
         self.ref_right_rail_px = 1759.0
         self.ref_center_x = 960.0
         self.ref_tilt_deg = 0.90
         self.ref_width_px = 1571.0
+        self.ref_y_top_px = 216.0
+        self.ref_y_bot_px = 864.0
+        self.ref_top_left_rail_px = 278.0
+        self.ref_top_right_rail_px = 1630.0
+        self.ref_bot_left_rail_px = 104.0
+        self.ref_bot_right_rail_px = 1808.0
         self.show_alignment_guides = False  # Sakelar Garis Panduan [G]
 
         # Inisialisasi Database Bridge (Default: False / Dry Run)
@@ -379,12 +385,7 @@ class CombinedTopInspector:
                     cp = cfg["calibration_profile"]
                     calib_mll = float(cp.get("calibrated_mll_ratio", calib_mll))
                     calib_v = float(cp.get("recommended_v_thresh", calib_v))
-                    gref = cp.get("golden_reference", {})
-                    self.ref_left_rail_px = float(gref.get("left_rail_px", cp.get("left_rail_px", self.ref_left_rail_px)))
-                    self.ref_right_rail_px = float(gref.get("right_rail_px", cp.get("right_rail_px", self.ref_right_rail_px)))
-                    self.ref_center_x = float(gref.get("target_cx", cp.get("conveyor_center_x", self.ref_center_x)))
-                    self.ref_tilt_deg = float(gref.get("target_tilt_deg", cp.get("bracket_tilt_deg", self.ref_tilt_deg)))
-                    self.ref_width_px = float(gref.get("conveyor_width_px", self.ref_right_rail_px - self.ref_left_rail_px))
+                    self._apply_golden_reference(cp)
 
                 th = cfg.get("thresholds", {})
                 max_pv_slat = float(th.get("max_flatness_pv", max_pv_slat))
@@ -508,6 +509,37 @@ class CombinedTopInspector:
         # Pre-allocated zero-copy canvas buffer (1000 x 820 px: 520 view + 300 HUD)
         self._screen_buf = np.zeros((820, 1000, 3), dtype=np.uint8)
 
+    def _apply_golden_reference(self, cp):
+        """Memuat koordinat acuan emas (termasuk trapesium rel Posisi 3) dari calibration_profile."""
+        gref = cp.get("golden_reference", {})
+        self.ref_left_rail_px = float(gref.get("left_rail_px", cp.get("left_rail_px", self.ref_left_rail_px)))
+        self.ref_right_rail_px = float(gref.get("right_rail_px", cp.get("right_rail_px", self.ref_right_rail_px)))
+        self.ref_center_x = float(gref.get("target_cx", cp.get("conveyor_center_x", self.ref_center_x)))
+        self.ref_tilt_deg = float(gref.get("target_tilt_deg", cp.get("bracket_tilt_deg", self.ref_tilt_deg)))
+        self.ref_width_px = float(gref.get("conveyor_width_px", self.ref_right_rail_px - self.ref_left_rail_px))
+        self.ref_y_top_px = float(gref.get("top_y_px", self.ref_y_top_px))
+        self.ref_y_bot_px = float(gref.get("bot_y_px", self.ref_y_bot_px))
+        self.ref_top_left_rail_px = float(gref.get("top_left_rail_px", self.ref_top_left_rail_px))
+        self.ref_top_right_rail_px = float(gref.get("top_right_rail_px", self.ref_top_right_rail_px))
+        self.ref_bot_left_rail_px = float(gref.get("bot_left_rail_px", self.ref_bot_left_rail_px))
+        self.ref_bot_right_rail_px = float(gref.get("bot_right_rail_px", self.ref_bot_right_rail_px))
+
+    def _golden_rail_x(self, side, y_val, w_f=1920, h_f=1080):
+        """Interpolasi linier X rel Acuan Emas pada tinggi y_val di koordinat frame."""
+        sx_f = float(w_f) / 1920.0
+        sy_f = float(h_f) / 1080.0
+        y_top_s = self.ref_y_top_px * sy_f
+        y_bot_s = self.ref_y_bot_px * sy_f
+        denom = max(1e-5, y_bot_s - y_top_s)
+        alpha = (float(y_val) - y_top_s) / denom
+        if side == "left":
+            x_top = self.ref_top_left_rail_px * sx_f
+            x_bot = self.ref_bot_left_rail_px * sx_f
+        else:
+            x_top = self.ref_top_right_rail_px * sx_f
+            x_bot = self.ref_bot_right_rail_px * sx_f
+        return float(x_top + alpha * (x_bot - x_top))
+
     def _update_slat_y_bounds(self, w_f=None, h_f=None):
         """Menghitung batas vertikal min/max gerbang slat secara aman tanpa pernah None."""
         if w_f is not None and w_f > 0:
@@ -589,13 +621,7 @@ class CombinedTopInspector:
                 self.rib_zone = cfg["rib_polygon"]
 
             if "calibration_profile" in cfg:
-                cp = cfg["calibration_profile"]
-                gref = cp.get("golden_reference", {})
-                self.ref_left_rail_px = float(gref.get("left_rail_px", cp.get("left_rail_px", self.ref_left_rail_px)))
-                self.ref_right_rail_px = float(gref.get("right_rail_px", cp.get("right_rail_px", self.ref_right_rail_px)))
-                self.ref_center_x = float(gref.get("target_cx", cp.get("conveyor_center_x", self.ref_center_x)))
-                self.ref_tilt_deg = float(gref.get("target_tilt_deg", cp.get("bracket_tilt_deg", self.ref_tilt_deg)))
-                self.ref_width_px = float(gref.get("conveyor_width_px", self.ref_right_rail_px - self.ref_left_rail_px))
+                self._apply_golden_reference(cfg["calibration_profile"])
 
             return True
 
@@ -777,7 +803,13 @@ class CombinedTopInspector:
                         "target_cx": getattr(self, "ref_center_x", 960.0),
                         "left_rail_px": int(getattr(self, "ref_left_rail_px", 188.0)),
                         "right_rail_px": int(getattr(self, "ref_right_rail_px", 1759.0)),
-                        "conveyor_width_px": int(getattr(self, "ref_width_px", 1571.0))
+                        "conveyor_width_px": int(getattr(self, "ref_width_px", 1571.0)),
+                        "top_y_px": int(getattr(self, "ref_y_top_px", 216.0)),
+                        "bot_y_px": int(getattr(self, "ref_y_bot_px", 864.0)),
+                        "top_left_rail_px": int(getattr(self, "ref_top_left_rail_px", 278.0)),
+                        "top_right_rail_px": int(getattr(self, "ref_top_right_rail_px", 1630.0)),
+                        "bot_left_rail_px": int(getattr(self, "ref_bot_left_rail_px", 104.0)),
+                        "bot_right_rail_px": int(getattr(self, "ref_bot_right_rail_px", 1808.0)),
                     },
                     "measured_tilt_deg": calib_res["measured_tilt_deg"],
                     "target_tilt_deg": calib_res["target_tilt_deg"],
@@ -1497,6 +1529,10 @@ class CombinedTopInspector:
         sx = float(cw) / float(w_f if w_f > 0 else 1920)
         sy = float(ch) / float(h_f if h_f > 0 else 1080)
 
+        lx_top = int(round(self._golden_rail_x("left", 0.0, w_f, h_f) * sx))
+        lx_bot = int(round(self._golden_rail_x("left", float(h_f), w_f, h_f) * sx))
+        rx_top = int(round(self._golden_rail_x("right", 0.0, w_f, h_f) * sx))
+        rx_bot = int(round(self._golden_rail_x("right", float(h_f), w_f, h_f) * sx))
         lx = int(round(getattr(self, "ref_left_rail_px", 188.0) * sx))
         rx = int(round(getattr(self, "ref_right_rail_px", 1759.0) * sx))
         cx = int(round(getattr(self, "ref_center_x", 960.0) * sx))
@@ -1505,15 +1541,15 @@ class CombinedTopInspector:
         guide_col = (0, 235, 255)    # Amber / Emas Kanonikal
         center_col = (255, 205, 0)   # Cyan terang untuk sumbu tengah
 
-        # 1. Garis Rel Kiri (Left Rail)
-        cv2.line(canvas, (lx, 0), (lx, ch), guide_col, 2, cv2.LINE_AA)
+        # 1. Garis Trapesium Rel Kiri & Kanan (Mengikuti Perspektif Asli Posisi 3)
+        cv2.line(canvas, (lx_top, 0), (lx_bot, ch), guide_col, 2, cv2.LINE_AA)
+        cv2.line(canvas, (rx_top, 0), (rx_bot, ch), guide_col, 2, cv2.LINE_AA)
         for y_tick in range(40, ch - 20, 60):
-            cv2.line(canvas, (lx - 7, y_tick), (lx + 7, y_tick), guide_col, 2, cv2.LINE_AA)
-
-        # 2. Garis Rel Kanan (Right Rail)
-        cv2.line(canvas, (rx, 0), (rx, ch), guide_col, 2, cv2.LINE_AA)
-        for y_tick in range(40, ch - 20, 60):
-            cv2.line(canvas, (rx - 7, y_tick), (rx + 7, y_tick), guide_col, 2, cv2.LINE_AA)
+            alpha_t = float(y_tick) / float(max(1, ch))
+            lx_t = int(round(lx_top + alpha_t * (lx_bot - lx_top)))
+            rx_t = int(round(rx_top + alpha_t * (rx_bot - rx_top)))
+            cv2.line(canvas, (lx_t - 7, y_tick), (lx_t + 7, y_tick), guide_col, 2, cv2.LINE_AA)
+            cv2.line(canvas, (rx_t - 7, y_tick), (rx_t + 7, y_tick), guide_col, 2, cv2.LINE_AA)
 
         # 3. Sumbu Simetri Tengah (Centerline) - Garis Putus-putus
         for y_dash in range(0, ch, 20):

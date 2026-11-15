@@ -151,6 +151,65 @@ class DatasetReviewStoreTests(unittest.TestCase):
             with open(config_path, encoding="utf-8") as config:
                 self.assertEqual(config.read(), '{"threshold": 12}')
 
+    def test_next_unreviewed_skips_excluded_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = DatasetReviewStore(os.path.join(directory, "review.db"))
+            first_id = store.insert_sample(sample_values())
+            second_id = store.insert_sample({**sample_values(), "rib_number": 8})
+            attach_reviewable_evidence(store, directory, first_id)
+            attach_reviewable_evidence(store, directory, second_id)
+
+            pending = store.next_unreviewed(exclude_ids={first_id})
+            self.assertIsNotNone(pending)
+            self.assertEqual(pending["dataset_id"], second_id)
+
+    def test_save_review_allow_update_updates_existing_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = DatasetReviewStore(os.path.join(directory, "review.db"))
+            dataset_id = store.insert_sample(sample_values())
+            attach_reviewable_evidence(store, directory, dataset_id)
+
+            self.assertTrue(store.save_review(dataset_id, "OK", "qa-01", "awal"))
+            self.assertTrue(store.save_review(dataset_id, "NG", "qa-01", "koreksi", allow_update=True))
+            fetched = store.fetch_sample(dataset_id)
+            self.assertEqual(fetched["manual_label"], "NG")
+            self.assertEqual(fetched["note"], "koreksi")
+
+    def test_evaluation_computes_distributions_and_threshold_recommendations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = DatasetReviewStore(os.path.join(directory, "review.db"))
+            ok_id = store.insert_sample({
+                **sample_values(),
+                "label": "NG",
+                "pv_flatness": 6.0,
+                "sagitta": 3.0,
+                "inner_dev": 4.0,
+                "tip_dev": 5.0,
+            })
+            ng_id = store.insert_sample({
+                **sample_values(),
+                "rib_number": 8,
+                "label": "NG",
+                "pv_flatness": 14.0,
+                "sagitta": 9.0,
+                "inner_dev": 10.0,
+                "tip_dev": 13.0,
+            })
+            attach_reviewable_evidence(store, directory, ok_id)
+            attach_reviewable_evidence(store, directory, ng_id)
+            store.save_review(ok_id, "OK", "qa")
+            store.save_review(ng_id, "NG", "qa")
+
+            summary = summarize_rows(store.evaluation_rows())
+            recs = summary["threshold_recommendations"]
+            self.assertEqual(recs["rib_pv_threshold"]["status"], "clean_separation")
+            self.assertAlmostEqual(recs["rib_pv_threshold"]["value"], 10.0)
+            self.assertAlmostEqual(recs["rib_sagitta_threshold"]["value"], 6.0)
+            report_path = write_report(summary, os.path.join(directory, "reports"))
+            with open(report_path, encoding="utf-8") as report:
+                content = report.read()
+            self.assertIn("recommended:rib_pv_threshold,10.0", content)
+
 
 if __name__ == "__main__":
     unittest.main()

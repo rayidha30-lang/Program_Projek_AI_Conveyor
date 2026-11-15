@@ -40,9 +40,9 @@
   ],
   "thresholds": {
     "rib_conf_threshold": 0.55,
-    "rib_pv_threshold": 14.0,
-    "rib_dev_threshold": 8.5,
-    "rib_max_dev_threshold": 8.5,
+    "rib_pv_threshold": 16.5,
+    "rib_dev_threshold": 9.5,
+    "rib_max_dev_threshold": 9.5,
     "rib_tip_threshold": 9.5,
     "rib_sagitta_threshold": 11.5,
     "slat_delta_limit": 14.0,
@@ -57,8 +57,8 @@
     "max_center_void": 1450,
     "scale_factor_mm_per_px": 0.515,
     "scale_factor_y_mm_per_px": 0.442,
-    "rib_prime_min_y": 340,
-    "rib_prime_max_y": 460
+    "rib_prime_min_y": 290,
+    "rib_prime_max_y": 520
   },
   "physical_dimensions": {
     "slat_width_flat_mm": 820.0,
@@ -89,7 +89,13 @@
       "target_cx": 960.0,
       "left_rail_px": 188,
       "right_rail_px": 1759,
-      "conveyor_width_px": 1571
+      "conveyor_width_px": 1571,
+      "top_y_px": 216,
+      "bot_y_px": 864,
+      "top_left_rail_px": 278,
+      "top_right_rail_px": 1630,
+      "bot_left_rail_px": 104,
+      "bot_right_rail_px": 1808
     },
     "left_rail_px": 188,
     "right_rail_px": 1759,

@@ -40,9 +40,9 @@
   ],
   "thresholds": {
     "rib_conf_threshold": 0.55,
-    "rib_pv_threshold": 14.0,
-    "rib_dev_threshold": 8.5,
-    "rib_max_dev_threshold": 8.5,
+    "rib_pv_threshold": 16.5,
+    "rib_dev_threshold": 9.5,
+    "rib_max_dev_threshold": 9.5,
     "rib_tip_threshold": 9.5,
     "rib_sagitta_threshold": 11.5,
     "slat_delta_limit": 14.0,
@@ -51,14 +51,14 @@
     "calibrated_mll_ratio": 0.684,
     "calibrated_v_thresh": 94.4,
     "total_slats_in_loop": 16,
-    "bracket_tilt_deg": -0.116,
+    "bracket_tilt_deg": 0.249,
     "max_flatness_pv": 16.5,
     "max_sagitta": 8.6,
     "max_center_void": 1450,
     "scale_factor_mm_per_px": 0.515,
     "scale_factor_y_mm_per_px": 0.442,
-    "rib_prime_min_y": 340,
-    "rib_prime_max_y": 460
+    "rib_prime_min_y": 290,
+    "rib_prime_max_y": 520
   },
   "physical_dimensions": {
     "slat_width_flat_mm": 820.0,
@@ -68,9 +68,9 @@
     "scale_factor_mm_per_px": 0.515,
     "scale_factor_y_mm_per_px": 0.442
   },
-  "updated_at": "2026-10-30 09:17:11",
+  "updated_at": "2026-11-15 08:04:35",
   "calibration_profile": {
-    "calibrated_at": "2026-10-30 09:17:11",
+    "calibrated_at": "2026-11-15 08:04:35",
     "total_slats_in_loop": 16,
     "bracket_tilt_deg": 0.9,
     "median_y_seam_px": 89.0,
@@ -89,54 +89,60 @@
       "target_cx": 960.0,
       "left_rail_px": 188,
       "right_rail_px": 1759,
-      "conveyor_width_px": 1571
+      "conveyor_width_px": 1571,
+      "top_y_px": 216,
+      "bot_y_px": 864,
+      "top_left_rail_px": 278,
+      "top_right_rail_px": 1630,
+      "bot_left_rail_px": 104,
+      "bot_right_rail_px": 1808
     },
     "left_rail_px": 188,
     "right_rail_px": 1759,
-    "conveyor_center_x": 997.8,
+    "conveyor_center_x": 958.5,
     "conveyor_width_px": 1571,
     "calibration_method": "INTERACTIVE_DUAL_RAILS_PERSPECTIVE",
-    "measured_tilt_deg": -0.116,
+    "measured_tilt_deg": 0.249,
     "target_tilt_deg": 0.9,
-    "angle_correction_deg": 0.116,
-    "lateral_offset_px": -37.8,
-    "measured_width_px": 1490.5,
-    "scale_x": 1.054,
+    "angle_correction_deg": -0.249,
+    "lateral_offset_px": -3.5,
+    "measured_width_px": 1526.0,
+    "scale_x": 1.001,
     "left_rail_pts": [
       [
-        374.0,
+        278.0,
         216.0
       ],
       [
-        131.0,
+        113.0,
         864.0
       ]
     ],
     "right_rail_pts": [
       [
-        1623.0,
+        1636.0,
         216.0
       ],
       [
-        1863.0,
+        1807.0,
         864.0
       ]
     ]
   },
   "rectification_matrix": [
     [
-      1.4439338235294117,
-      0.6702707992919389,
-      -468.98988970588226
+      0.9921881639543833,
+      -0.016603926632867853,
+      4.810538283968616
     ],
     [
-      0.0,
-      1.7398897058823528,
-      -127.8529411764706
+      1.2779545607196047e-17,
+      0.9829568293271165,
+      2.9450598922742706
     ],
     [
-      -0.0,
-      0.0006850830610021786,
+      -1.0438353713097348e-21,
+      -1.578071358600325e-05,
       1.0
     ]
   ]

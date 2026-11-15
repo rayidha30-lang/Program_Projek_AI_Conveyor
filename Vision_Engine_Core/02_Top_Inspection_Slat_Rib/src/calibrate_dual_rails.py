@@ -53,25 +53,31 @@ class DualRailCalibrator:
         self.calibrated_config_path = CALIBRATED_CONFIG_PATH
         self.default_config_path = DEFAULT_STABIL_CONFIG_PATH
 
-        # Nilai Target Acuan Emas (Golden Reference)
+        # Nilai Target Acuan Emas (Golden Reference - Trapesium Perspektif Posisi 3)
         self.ref_left_rail = 188.0
         self.ref_right_rail = 1759.0
         self.ref_center_x = 960.0
         self.ref_width = 1571.0
         self.ref_tilt_deg = 0.90
+        self.ref_y_top = 216.0
+        self.ref_y_bot = 864.0
+        self.ref_top_left_rail = 278.0
+        self.ref_top_right_rail = 1630.0
+        self.ref_bot_left_rail = 104.0
+        self.ref_bot_right_rail = 1808.0
 
         self.load_golden_reference()
 
         # 4 Titik Kendali Rel pada Angle Saat Ini (Koordinat Citra Asli 1080p)
         # Point 0: Left Top, Point 1: Left Bottom
         # Point 2: Right Top, Point 3: Right Bottom
-        self.y_top = 100.0
-        self.y_bot = 980.0
+        self.y_top = self.ref_y_top
+        self.y_bot = self.ref_y_bot
         self.pts = [
-            np.array([240.0, self.y_top]),     # 0: Left Top
-            np.array([280.0, self.y_bot]),     # 1: Left Bottom
-            np.array([1600.0, self.y_top]),    # 2: Right Top
-            np.array([1640.0, self.y_bot])     # 3: Right Bottom
+            np.array([self.ref_top_left_rail, self.y_top]),    # 0: Left Top
+            np.array([self.ref_bot_left_rail, self.y_bot]),    # 1: Left Bottom
+            np.array([self.ref_top_right_rail, self.y_top]),   # 2: Right Top
+            np.array([self.ref_bot_right_rail, self.y_bot]),   # 3: Right Bottom
         ]
 
         # State Mouse Interaction
@@ -102,6 +108,12 @@ class DualRailCalibrator:
                 self.ref_center_x = float(gref.get("target_cx", cp.get("conveyor_center_x", self.ref_center_x)))
                 self.ref_tilt_deg = float(gref.get("target_tilt_deg", cp.get("bracket_tilt_deg", self.ref_tilt_deg)))
                 self.ref_width = float(gref.get("conveyor_width_px", self.ref_right_rail - self.ref_left_rail))
+                self.ref_y_top = float(gref.get("top_y_px", self.ref_y_top))
+                self.ref_y_bot = float(gref.get("bot_y_px", self.ref_y_bot))
+                self.ref_top_left_rail = float(gref.get("top_left_rail_px", self.ref_top_left_rail))
+                self.ref_top_right_rail = float(gref.get("top_right_rail_px", self.ref_top_right_rail))
+                self.ref_bot_left_rail = float(gref.get("bot_left_rail_px", self.ref_bot_left_rail))
+                self.ref_bot_right_rail = float(gref.get("bot_right_rail_px", self.ref_bot_right_rail))
             except Exception as e:
                 print(f"[!] Warning load golden reference: {e}")
 
@@ -118,10 +130,89 @@ class DualRailCalibrator:
             except Exception:
                 pass
 
+    def get_golden_rail_x(self, side, y_val, w_f=1920, h_f=1080):
+        """Interpolasi linier posisi X rel kiri/kanan Acuan Emas Posisi 3 pada tinggi y_val."""
+        sx = float(w_f) / 1920.0
+        sy = float(h_f) / 1080.0
+        y_top_s = self.ref_y_top * sy
+        y_bot_s = self.ref_y_bot * sy
+        denom = max(1e-5, y_bot_s - y_top_s)
+        alpha = (float(y_val) - y_top_s) / denom
+        if side == "left":
+            x_top = self.ref_top_left_rail * sx
+            x_bot = self.ref_bot_left_rail * sx
+        else:
+            x_top = self.ref_top_right_rail * sx
+            x_bot = self.ref_bot_right_rail * sx
+        return float(x_top + alpha * (x_bot - x_top))
+
+    def get_golden_trapezoid_pts(self, w_f=1920, h_f=1080):
+        """Mengembalikan 4 titik sudut trapesium Acuan Emas [Top-Left, Top-Right, Bottom-Right, Bottom-Left]."""
+        sy = float(h_f) / 1080.0
+        y_top_s = self.ref_y_top * sy
+        y_bot_s = self.ref_y_bot * sy
+        return np.array([
+            [self.get_golden_rail_x("left", y_top_s, w_f, h_f), y_top_s],
+            [self.get_golden_rail_x("right", y_top_s, w_f, h_f), y_top_s],
+            [self.get_golden_rail_x("right", y_bot_s, w_f, h_f), y_bot_s],
+            [self.get_golden_rail_x("left", y_bot_s, w_f, h_f), y_bot_s],
+        ], dtype=np.float32)
+
+    @staticmethod
+    def _find_top_rail_x(prof_top, primary_bounds, fallback_bounds, min_peak=12.0):
+        """Cari puncak Sobel-X bibir rel dalam pada rentang utama dengan fallback rentang lebar."""
+        p_min, p_max = primary_bounds
+        idx_rel = int(np.argmax(prof_top[p_min:p_max]))
+        peak_val = float(prof_top[p_min + idx_rel])
+        if peak_val >= min_peak:
+            return int(p_min + idx_rel)
+        f_min, f_max = fallback_bounds
+        return int(f_min + np.argmax(prof_top[f_min:f_max]))
+
+    @staticmethod
+    def _track_bottom_rail_x(
+        sobx,
+        x_top_val,
+        y_top,
+        y_bot,
+        sample_ys,
+        nom_dx,
+        dx_min,
+        dx_max,
+        x_min_bound,
+        x_max_bound,
+        outward_sign,
+        min_abs_dx,
+    ):
+        """Lacak garis tepi rel dari titik atas ke bawah dengan batasan sudut perspektif keluar."""
+        best_score = -1e9
+        best_xb = int(np.clip(x_top_val + nom_dx, x_min_bound, x_max_bound))
+        span_y = max(1e-5, y_bot - y_top)
+        h_f, w_f = sobx.shape[:2]
+        for dx in range(int(dx_min), int(dx_max) + 1):
+            if dx * outward_sign <= int(min_abs_dx):
+                continue
+            xb_cand = int(x_top_val + dx)
+            if xb_cand < x_min_bound or xb_cand > x_max_bound:
+                continue
+            vals = []
+            for sy in sample_ys:
+                alpha = (sy - y_top) / span_y
+                cx = int(round(x_top_val + alpha * dx))
+                y0, y1 = max(0, int(sy) - 10), min(h_f, int(sy) + 10)
+                x0, x1 = max(0, cx - 4), min(w_f, cx + 5)
+                vals.append(float(np.mean(sobx[y0:y1, x0:x1])))
+            score = float(np.median(vals)) - 0.15 * abs(dx - nom_dx)
+            if score > best_score:
+                best_score = score
+                best_xb = xb_cand
+        return best_xb
+
     def auto_snap_rails(self, frame_bgr):
         """
-        Mendeteksi posisi bibir rel kiri dan kanan secara otomatis menggunakan Sobel-X
-        untuk inisialisasi cepat titik kendali.
+        Mendeteksi posisi bibir rel dalam kiri & kanan secara otomatis menggunakan
+        Sobel-X multi-strip dengan batasan perspektif trapesium agar kebal terhadap
+        tekstur baut/sirip di dalam sabuk konveyor.
         """
         if frame_bgr is None:
             return
@@ -129,28 +220,50 @@ class DualRailCalibrator:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # Sampling pada band atas (Y: 15% - 35%) dan band bawah (Y: 65% - 85%)
-        band_top = blurred[int(0.15 * h_f):int(0.35 * h_f), :]
-        band_bot = blurred[int(0.65 * h_f):int(0.85 * h_f), :]
+        sobx = np.abs(cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3))
+        prof_top = np.mean(sobx[int(0.15 * h_f):int(0.35 * h_f), :], axis=0)
 
-        sobx_top = np.abs(cv2.Sobel(band_top, cv2.CV_64F, 1, 0, ksize=3))
-        sobx_bot = np.abs(cv2.Sobel(band_bot, cv2.CV_64F, 1, 0, ksize=3))
+        # Tahap 1: Cari puncak bibir rel dalam di band atas (Y: 15% - 35%)
+        lt_x = self._find_top_rail_x(
+            prof_top,
+            primary_bounds=(int(0.12 * w_f), int(0.24 * w_f)),
+            fallback_bounds=(int(0.05 * w_f), int(0.30 * w_f)),
+        )
+        rt_x = self._find_top_rail_x(
+            prof_top,
+            primary_bounds=(int(0.80 * w_f), int(0.87 * w_f)),
+            fallback_bounds=(int(0.70 * w_f), int(0.96 * w_f)),
+        )
 
-        prof_top = np.mean(sobx_top, axis=0)
-        prof_bot = np.mean(sobx_bot, axis=0)
-
-        # Rel kiri di rentang [5%, 32%], Rel kanan di rentang [68%, 98%]
-        x_min_l, x_max_l = int(0.05 * w_f), int(0.32 * w_f)
-        x_min_r, x_max_r = int(0.68 * w_f), int(0.98 * w_f)
-
-        lt_x = x_min_l + np.argmax(prof_top[x_min_l:x_max_l])
-        lb_x = x_min_l + np.argmax(prof_bot[x_min_l:x_max_l])
-
-        rt_x = x_min_r + np.argmax(prof_top[x_min_r:x_max_r])
-        rb_x = x_min_r + np.argmax(prof_bot[x_min_r:x_max_r])
-
+        # Tahap 2: Multi-strip outward perspective line tracking (Y: 30% - 82%)
         self.y_top = 0.20 * h_f
         self.y_bot = 0.80 * h_f
+        sx = float(w_f) / 1920.0
+        w_top = max(600.0 * sx, float(rt_x - lt_x))
+        ref_w_top = max(100.0, (self.ref_top_right_rail - self.ref_top_left_rail) * sx)
+        scale_w = w_top / ref_w_top
+
+        ref_dx_l = (self.ref_bot_left_rail - self.ref_top_left_rail) * sx
+        ref_dx_r = (self.ref_bot_right_rail - self.ref_top_right_rail) * sx
+        min_abs_dx = int(0.03 * w_f)
+        margin_dx = int(0.012 * w_f)
+        x_min_b = int(0.015 * w_f)
+        x_max_b = int(0.985 * w_f)
+
+        nom_dx_l = int(np.clip(int(round(ref_dx_l * scale_w)), x_min_b - lt_x, -(min_abs_dx + 1)))
+        nom_dx_r = int(np.clip(int(round(ref_dx_r * scale_w)), min_abs_dx + 1, x_max_b - rt_x))
+        sample_ys = np.linspace(0.30 * h_f, 0.82 * h_f, 9)
+
+        lb_x = self._track_bottom_rail_x(
+            sobx, lt_x, self.y_top, self.y_bot, sample_ys,
+            nom_dx_l, nom_dx_l - margin_dx, nom_dx_l + margin_dx,
+            x_min_b, w_f - 20, outward_sign=-1, min_abs_dx=min_abs_dx,
+        )
+        rb_x = self._track_bottom_rail_x(
+            sobx, rt_x, self.y_top, self.y_bot, sample_ys,
+            nom_dx_r, nom_dx_r - margin_dx, nom_dx_r + margin_dx,
+            20, x_max_b, outward_sign=+1, min_abs_dx=min_abs_dx,
+        )
 
         self.pts[0] = np.array([float(lt_x), self.y_top])
         self.pts[1] = np.array([float(lb_x), self.y_bot])
@@ -162,7 +275,7 @@ class DualRailCalibrator:
     def compute_rectification(self, w_f=1920, h_f=1080):
         """
         Menghitung matriks rektifikasi (Perspective 3x3 atau Affine 2x3)
-        berdasarkan 2 garis rel saat ini terhadap Acuan Emas.
+        berdasarkan 2 garis rel saat ini terhadap Trapesium Acuan Emas Posisi 3.
         """
         p_lt, p_lb, p_rt, p_rb = self.pts
 
@@ -172,7 +285,6 @@ class DualRailCalibrator:
         theta_mean = float((theta_l + theta_r) / 2.0)
 
         mid_y = h_f / 2.0
-        # X pada ketinggian tengah frame
         den_l = max(1e-5, p_lb[1] - p_lt[1])
         den_r = max(1e-5, p_rb[1] - p_rt[1])
         x_l_mid = float(p_lt[0] + (mid_y - p_lt[1]) * (p_lb[0] - p_lt[0]) / den_l)
@@ -180,8 +292,14 @@ class DualRailCalibrator:
 
         cur_width = max(10.0, x_r_mid - x_l_mid)
         cur_cx = (x_l_mid + x_r_mid) / 2.0
-        scale_x = self.ref_width / cur_width
-        delta_x = self.ref_center_x - cur_cx
+
+        ref_left_mid = self.get_golden_rail_x("left", mid_y, w_f, h_f)
+        ref_right_mid = self.get_golden_rail_x("right", mid_y, w_f, h_f)
+        ref_width_mid = max(10.0, ref_right_mid - ref_left_mid)
+        ref_cx_mid = (ref_left_mid + ref_right_mid) / 2.0
+
+        scale_x = ref_width_mid / cur_width
+        delta_x = ref_cx_mid - cur_cx
 
         self.metrology = {
             "theta_l": theta_l,
@@ -192,31 +310,28 @@ class DualRailCalibrator:
             "cur_center_x": cur_cx,
             "scale_x": scale_x,
             "lateral_offset_px": delta_x,
-            "ref_width_px": self.ref_width,
-            "ref_center_x": self.ref_center_x,
-            "ref_left_px": self.ref_left_rail,
-            "ref_right_px": self.ref_right_rail
+            "ref_width_px": ref_width_mid,
+            "ref_center_x": ref_cx_mid,
+            "ref_left_px": ref_left_mid,
+            "ref_right_px": ref_right_mid,
         }
 
-        if self.mode == "PERSPECTIVE":
-            # 4 Titik Sumber (Trapezoid Rel) -> 4 Titik Target (Garis Rel Tegak Lurus Acuan Emas)
-            src_pts = np.array([p_lt, p_rt, p_rb, p_lb], dtype=np.float32)
-            dst_pts = np.array([
-                [self.ref_left_rail, p_lt[1]],
-                [self.ref_right_rail, p_rt[1]],
-                [self.ref_right_rail, p_rb[1]],
-                [self.ref_left_rail, p_lb[1]]
-            ], dtype=np.float32)
+        src_pts = np.array([p_lt, p_rt, p_rb, p_lb], dtype=np.float32)
+        dst_pts = np.array([
+            [self.get_golden_rail_x("left", p_lt[1], w_f, h_f), p_lt[1]],
+            [self.get_golden_rail_x("right", p_rt[1], w_f, h_f), p_rt[1]],
+            [self.get_golden_rail_x("right", p_rb[1], w_f, h_f), p_rb[1]],
+            [self.get_golden_rail_x("left", p_lb[1], w_f, h_f), p_lb[1]],
+        ], dtype=np.float32)
 
+        if self.mode == "PERSPECTIVE":
             M_persp = cv2.getPerspectiveTransform(src_pts, dst_pts)
             self.last_matrix = M_persp
             return M_persp, "PERSPECTIVE"
         else:
-            # Mode Affine 2D: Derotasi seputar (cur_cx, mid_y) lalu skala sumbu X dan translasi
-            R = cv2.getRotationMatrix2D((cur_cx, mid_y), theta_mean, 1.0)
-            M_aff = R.copy()
-            M_aff[0, :] *= scale_x
-            M_aff[0, 2] += (self.ref_center_x - scale_x * cur_cx)
+            # Mode Affine 2D: 4-point least-squares affine fit ke Trapesium Acuan Emas
+            X_aug = np.hstack([src_pts, np.ones((4, 1), dtype=np.float32)])
+            M_aff = np.linalg.lstsq(X_aug, dst_pts, rcond=None)[0].T.astype(np.float32)
             self.last_matrix = M_aff
             return M_aff, "AFFINE"
 
@@ -281,7 +396,13 @@ class DualRailCalibrator:
                 "target_cx": self.ref_center_x,
                 "left_rail_px": int(self.ref_left_rail),
                 "right_rail_px": int(self.ref_right_rail),
-                "conveyor_width_px": int(self.ref_width)
+                "conveyor_width_px": int(self.ref_width),
+                "top_y_px": int(self.ref_y_top),
+                "bot_y_px": int(self.ref_y_bot),
+                "top_left_rail_px": int(self.ref_top_left_rail),
+                "top_right_rail_px": int(self.ref_top_right_rail),
+                "bot_left_rail_px": int(self.ref_bot_left_rail),
+                "bot_right_rail_px": int(self.ref_bot_right_rail),
             },
             "measured_tilt_deg": round(self.metrology.get("measured_tilt_deg", 0.0), 3),
             "target_tilt_deg": self.ref_tilt_deg,
@@ -492,21 +613,23 @@ def run_interactive_dual_rail_calibration(source_path=None, config_path=DEFAULT_
         warped_frame = calibrator.apply_warp(frame_raw)
         view_right = cv2.resize(warped_frame, (vw, vh))
 
-        # Skala Acuan Emas ke Viewport Kanan
-        ref_lx_d = int(round(calibrator.ref_left_rail * scale_vx))
-        ref_rx_d = int(round(calibrator.ref_right_rail * scale_vx))
+        # Skala Trapesium Acuan Emas Posisi 3 ke Viewport Kanan
+        ref_lx_top_d = int(round(calibrator.get_golden_rail_x("left", 0.0, w_f, h_f) * scale_vx))
+        ref_lx_bot_d = int(round(calibrator.get_golden_rail_x("left", float(h_f), w_f, h_f) * scale_vx))
+        ref_rx_top_d = int(round(calibrator.get_golden_rail_x("right", 0.0, w_f, h_f) * scale_vx))
+        ref_rx_bot_d = int(round(calibrator.get_golden_rail_x("right", float(h_f), w_f, h_f) * scale_vx))
         ref_cx_d = int(round(calibrator.ref_center_x * scale_vx))
 
-        # Overlay Garis Acuan Emas pada Viewport Kanan
+        # Overlay Garis Trapesium Acuan Emas pada Viewport Kanan
         # Rel Kiri Emas (Neon Green)
-        cv2.line(view_right, (ref_lx_d, 0), (ref_lx_d, vh), (0, 255, 100), 2, cv2.LINE_AA)
-        cv2.putText(view_right, f"ACUAN KIRI ({int(calibrator.ref_left_rail)}px)", (ref_lx_d + 6, vh - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 100), 1, cv2.LINE_AA)
+        cv2.line(view_right, (ref_lx_top_d, 0), (ref_lx_bot_d, vh), (0, 255, 100), 2, cv2.LINE_AA)
+        cv2.putText(view_right, f"ACUAN KIRI ({int(calibrator.ref_top_left_rail)}->{int(calibrator.ref_bot_left_rail)}px)", (max(4, ref_lx_bot_d + 6), vh - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 100), 1, cv2.LINE_AA)
 
         # Rel Kanan Emas (Neon Green)
-        cv2.line(view_right, (ref_rx_d, 0), (ref_rx_d, vh), (0, 255, 100), 2, cv2.LINE_AA)
-        cv2.putText(view_right, f"ACUAN KANAN ({int(calibrator.ref_right_rail)}px)", (ref_rx_d - 130, vh - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 100), 1, cv2.LINE_AA)
+        cv2.line(view_right, (ref_rx_top_d, 0), (ref_rx_bot_d, vh), (0, 255, 100), 2, cv2.LINE_AA)
+        cv2.putText(view_right, f"ACUAN KANAN ({int(calibrator.ref_top_right_rail)}->{int(calibrator.ref_bot_right_rail)}px)", (max(10, ref_rx_bot_d - 165), vh - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 100), 1, cv2.LINE_AA)
 
         # Sumbu Simetri Tengah Emas (Cyan)
         for y_dash in range(0, vh, 20):

@@ -155,48 +155,40 @@ class ConveyorMotionCalibrator:
                             motion_angles.append(ang_m)
 
         # ----------------------------------------------------------------------
-        # 3. DETEKSI BATAS LATERAL REL SAMPING KONVEYOR (PARALLEL RAILS)
+        # 3. DETEKSI BATAS REL PADA TEMPORAL MEDIAN FRAME (BEBAS OBJEK BERGERAK)
         # ----------------------------------------------------------------------
-        # Putar frame tengah sementara agar tegak lurus horizontal
-        mid_frame = frames[len(frames) // 2]
-        center_pt = (w_f / 2.0, h_f / 2.0)
-        temp_rot_m = cv2.getRotationMatrix2D(center_pt, -measured_tilt, 1.0)
-        derot_frame = cv2.warpAffine(mid_frame, temp_rot_m, (w_f, h_f), borderMode=cv2.BORDER_REPLICATE)
-        derot_gray = cv2.cvtColor(derot_frame, cv2.COLOR_BGR2GRAY)
+        try:
+            from calibrate_dual_rails import DualRailCalibrator
+        except ImportError:
+            from .calibrate_dual_rails import DualRailCalibrator
 
-        # Hitung gradien vertikal (Sobel X) untuk menemukan garis rel kiri dan kanan
-        rail_band = derot_gray[int(0.35 * h_f):int(0.68 * h_f), :]
-        sobx = np.abs(cv2.Sobel(rail_band, cv2.CV_64F, 1, 0, ksize=3))
-        profile_x = np.mean(sobx, axis=0)
+        bg_step = max(1, len(frames) // 15)
+        bg_samples = frames[::bg_step]
+        median_frame = np.median(np.stack(bg_samples, axis=0), axis=0).astype(np.uint8)
 
-        # Rel kiri di rentang [3%, 25%], Rel kanan di rentang [75%, 97%]
-        x_min_bound = int(0.03 * w_f)
-        x_max_left = int(0.25 * w_f)
-        left_rail_x = x_min_bound + int(np.argmax(profile_x[x_min_bound:x_max_left]))
-
-        x_min_right = int(0.75 * w_f)
-        x_max_bound = int(0.97 * w_f)
-        right_rail_x = x_min_right + int(np.argmax(profile_x[x_min_right:x_max_bound]))
-
-        conveyor_center_x = (left_rail_x + right_rail_x) / 2.0
-        delta_x = float(self.target_cx - conveyor_center_x)
+        rail_calib = DualRailCalibrator()
+        rail_calib.mode = "PERSPECTIVE"
+        rail_calib.auto_snap_rails(median_frame)
 
         # ----------------------------------------------------------------------
-        # 4. PEMBENTUKAN MATRIKS AFFINE RECTIFICATION (M_rect 2x3)
+        # 4. PEMBENTUKAN MATRIKS REKTIFIKASI PERSPEKTIF (M_rect 3x3)
         # ----------------------------------------------------------------------
-        # Memutar frame sejauh delta_theta dan menggeser pusat lateral sejauh delta_x
-        M_rect = cv2.getRotationMatrix2D(center_pt, delta_theta, 1.0)
-        M_rect[0, 2] += delta_x
+        M_rect, _ = rail_calib.compute_rectification(w_f, h_f)
+        metro = rail_calib.metrology
 
-        conveyor_width_px = int(right_rail_x - left_rail_x)
+        conveyor_center_x = float(metro.get("cur_center_x", w_f / 2.0))
+        delta_x = float(metro.get("lateral_offset_px", 0.0))
+        conveyor_width_px = int(round(metro.get("cur_width_px", self.target_width)))
+        left_rail_x = int(round(conveyor_center_x - conveyor_width_px / 2.0))
+        right_rail_x = int(round(conveyor_center_x + conveyor_width_px / 2.0))
 
         # ----------------------------------------------------------------------
         # 5. PEMBUATAN RECTIFIED SLAT POLYGON (GERBANG SLAT KANONIKAL)
         # ----------------------------------------------------------------------
-        # Menghasilkan koordinat polygon plat slat yang persis mengikuti posisi baru
-        norm_lx = float(max(0.04, left_rail_x / float(w_f)))
-        norm_rx = float(min(0.96, right_rail_x / float(w_f)))
-        
+        # Setelah rektifikasi ke Trapesium Acuan Emas Posisi 3, gunakan koordinat rel kanonikal
+        norm_lx = float(max(0.04, self.target_left_rail / 1920.0))
+        norm_rx = float(min(0.96, self.target_right_rail / 1920.0))
+
         # Gerbang slat kanonikal di area tengah stabil Y [51%, 67%]
         calibrated_slat_poly = [
             [norm_lx, 0.515],

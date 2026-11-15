@@ -89,7 +89,13 @@
       "target_cx": 960.0,
       "left_rail_px": 188,
       "right_rail_px": 1759,
-      "conveyor_width_px": 1571
+      "conveyor_width_px": 1571,
+      "top_y_px": 216,
+      "bot_y_px": 864,
+      "top_left_rail_px": 278,
+      "top_right_rail_px": 1630,
+      "bot_left_rail_px": 104,
+      "bot_right_rail_px": 1808
     },
     "left_rail_px": 188,
     "right_rail_px": 1759,

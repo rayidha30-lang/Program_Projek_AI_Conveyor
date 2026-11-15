@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import queue
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -26,6 +28,7 @@ class RibDatasetRecorder:
         camera_profile: str | None = None,
         pipeline_version: str = "root-runner",
         min_active_frames: int = 15,
+        async_write: bool = False,
     ):
         self.store = store
         self.store.ensure_schema()
@@ -35,8 +38,19 @@ class RibDatasetRecorder:
         self.camera_profile = camera_profile
         self.pipeline_version = pipeline_version
         self.min_active_frames = min_active_frames
-        self._candidates: dict[tuple[int | None, int | None], dict[str, Any]] = {}
-        self._finalized: dict[tuple[int | None, int | None], int] = {}
+        self.async_write = bool(async_write)
+        self._candidates: dict[int | None, dict[str, Any]] = {}
+        self._finalized: dict[int | None, int | None] = {}
+        self._queue: queue.Queue[dict[str, Any]] | None = None
+        self._stop_event: threading.Event | None = None
+        self._worker_thread: threading.Thread | None = None
+        if self.async_write:
+            self._queue = queue.Queue(maxsize=128)
+            self._stop_event = threading.Event()
+            self._worker_thread = threading.Thread(
+                target=self._worker_loop, daemon=True, name="RibDatasetRecorderWorker"
+            )
+            self._worker_thread.start()
 
     def start_new_session(self, session_id: str | None = None) -> None:
         """Reset in-memory deduplication after the operator resets the rib counter."""
@@ -51,6 +65,39 @@ class RibDatasetRecorder:
             return status
         return None
 
+    @staticmethod
+    def _quality_key(rib_result: Mapping[str, Any]) -> tuple[float, float]:
+        return (
+            float(rib_result.get("coverage", 0.0) or 0.0),
+            float(rib_result.get("confidence", 0.0) or 0.0),
+        )
+
+    @staticmethod
+    def _is_observable_frame(rib_result: Mapping[str, Any]) -> bool:
+        """Reject Transit Hysteresis buffer frames that lack an active rib box or contour."""
+        reason = str(rib_result.get("detection_reason", "") or "")
+        if "transit hysteresis" in reason.lower():
+            return False
+        if "active_box" in rib_result and rib_result.get("active_box") is None:
+            return False
+        contour = rib_result.get("ys_contour")
+        if contour is None or len(contour) == 0:
+            return False
+        return True
+
+    def should_observe(self, rib_result: Mapping[str, Any], rib_number: int | None) -> bool:
+        """Return True only when this frame improves on the buffered candidate."""
+        if rib_number in self._finalized:
+            return False
+        label = self._model_label(rib_result)
+        active_frames = int(rib_result.get("active_rib_frames", 0) or 0)
+        if label is None or active_frames < self.min_active_frames:
+            return False
+        if not self._is_observable_frame(rib_result):
+            return False
+        current = self._candidates.get(rib_number)
+        return current is None or self._quality_key(rib_result) > current["quality"]
+
     def observe(
         self,
         rib_result: Mapping[str, Any],
@@ -59,18 +106,12 @@ class RibDatasetRecorder:
         rib_number: int | None,
         slat_number: int | None,
     ) -> None:
-        label = self._model_label(rib_result)
-        active_frames = int(rib_result.get("active_rib_frames", 0) or 0)
-        if label is None or active_frames < self.min_active_frames or raw_frame is None or annotated_frame is None:
+        if raw_frame is None or annotated_frame is None or not self.should_observe(rib_result, rib_number):
             return
-        key = (rib_number, slat_number)
-        quality = (float(rib_result.get("coverage", 0.0) or 0.0), float(rib_result.get("confidence", 0.0) or 0.0))
-        current = self._candidates.get(key)
-        if current is not None and quality <= current["quality"]:
-            return
-        self._candidates[key] = {
-            "quality": quality,
+        self._candidates[rib_number] = {
+            "quality": self._quality_key(rib_result),
             "result": dict(rib_result),
+            "slat_number": slat_number,
             "raw_frame": raw_frame.copy(),
             "annotated_frame": annotated_frame.copy(),
         }
@@ -81,28 +122,58 @@ class RibDatasetRecorder:
         rib_number: int | None,
         slat_number: int | None,
     ) -> int | None:
-        key = (rib_number, slat_number)
-        if key in self._finalized:
-            return self._finalized[key]
-        candidate = self._candidates.pop(key, None)
+        if rib_number in self._finalized:
+            return self._finalized[rib_number]
+        candidate = self._candidates.pop(rib_number, None)
         label = self._model_label(rib_result)
         active_frames = int(rib_result.get("active_rib_frames", 0) or 0)
         if candidate is None or label is None or active_frames < self.min_active_frames:
             return None
+
+        # Keep the geometry metrics from the best-frame candidate so DB values
+        # always match the overlay baked into annotated_frame; only sync final
+        # verdict and total active frame count.
         final_result = dict(candidate["result"])
-        final_result.update({key: value for key, value in rib_result.items() if value is not None})
-        dataset_id = self.store.insert_sample(self._sample_values(final_result, rib_number, slat_number))
-        session_dir = self.capture_root / self.session_id
+        final_result["status"] = label
+        best_frames = int(final_result.get("active_rib_frames", 0) or 0)
+        final_result["active_rib_frames"] = max(best_frames, active_frames)
+        resolved_slat = candidate["slat_number"] if candidate.get("slat_number") is not None else slat_number
+
+        payload = {
+            "sample_values": self._sample_values(final_result, rib_number, resolved_slat),
+            "raw_frame": candidate["raw_frame"],
+            "annotated_frame": candidate["annotated_frame"],
+            "session_id": self.session_id,
+        }
+        if self.async_write and self._queue is not None:
+            try:
+                self._queue.put_nowait(payload)
+                self._finalized[rib_number] = None
+            except queue.Full:
+                pass
+            return None
+
+        dataset_id = self._persist_payload(payload)
+        if dataset_id is not None:
+            self._finalized[rib_number] = dataset_id
+        return dataset_id
+
+    def _persist_payload(self, payload: Mapping[str, Any]) -> int | None:
+        dataset_id = self.store.insert_sample(payload["sample_values"])
+        session_dir = self.capture_root / str(payload["session_id"])
         session_dir.mkdir(parents=True, exist_ok=True)
         raw_path = session_dir / f"rib_{dataset_id:06d}_raw.jpg"
         annotated_path = session_dir / f"rib_{dataset_id:06d}_annotated.jpg"
-        if not (cv2.imwrite(str(raw_path), candidate["raw_frame"]) and cv2.imwrite(str(annotated_path), candidate["annotated_frame"])):
+        if not (
+            cv2.imwrite(str(raw_path), payload["raw_frame"])
+            and cv2.imwrite(str(annotated_path), payload["annotated_frame"])
+        ):
             self.store.delete_sample(dataset_id)
             return None
         self.store.attach_evidence(
             dataset_id,
             {
-                "session_id": self.session_id,
+                "session_id": str(payload["session_id"]),
                 "source_label": self.source_label,
                 "raw_image_path": str(raw_path.resolve()),
                 "annotated_image_path": str(annotated_path.resolve()),
@@ -110,8 +181,33 @@ class RibDatasetRecorder:
                 "pipeline_version": self.pipeline_version,
             },
         )
-        self._finalized[key] = dataset_id
         return dataset_id
+
+    def _worker_loop(self) -> None:
+        assert self._queue is not None and self._stop_event is not None
+        while not self._stop_event.is_set() or not self._queue.empty():
+            try:
+                payload = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._persist_payload(payload)
+            except Exception as error:
+                print(f"[WARN RibDatasetRecorder] Gagal menyimpan bukti rib: {error}")
+            finally:
+                self._queue.task_done()
+
+    def flush(self) -> None:
+        """Wait until all queued async evidence writes finish."""
+        if self._queue is not None:
+            self._queue.join()
+
+    def close(self) -> None:
+        """Drain pending writes and stop the background worker cleanly."""
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=5.0)
 
     def _sample_values(self, result: Mapping[str, Any], rib_number: int | None, slat_number: int | None) -> dict[str, Any]:
         contour = result.get("ys_contour")
