@@ -62,12 +62,12 @@ _load_env_file()
 from bolt_pin_detector import BoltPinDetector
 from bracket_anomaly_detector import BracketAnomalyDetector
 
-# Impor Modul Jembatan Database SQLite & Notifier Teams
-DB_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", "..", "..", "Database"))
-if not os.path.exists(DB_DIR):
-    DB_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", "..", "Database"))
-if DB_DIR not in sys.path:
-    sys.path.insert(0, DB_DIR)
+# Impor Modul Jembatan Database SQLite & Notifier Teams dari root Program/ (fallback ke Program/Database)
+PROGRAM_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", ".."))
+for _db_cand in (PROGRAM_DIR, os.path.join(PROGRAM_DIR, "Database")):
+    if os.path.exists(os.path.join(_db_cand, "db_bridge.py")) and _db_cand not in sys.path:
+        sys.path.insert(0, _db_cand)
+        break
 
 try:
     from db_bridge import InspectionDBBridge

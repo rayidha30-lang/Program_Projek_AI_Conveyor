@@ -95,6 +95,21 @@ for _p in [
     if _p and os.path.exists(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
 
+
+def _ensure_db_bridge_on_path():
+    """Ensure canonical Program/db_bridge.py (or Program/Database fallback) is importable."""
+    _db_candidates = [
+        BASE_DIR,
+        os.path.join(BASE_DIR, "Database"),
+    ]
+    db_dir = next(
+        (d for d in _db_candidates if os.path.exists(os.path.join(d, "db_bridge.py"))),
+        _db_candidates[0],
+    )
+    if db_dir not in sys.path:
+        sys.path.insert(0, db_dir)
+
+
 def is_stream_or_camera(src):
     """Mengecek apakah input berupa index kamera (misal 0, 1) atau URL stream (RTSP, HTTP, GStreamer)."""
     if src is None:
@@ -1172,18 +1187,7 @@ def _run_side_worker(
     # 1. Pastikan path impor modul side inspector dan Database terdaftar di proses anak
     if SIDE_SRC_DIR not in sys.path:
         sys.path.insert(0, SIDE_SRC_DIR)
-    # Deteksi lokasi db_bridge (BASE_DIR = Jetson deployment, ../Database = PC original)
-    _db_candidates = [
-        BASE_DIR,
-        os.path.abspath(os.path.join(BASE_DIR, "..", "Database")),
-        os.path.abspath(os.path.join(BASE_DIR, "..", "Program AI")),
-    ]
-    db_dir = next(
-        (d for d in _db_candidates if os.path.exists(os.path.join(d, "db_bridge.py"))),
-        _db_candidates[1]
-    )
-    if db_dir not in sys.path:
-        sys.path.insert(0, db_dir)
+    _ensure_db_bridge_on_path()
 
     import cv2
     import numpy as np
@@ -1479,18 +1483,7 @@ def _run_threaded_engine(args):
         sys.path.insert(0, TOP_SRC_DIR)
     if SIDE_SRC_DIR not in sys.path:
         sys.path.insert(0, SIDE_SRC_DIR)
-    # Deteksi lokasi db_bridge (BASE_DIR = Jetson deployment, ../Database = PC original)
-    _db_candidates = [
-        BASE_DIR,
-        os.path.abspath(os.path.join(BASE_DIR, "..", "Database")),
-        os.path.abspath(os.path.join(BASE_DIR, "..", "Program AI")),
-    ]
-    db_dir = next(
-        (d for d in _db_candidates if os.path.exists(os.path.join(d, "db_bridge.py"))),
-        _db_candidates[1]
-    )
-    if db_dir not in sys.path:
-        sys.path.insert(0, db_dir)
+    _ensure_db_bridge_on_path()
 
     from combined_top_inspector import CombinedTopInspector
     from side_inspector_pipeline import SideConveyorInspector
