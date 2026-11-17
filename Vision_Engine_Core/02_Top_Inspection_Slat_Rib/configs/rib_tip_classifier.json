@@ -1,0 +1,70 @@
+{
+  "model_type": "logistic_regression_standard_scaled",
+  "feature_names": [
+    "pv",
+    "sag",
+    "idev",
+    "tdev",
+    "left_max",
+    "right_max",
+    "asym",
+    "left_slope",
+    "right_slope",
+    "coh_run"
+  ],
+  "scaler_mean": [
+    5.763084,
+    4.777222,
+    3.691742,
+    4.372881,
+    4.477532,
+    5.448634,
+    2.360338,
+    -0.048617,
+    -0.045409,
+    7.59292
+  ],
+  "scaler_scale": [
+    2.131066,
+    2.624814,
+    1.593334,
+    4.229995,
+    2.696737,
+    3.221282,
+    1.956873,
+    0.251878,
+    0.493949,
+    2.487623
+  ],
+  "weights": [
+    1.128785,
+    -0.544211,
+    1.666725,
+    0.694227,
+    0.112443,
+    -0.435167,
+    -1.097472,
+    1.308598,
+    1.633322,
+    -0.285293
+  ],
+  "bias": -3.070583,
+  "prob_threshold": 0.5,
+  "metadata": {
+    "trained_at": "2026-11-16T13:08:03",
+    "db_path": "C:\\File Rayidha\\Internship\\Project\\Database\\AI_Slat_Rib_Conveyor.db",
+    "camera_profile": "ALL",
+    "n_total": 113,
+    "n_ok": 96,
+    "n_ng": 17,
+    "cv_folds": 5,
+    "tp": 16,
+    "tn": 92,
+    "fp": 4,
+    "fn": 1,
+    "precision": 0.8,
+    "recall": 0.9412,
+    "f1": 0.8649,
+    "auc": 0.9908
+  }
+}

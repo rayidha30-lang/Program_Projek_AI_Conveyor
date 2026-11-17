@@ -12,7 +12,7 @@ import json
 import threading
 import time
 from datetime import datetime, timedelta
-from db import get_connection, purge_expired_inspections
+from db import get_connection, purge_expired_inspections, resolve_db_path
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -510,11 +510,17 @@ def get_image():
     if not path or not os.path.exists(path):
         # Cek path relatif jika path awal tidak langsung ditemukan
         if path:
-            base_proj = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            rel_path = path.lstrip("/\\")
+            db_dir = os.path.dirname(os.path.abspath(resolve_db_path()))
+            program_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            base_proj = os.path.abspath(os.path.join(program_dir, ".."))
             candidates = [
-                os.path.join(base_proj, path.lstrip("/\\")),
-                os.path.join(base_proj, "Database", path.lstrip("/\\")),
-                os.path.join(base_proj, "Database", "captures", path.lstrip("/\\")),
+                os.path.join(db_dir, rel_path),
+                os.path.join(db_dir, "captures", rel_path),
+                os.path.join(program_dir, rel_path),
+                os.path.join(base_proj, rel_path),
+                os.path.join(base_proj, "Database", rel_path),
+                os.path.join(base_proj, "Database", "captures", rel_path),
             ]
             for c in candidates:
                 if os.path.exists(c):

@@ -21,11 +21,11 @@ import {
   type TopInspectionThresholds,
 } from "@/lib/api";
 
-// Nilai Default Emas (Baseline Aman Teruji)
+// Nilai Default Emas (Selaras dengan top_inspection_config.default.json)
 const GOLDEN_DEFAULTS: TopInspectionThresholds = {
-  rib_tip_threshold: 9.5,
-  rib_dev_threshold: 8.5,
-  rib_pv_threshold: 14.0,
+  rib_tip_threshold: 8.5,
+  rib_dev_threshold: 8.0,
+  rib_pv_threshold: 11.5,
   rib_sagitta_threshold: 11.5,
   rib_conf_threshold: 0.55,
   max_flatness_pv: 16.5,
@@ -132,7 +132,7 @@ export default function TuningSettings({ theme = "dark" }: TuningSettingsProps) 
               Skala Metrologi: 0.515 mm/px
             </span>
             <span className="text-[11px] text-muted-foreground hidden sm:inline">
-              • Parameter langsung diterapkan ke kamera secara seketika tanpa restart
+              • Simpan ke config; tekan [H] di jendela kamera untuk beralih Dataset ↔ Web (auto hot-reload)
             </span>
           </div>
 

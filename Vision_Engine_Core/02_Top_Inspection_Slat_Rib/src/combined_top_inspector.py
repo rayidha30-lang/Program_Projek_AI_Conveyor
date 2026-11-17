@@ -485,6 +485,11 @@ class CombinedTopInspector:
         else:
             self.rib_inspector.set_prime_zone(355, 435)
 
+        # Sumber threshold aktif: default "DATASET" (Rib_Dataset adaptive), tekan [H] untuk beralih ke "WEB"
+        self.threshold_source_mode = "DATASET"
+        self._config_mtime = os.path.getmtime(config_path) if (config_path and os.path.exists(config_path)) else 0.0
+        self._last_hot_reload_check = 0.0
+
         # Variabel State Kalibrasi Cepat Konveyor (Quick Re-Alignment)
         self.is_calibrating = False
         self.calib_frames_target = 60
@@ -498,10 +503,11 @@ class CombinedTopInspector:
         self.latched_slat_data = None
         self.latched_hold_frames = 0
 
-        # Single-Capture Per-Object Latch & Best-Shot Peak Buffer
+        # Single-Capture Per-Object Latch & Best-Shot Peak Buffer (Terpisah Slat vs Rib)
         self.logged_slat_id = None
         self.logged_rib_id = None
-        self._best_top_candidate = None
+        self._best_slat_candidate = None
+        self._best_rib_candidate = None
         self._current_slat_cycle_id = None
         self._current_rib_cycle_id = None
         self._last_emitted_slat_id = None
@@ -577,7 +583,8 @@ class CombinedTopInspector:
             self.latched_hold_frames = 0
             self.logged_slat_id = None
             self.logged_rib_id = None
-            self._best_top_candidate = None
+            self._best_slat_candidate = None
+            self._best_rib_candidate = None
             self._current_slat_cycle_id = None
             self._current_rib_cycle_id = None
             self._last_emitted_slat_id = None
@@ -591,17 +598,28 @@ class CombinedTopInspector:
             return self.db_bridge.toggle()
         return False
 
-    def apply_config_dict(self, cfg):
+    def apply_config_dict(self, cfg, apply_geometry=True):
         """Menerapkan konfigurasi dictionary ke Slat & Rib Inspector saat runtime."""
         if not cfg or not isinstance(cfg, dict):
             return False
 
         with self._inspect_lock:
-            # Terapkan Matriks Rektifikasi Virtual Citra (Metode 4)
-            if "rectification_matrix" in cfg and cfg["rectification_matrix"] is not None:
-                self.rect_matrix = np.array(cfg["rectification_matrix"], dtype=np.float32)
-            else:
-                self.rect_matrix = None
+            if apply_geometry:
+                # Terapkan Matriks Rektifikasi Virtual Citra (Metode 4)
+                if "rectification_matrix" in cfg and cfg["rectification_matrix"] is not None:
+                    self.rect_matrix = np.array(cfg["rectification_matrix"], dtype=np.float32)
+                else:
+                    self.rect_matrix = None
+
+                if "slat_polygon" in cfg and len(cfg["slat_polygon"]) >= 4:
+                    self.slat_polygon = cfg["slat_polygon"]
+                    self._update_slat_y_bounds()
+
+                if "rib_polygon" in cfg and len(cfg["rib_polygon"]) >= 4:
+                    self.rib_zone = cfg["rib_polygon"]
+
+                if "calibration_profile" in cfg:
+                    self._apply_golden_reference(cfg["calibration_profile"])
 
             th = cfg.get("thresholds", {})
             if "max_flatness_pv" in th:
@@ -610,44 +628,132 @@ class CombinedTopInspector:
                 self.slat_inspector.max_sagitta = float(th["max_sagitta"])
             if "max_center_void" in th:
                 self.slat_inspector.max_center_void = int(th["max_center_void"])
+            if "min_continuity_cov" in th:
+                self.slat_inspector.min_continuity_cov = float(th["min_continuity_cov"])
 
             if "rib_pv_threshold" in th:
                 self.rib_inspector.pv_thresh = float(th["rib_pv_threshold"])
+                self.rib_inspector._base_pv_thresh = self.rib_inspector.pv_thresh
             if "rib_sagitta_threshold" in th:
                 self.rib_inspector.sagitta_thresh = float(th["rib_sagitta_threshold"])
+                self.rib_inspector._base_sagitta_thresh = self.rib_inspector.sagitta_thresh
             if "rib_dev_threshold" in th or "rib_max_dev_threshold" in th:
                 dev_val = th.get("rib_dev_threshold", th.get("rib_max_dev_threshold"))
                 self.rib_inspector.dev_thresh = float(dev_val)
+                self.rib_inspector._base_dev_thresh = self.rib_inspector.dev_thresh
             if "rib_tip_threshold" in th:
                 self.rib_inspector.tip_thresh = float(th["rib_tip_threshold"])
+                self.rib_inspector._base_tip_thresh = self.rib_inspector.tip_thresh
+            if "rib_conf_threshold" in th:
+                self.rib_inspector.conf_thresh = float(th["rib_conf_threshold"])
             if "rib_severity_zones" in th:
                 self.rib_inspector._severity_zones = th["rib_severity_zones"]
 
-            pmin = th.get("rib_prime_min_y", 355)
-            pmax = th.get("rib_prime_max_y", 435)
-            self.rib_inspector.set_prime_zone(pmin, pmax)
-
-            if "slat_polygon" in cfg and len(cfg["slat_polygon"]) >= 4:
-                self.slat_polygon = cfg["slat_polygon"]
-                self._update_slat_y_bounds()
-
-            if "rib_polygon" in cfg and len(cfg["rib_polygon"]) >= 4:
-                self.rib_zone = cfg["rib_polygon"]
-
-            if "calibration_profile" in cfg:
-                self._apply_golden_reference(cfg["calibration_profile"])
+            if "rib_prime_min_y" in th or "rib_prime_max_y" in th:
+                pmin = th.get("rib_prime_min_y", self.rib_inspector.prime_min_y)
+                pmax = th.get("rib_prime_max_y", self.rib_inspector.prime_max_y)
+                self.rib_inspector.set_prime_zone(pmin, pmax)
 
             return True
+
+    def _sync_config_mtime(self):
+        try:
+            if self.config_path and os.path.exists(self.config_path):
+                self._config_mtime = os.path.getmtime(self.config_path)
+        except Exception:
+            pass
+
+    def _apply_dataset_adaptive_thresholds(self):
+        """Memuat ulang adaptive threshold dari Rib_Dataset untuk profil aktif."""
+        if self.db_bridge is not None and hasattr(self.db_bridge, "db_path"):
+            return self.rib_inspector.load_adaptive_thresholds(
+                db_path=self.db_bridge.db_path,
+                camera_profile=self.active_profile_name or None
+            )
+        return False
+
+    def toggle_threshold_source(self):
+        """
+        Beralih antara sumber threshold:
+        - 'DATASET': baseline config + adaptive threshold Rib_Dataset (default startup)
+        - 'WEB'    : parameter murni dari Web Dashboard (top_inspection_config.json) + auto hot-reload
+        """
+        with self._inspect_lock:
+            target_mode = "WEB" if self.threshold_source_mode == "DATASET" else "DATASET"
+            cfg = None
+            if self.config_path and os.path.exists(self.config_path):
+                try:
+                    with open(self.config_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                except Exception as err:
+                    print(f"[!] Gagal membaca {os.path.basename(self.config_path)}: {err}")
+
+            if cfg is not None:
+                self.apply_config_dict(cfg, apply_geometry=False)
+            self._sync_config_mtime()
+            self.threshold_source_mode = target_mode
+
+            if target_mode == "DATASET":
+                self._apply_dataset_adaptive_thresholds()
+                self.profile_banner_text = "MODE THRESHOLD: AUTO DATASET (Rib_Dataset)"
+                print("\n" + "=" * 70)
+                print("[CombinedTopInspector] 📊 BERALIH KE THRESHOLD HASIL DATASET (AUTO ADAPTIVE)")
+            else:
+                self.profile_banner_text = "MODE THRESHOLD: WEB DASHBOARD (Hot-Reload Aktif)"
+                print("\n" + "=" * 70)
+                print("[CombinedTopInspector] 🌐 BERALIH KE PARAMETER WEB DASHBOARD (HOT-RELOAD AKTIF)")
+
+            self.profile_banner_timer = 90
+            print(
+                f"[*] Rib  : PV<={self.rib_inspector.pv_thresh:.2f}px | Sag<={self.rib_inspector.sagitta_thresh:.2f}px | "
+                f"Dev<={self.rib_inspector.dev_thresh:.2f}px | Tip<={self.rib_inspector.tip_thresh:.2f}px | "
+                f"Conf>={self.rib_inspector.conf_thresh:.2f}"
+            )
+            print(
+                f"[*] Slat : PV<={self.slat_inspector.max_flatness_pv:.2f}px | Sag<={self.slat_inspector.max_sagitta:.2f}px | "
+                f"Void<{self.slat_inspector.max_center_void}px"
+            )
+            print("=" * 70 + "\n")
+            return self.threshold_source_mode
+
+    def _check_web_config_hot_reload(self):
+        """Hot-reload threshold dari top_inspection_config.json jika mode WEB aktif."""
+        if getattr(self, "threshold_source_mode", "DATASET") != "WEB":
+            return False
+        if not self.config_path or not os.path.exists(self.config_path):
+            return False
+        now = time.time()
+        if (now - getattr(self, "_last_hot_reload_check", 0.0)) < 0.5:
+            return False
+        self._last_hot_reload_check = now
+        try:
+            mtime = os.path.getmtime(self.config_path)
+            if mtime > getattr(self, "_config_mtime", 0.0):
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                self.apply_config_dict(cfg, apply_geometry=False)
+                self._config_mtime = mtime
+                self.profile_banner_text = "HOT-RELOAD: Parameter Web Dashboard Diperbarui!"
+                self.profile_banner_timer = 90
+                print(
+                    f"[HOT-RELOAD WEB] Config diperbarui | Rib PV<={self.rib_inspector.pv_thresh:.2f}, "
+                    f"Sag<={self.rib_inspector.sagitta_thresh:.2f}, Dev<={self.rib_inspector.dev_thresh:.2f}, "
+                    f"Tip<={self.rib_inspector.tip_thresh:.2f} | Slat PV<={self.slat_inspector.max_flatness_pv:.2f}"
+                )
+                return True
+        except Exception:
+            pass
+        return False
 
     def toggle_alignment_guides(self):
         """Membalik status tampilan garis referensi rel & sumbu konveyor (ON <-> OFF)."""
         self.show_alignment_guides = not getattr(self, "show_alignment_guides", False)
         return self.show_alignment_guides
 
-    def restore_default_profile(self):
+    def restore_default_profile(self, preserve_web_thresholds=False):
         """
         Mengembalikan konfigurasi ke Profil Default Stabil (Baseline Terbukti).
-        Memulihkan file config aktif dan menerapkan langsung ke memory inspector.
+        Jika preserve_web_thresholds=False (tombol [U]), reset total termasuk kembali ke mode DATASET.
         """
         if not os.path.exists(self.default_config_path):
             print(f"[!] File default config tidak ditemukan: {self.default_config_path}")
@@ -655,26 +761,33 @@ class CombinedTopInspector:
 
         with self._inspect_lock:
             try:
-                with open(self.default_config_path, "r") as f:
+                with open(self.default_config_path, "r", encoding="utf-8") as f:
                     cfg_default = json.load(f)
 
-                self.apply_config_dict(cfg_default)
+                if preserve_web_thresholds and getattr(self, "threshold_source_mode", "DATASET") == "WEB":
+                    if os.path.exists(self.config_path):
+                        with open(self.config_path, "r", encoding="utf-8") as f_cur:
+                            cur_cfg = json.load(f_cur)
+                        if isinstance(cur_cfg.get("thresholds"), dict):
+                            cfg_default["thresholds"] = cur_cfg["thresholds"]
 
-                with open(self.config_path, "w") as f:
+                self.apply_config_dict(cfg_default, apply_geometry=True)
+
+                with open(self.config_path, "w", encoding="utf-8") as f:
                     json.dump(cfg_default, f, indent=2)
+                self._sync_config_mtime()
 
                 self.active_profile_name = cfg_default.get("profile_name", "DEFAULT_STABIL")
-                if self.db_bridge is not None and hasattr(self.db_bridge, "db_path"):
-                    self.rib_inspector.load_adaptive_thresholds(
-                        db_path=self.db_bridge.db_path,
-                        camera_profile=self.active_profile_name or None
-                    )
+                if not preserve_web_thresholds:
+                    self.threshold_source_mode = "DATASET"
+                    self._apply_dataset_adaptive_thresholds()
                 self.profile_banner_text = "PROFIL PULIH: DEFAULT STABIL (Tanpa Rektifikasi)"
                 self.profile_banner_timer = 90
                 print("\n" + "=" * 70)
                 print("[CombinedTopInspector] ✅ BERHASIL DIKEMBALIKAN KE PROFIL DEFAULT STABIL!")
                 print(f"[*] Config Aktif: {os.path.basename(self.config_path)} (Dipulihkan dari .default.json)")
                 print(f"[*] Rektifikasi : {'AKTIF' if self.rect_matrix is not None else 'NON-AKTIF (Asli)'}")
+                print(f"[*] Mode Thresh : {self.threshold_source_mode}")
                 print(f"[*] Parameter   : Rib PV={self.rib_inspector.pv_thresh:.1f}px, Tip={self.rib_inspector.tip_thresh:.1f}px, Prime=[{self.rib_inspector.prime_min_y}, {self.rib_inspector.prime_max_y}]")
                 print("=" * 70 + "\n")
                 return True
@@ -693,26 +806,32 @@ class CombinedTopInspector:
 
         with self._inspect_lock:
             try:
-                with open(self.calibrated_config_path, "r") as f:
+                with open(self.calibrated_config_path, "r", encoding="utf-8") as f:
                     cfg_calib = json.load(f)
 
-                self.apply_config_dict(cfg_calib)
+                keep_web = (getattr(self, "threshold_source_mode", "DATASET") == "WEB")
+                if keep_web and os.path.exists(self.config_path):
+                    with open(self.config_path, "r", encoding="utf-8") as f_cur:
+                        cur_cfg = json.load(f_cur)
+                    if isinstance(cur_cfg.get("thresholds"), dict):
+                        cfg_calib["thresholds"] = cur_cfg["thresholds"]
 
-                with open(self.config_path, "w") as f:
+                self.apply_config_dict(cfg_calib, apply_geometry=True)
+
+                with open(self.config_path, "w", encoding="utf-8") as f:
                     json.dump(cfg_calib, f, indent=2)
+                self._sync_config_mtime()
 
                 self.active_profile_name = cfg_calib.get("profile_name", "HASIL_KALIBRASI")
-                if self.db_bridge is not None and hasattr(self.db_bridge, "db_path"):
-                    self.rib_inspector.load_adaptive_thresholds(
-                        db_path=self.db_bridge.db_path,
-                        camera_profile=self.active_profile_name or None
-                    )
+                if not keep_web:
+                    self._apply_dataset_adaptive_thresholds()
                 self.profile_banner_text = "PROFIL AKTIF: HASIL KALIBRASI (Rektifikasi Aktif)"
                 self.profile_banner_timer = 90
                 print("\n" + "=" * 70)
                 print("[CombinedTopInspector] 🔄 BERALIH KE PROFIL HASIL KALIBRASI!")
                 print(f"[*] Config Aktif: {os.path.basename(self.config_path)} (Dimuat dari .calibrated.json)")
                 print(f"[*] Rektifikasi : {'AKTIF' if self.rect_matrix is not None else 'NON-AKTIF'}")
+                print(f"[*] Mode Thresh : {self.threshold_source_mode}")
                 print(f"[*] Parameter   : Rib PV={self.rib_inspector.pv_thresh:.1f}px, Tip={self.rib_inspector.tip_thresh:.1f}px, Prime=[{self.rib_inspector.prime_min_y}, {self.rib_inspector.prime_max_y}]")
                 print("=" * 70 + "\n")
                 return True
@@ -732,7 +851,8 @@ class CombinedTopInspector:
                     print("\n[!] Profil Kalibrasi belum tersedia. Jalankan kalibrasi [K] terlebih dahulu.\n")
                     return False
             else:
-                return self.restore_default_profile()
+                keep_web = (getattr(self, "threshold_source_mode", "DATASET") == "WEB")
+                return self.restore_default_profile(preserve_web_thresholds=keep_web)
 
     def start_calibration(self, duration_frames=60):
         """Memulai sesi kalibrasi konveyor multi-frame (default 60 frame / ~2-3 detik)."""
@@ -814,6 +934,14 @@ class CombinedTopInspector:
 
                 if "thresholds" not in cfg_data:
                     cfg_data["thresholds"] = {}
+                if getattr(self, "threshold_source_mode", "DATASET") == "WEB" and os.path.exists(self.config_path):
+                    try:
+                        with open(self.config_path, "r", encoding="utf-8") as f_cur:
+                            cur_cfg = json.load(f_cur)
+                        if isinstance(cur_cfg.get("thresholds"), dict):
+                            cfg_data["thresholds"] = cur_cfg["thresholds"]
+                    except Exception:
+                        pass
                 cfg_data["thresholds"]["bracket_tilt_deg"] = calib_res["measured_tilt_deg"]
 
                 if "calibration_profile" not in cfg_data:
@@ -849,6 +977,7 @@ class CombinedTopInspector:
                 # Simpan ke config aktif dan file calibrated.json
                 with open(self.config_path, "w") as f:
                     json.dump(cfg_data, f, indent=2)
+                self._sync_config_mtime()
 
                 if hasattr(self, "calibrated_config_path") and self.calibrated_config_path:
                     with open(self.calibrated_config_path, "w") as f:
@@ -892,7 +1021,27 @@ class CombinedTopInspector:
 
             with self._inspect_lock:
                 self.rect_matrix = np.array(M, dtype=np.float32)
+                saved_web_th = None
+                if getattr(self, "threshold_source_mode", "DATASET") == "WEB" and os.path.exists(self.config_path):
+                    try:
+                        with open(self.config_path, "r", encoding="utf-8") as f_cur:
+                            saved_web_th = json.load(f_cur).get("thresholds")
+                    except Exception:
+                        saved_web_th = None
                 calib.save_calibration_to_config()
+                if isinstance(saved_web_th, dict) and os.path.exists(self.config_path):
+                    try:
+                        with open(self.config_path, "r", encoding="utf-8") as f_new:
+                            new_cfg = json.load(f_new)
+                        tilt_new = new_cfg.get("thresholds", {}).get("bracket_tilt_deg")
+                        new_cfg["thresholds"] = saved_web_th
+                        if tilt_new is not None:
+                            new_cfg["thresholds"]["bracket_tilt_deg"] = tilt_new
+                        with open(self.config_path, "w", encoding="utf-8") as f_out:
+                            json.dump(new_cfg, f_out, indent=2)
+                    except Exception:
+                        pass
+                self._sync_config_mtime()
                 self.active_profile_name = "HASIL_KALIBRASI"
                 tilt_val = calib.metrology.get("measured_tilt_deg", 0.0)
                 offset_val = calib.metrology.get("lateral_offset_px", 0.0)
@@ -1021,7 +1170,7 @@ class CombinedTopInspector:
         s_pv = float(slat_res.get("pv_flatness", 0.0) or 0.0)
         s_sag = float(slat_res.get("sagitta", 0.0) or 0.0)
         s_void = int(slat_res.get("center_void", 0) or 0)
-        r_dev = float(rib_res.get("max_dev", rib_res.get("dev", 0.0)) or 0.0)
+        r_dev = self._extract_rib_deviation(rib_res)
         r_sag = float(rib_res.get("sagitta", 0.0) or 0.0)
 
         s_stat = slat_res.get("status", "WAIT")
@@ -1042,107 +1191,161 @@ class CombinedTopInspector:
 
         return ann
 
+    @staticmethod
+    def _extract_rib_deviation(rib_res):
+        """Ambil nilai deviasi rib terbesar dari berbagai key hasil inspeksi."""
+        if not rib_res:
+            return 0.0
+        for key in ("max_deviation", "max_dev", "dev"):
+            val = rib_res.get(key)
+            if val is not None and float(val) > 0.0:
+                return float(val)
+        inner_v = float(rib_res.get("inner_dev", 0.0) or 0.0)
+        tip_v = float(rib_res.get("tip_dev", 0.0) or 0.0)
+        return max(inner_v, tip_v)
+
     def purge_top_candidate_if_ok(self, curr_slat_ok=False, curr_rib_ok=False, slat_no=None, rib_no=None):
         """
         Mekanisme Transactional Latch:
-        Membatalkan (purge) kandidat Best-Shot di memori jika vonis akhir objek menyatakan OK.
-        Mencegah 100% bug desinkronisasi di mana frame NG prematur tersimpan padahal counter QC = OK.
+        Membatalkan (purge) kandidat Best-Shot Slat/Rib secara independen jika vonis menjadi OK.
         """
-        if self._best_top_candidate is None:
-            return
+        if self._best_rib_candidate is not None:
+            cand_rib_no = self._best_rib_candidate.get("rib_no")
+            committed_rib = (
+                self.rib_inspector.get_committed_status(cand_rib_no)
+                if hasattr(self.rib_inspector, "get_committed_status")
+                else None
+            )
+            if committed_rib == "OK" or (curr_rib_ok and (rib_no is None or rib_no == cand_rib_no)):
+                self._best_rib_candidate = None
 
-        cand = self._best_top_candidate
-        cand_rib_ng = bool(cand.get("rib_res", {}).get("is_ng", False))
-        cand_slat_ng = bool(cand.get("slat_res", {}).get("is_ng", False))
-        cand_rib_no = cand.get("rib_no")
-        cand_slat_no = cand.get("slat_no")
+        if self._best_slat_candidate is not None:
+            cand_slat_no = self._best_slat_candidate.get("slat_no")
+            if curr_slat_ok and (slat_no is None or slat_no == cand_slat_no):
+                self._best_slat_candidate = None
 
-        # Kasus 1: Rib dikonfirmasi OK dan kandidat hanya berisi cacat Rib
-        if curr_rib_ok and cand_rib_ng and not cand_slat_ng:
-            if rib_no is None or rib_no == cand_rib_no:
-                self._best_top_candidate = None
-                return
-
-        # Kasus 2: Slat dikonfirmasi OK dan kandidat hanya berisi cacat Slat
-        if curr_slat_ok and cand_slat_ng and not cand_rib_ng:
-            if slat_no is None or slat_no == cand_slat_no:
-                self._best_top_candidate = None
-                return
-
-        # Kasus 3: Keduanya dikonfirmasi OK
-        if curr_rib_ok and curr_slat_ok:
-            self._best_top_candidate = None
-            return
-
-        # Kasus 4: Kandidat gabungan, tapi salah satu terbukti OK
-        if curr_rib_ok and cand_rib_ng and cand_slat_ng:
-            cand["rib_res"]["is_ng"] = False
-            cand["rib_res"]["status"] = "OK"
-        if curr_slat_ok and cand_slat_ng and cand_rib_ng:
-            cand["slat_res"]["is_ng"] = False
-            cand["slat_res"]["status"] = "OK"
-
-    def flush_best_shot_if_needed(self):
-        """
-        Memancarkan kandidat Best-Shot ke db_bridge jika siklus selesai dan terdapat NG terkonfirmasi.
-        Menjamin frame yang tersimpan adalah frame dengan keparahan puncak (Peak Abnormality).
-        """
-        if self._best_top_candidate is None:
+    def _flush_slat_candidate_if_needed(self):
+        """Memancarkan kandidat Best-Shot PLAT SLAT ke db_bridge saat siklus slat selesai."""
+        if self._best_slat_candidate is None:
             return False
-        cand = self._best_top_candidate
+        cand = self._best_slat_candidate
+        self._best_slat_candidate = None
 
         slat_no = cand.get("slat_no")
-        rib_no = cand.get("rib_no")
-        cand_slat_no = slat_no
-        cand_rib_no = rib_no
-
-        # Validasi ganda terhadap status riil inspector saat ini
-        cand_rib_ng = bool(cand.get("rib_res", {}).get("is_ng", False))
-        cand_slat_ng = bool(cand.get("slat_res", {}).get("is_ng", False))
-
-        current_rib_stat = getattr(self.rib_inspector, "current_rib_status", None)
         current_slat_stat = getattr(self.slat_inspector, "latched_status", None)
-        current_rib_count = getattr(self.rib_inspector, "rib_count", 0)
         current_slat_count = getattr(self.slat_inspector, "slat_count", 0)
-
-        # Jika kandidat tercatat Rib NG tapi vonis akhir sirip tersebut OK -> Batalkan emisi!
-        if cand_rib_ng and not cand_slat_ng:
-            if cand_rib_no == current_rib_count and current_rib_stat == "OK":
-                self._best_top_candidate = None
-                return False
-
-        # Jika kandidat tercatat Slat NG tapi vonis akhir plat tersebut OK -> Batalkan emisi!
-        if cand_slat_ng and not cand_rib_ng:
-            if cand_slat_no == current_slat_count and current_slat_stat == "OK":
-                self._best_top_candidate = None
-                return False
-
-        self._best_top_candidate = None
-
-        # Cek deduplikasi agar 1 siklus NG tidak pernah di-emit ganda
-        if slat_no is not None and slat_no == self._last_emitted_slat_id and rib_no == self._last_emitted_rib_id:
+        if slat_no == current_slat_count and current_slat_stat == "OK":
+            return False
+        if slat_no is not None and slat_no == self._last_emitted_slat_id:
             return False
 
         self._last_emitted_slat_id = slat_no
-        self._last_emitted_rib_id = rib_no
-
         if self.db_bridge is not None and self.db_bridge.is_enabled():
             return self.db_bridge.emit_top_inspection(
                 frame_raw=cand["frame_raw"],
                 frame_ann=cand["frame_ann"],
                 slat_result=cand["slat_res"],
-                rib_result=cand["rib_res"],
+                rib_result=None,
                 slat_number=slat_no,
-                rib_number=rib_no
+                rib_number=cand.get("rib_no"),
             )
         return False
 
+    def _flush_rib_candidate_if_needed(self, force_final=False):
+        """Memancarkan kandidat Best-Shot RIB ke db_bridge hanya setelah vonis rib final."""
+        if self._best_rib_candidate is None:
+            return False
+        cand = self._best_rib_candidate
+        rib_no = cand.get("rib_no")
+
+        committed_stat = (
+            self.rib_inspector.get_committed_status(rib_no)
+            if hasattr(self.rib_inspector, "get_committed_status")
+            else None
+        )
+        current_rib_stat = getattr(self.rib_inspector, "current_rib_status", None)
+        current_rib_count = getattr(self.rib_inspector, "rib_count", 0)
+
+        # Jika sesi rib belum final/komit dan bukan shutdown paksa, tahan di buffer!
+        if hasattr(self.rib_inspector, "get_committed_status") and committed_stat is None and not force_final:
+            if rib_no == current_rib_count:
+                return False
+
+        self._best_rib_candidate = None
+
+        if committed_stat == "OK":
+            return False
+        if committed_stat is None and rib_no == current_rib_count and current_rib_stat == "OK":
+            return False
+        if committed_stat is None and force_final and current_rib_stat != "NG":
+            return False
+
+        if rib_no is not None and rib_no == self._last_emitted_rib_id:
+            return False
+
+        self._last_emitted_rib_id = rib_no
+        if self.db_bridge is not None and self.db_bridge.is_enabled():
+            return self.db_bridge.emit_top_inspection(
+                frame_raw=cand["frame_raw"],
+                frame_ann=cand["frame_ann"],
+                slat_result=None,
+                rib_result=cand["rib_res"],
+                slat_number=cand.get("slat_no"),
+                rib_number=rib_no,
+            )
+        return False
+
+    def flush_best_shot_if_needed(self, force_final=False):
+        """Memancarkan kandidat Best-Shot Slat dan Rib yang sudah selesai siklusnya."""
+        res_slat = self._flush_slat_candidate_if_needed()
+        res_rib = self._flush_rib_candidate_if_needed(force_final=force_final)
+        return bool(res_slat or res_rib)
+
+    def _sync_recording_lifecycle(self, slat_res, rib_res, slat_no=None, rib_no=None):
+        """Sinkronisasi siklus Slat dan Rib secara terpisah pada setiap frame tanpa render HUD."""
+        slat_res = slat_res or {}
+        rib_res = rib_res or {}
+        curr_slat_no = slat_no if slat_no is not None else getattr(self.slat_inspector, "slat_count", 0)
+        curr_rib_no = rib_no if rib_no is not None else getattr(self.rib_inspector, "rib_count", 0)
+
+        # 1a. Siklus Slat independen: pergantian slat hanya men-flush kandidat slat
+        slat_changed = (self._current_slat_cycle_id is not None and curr_slat_no != self._current_slat_cycle_id)
+        if slat_changed:
+            self._flush_slat_candidate_if_needed()
+            self._current_slat_cycle_id = curr_slat_no
+        elif self._current_slat_cycle_id is None:
+            self._current_slat_cycle_id = curr_slat_no
+
+        # 1b. Siklus Rib independen: flush hanya bila sesi rib sudah komit final atau rib berganti
+        rib_changed = (self._current_rib_cycle_id is not None and curr_rib_no != self._current_rib_cycle_id and curr_rib_no > 0)
+        cand_rib_no = self._best_rib_candidate.get("rib_no") if self._best_rib_candidate else None
+        rib_committed = (
+            cand_rib_no is not None
+            and hasattr(self.rib_inspector, "get_committed_status")
+            and self.rib_inspector.get_committed_status(cand_rib_no) is not None
+        )
+        if rib_committed or rib_changed:
+            self._flush_rib_candidate_if_needed()
+            self._current_rib_cycle_id = curr_rib_no
+        elif self._current_rib_cycle_id is None:
+            self._current_rib_cycle_id = curr_rib_no
+
+        # 2. Transactional Purge segera bila status berbalik menjadi OK
+        curr_rib_ok = bool(rib_res.get("is_ok", False)) or (rib_res.get("status") == "OK")
+        curr_slat_ok = bool(slat_res.get("is_ok", False)) or (slat_res.get("status") == "OK")
+        if curr_rib_ok or curr_slat_ok or self._best_rib_candidate is not None or self._best_slat_candidate is not None:
+            self.purge_top_candidate_if_ok(
+                curr_slat_ok=curr_slat_ok,
+                curr_rib_ok=curr_rib_ok,
+                slat_no=curr_slat_no,
+                rib_no=curr_rib_no,
+            )
+        return curr_slat_no, curr_rib_no
+
     def record_if_ng(self, frame_raw, frame_ann, inspect_res, slat_no=None, rib_no=None):
         """
-        Merekam frame ke SQLite & folder captures menggunakan mekanisme Best-Shot Peak Buffer.
-        Alih-alih langsung menyimpan frame awal yang terpotong saat baru masuk, sistem mengumpulkan
-        kandidat selama objek melintas dan menyimpan frame dengan deviasi keparahan tertinggi (Peak Abnormality)
-        langsung pada resolusi penuh kamera asli (1080p).
+        Merekam frame ke buffer Best-Shot Slat/Rib secara terpisah.
+        Kandidat Rib hanya di-emit ke DB/Teams setelah rib selesai melintas ROI dengan vonis final NG.
         """
         if self.db_bridge is None or not self.db_bridge.is_enabled():
             return False
@@ -1150,31 +1353,9 @@ class CombinedTopInspector:
         slat_res = inspect_res.get("slat_res", {}) if inspect_res else {}
         rib_res = inspect_res.get("rib_res", {}) if inspect_res else {}
 
-        curr_slat_no = slat_no if slat_no is not None else getattr(self.slat_inspector, "slat_count", 0)
-        curr_rib_no = rib_no if rib_no is not None else getattr(self.rib_inspector, "rib_count", 0)
-
-        # 1. Deteksi pergantian siklus (Slat berganti ATAU Rib berganti)
-        slat_changed = (self._current_slat_cycle_id is not None and curr_slat_no != self._current_slat_cycle_id)
-        rib_changed = (self._current_rib_cycle_id is not None and curr_rib_no != self._current_rib_cycle_id and curr_rib_no > 0)
-
-        if slat_changed or rib_changed:
-            self.flush_best_shot_if_needed()
-            self._current_slat_cycle_id = curr_slat_no
-            self._current_rib_cycle_id = curr_rib_no
-        elif self._current_slat_cycle_id is None:
-            self._current_slat_cycle_id = curr_slat_no
-            self._current_rib_cycle_id = curr_rib_no
-
-        # 2. Periksa konfirmasi status OK untuk melakukan Transactional Purge
-        curr_rib_ok = bool(rib_res.get("is_ok", False)) or (rib_res.get("status") == "OK")
-        curr_slat_ok = bool(slat_res.get("is_ok", False)) or (slat_res.get("status") == "OK")
-        if curr_rib_ok or curr_slat_ok:
-            self.purge_top_candidate_if_ok(
-                curr_slat_ok=curr_slat_ok,
-                curr_rib_ok=curr_rib_ok,
-                slat_no=curr_slat_no,
-                rib_no=curr_rib_no
-            )
+        curr_slat_no, curr_rib_no = self._sync_recording_lifecycle(
+            slat_res, rib_res, slat_no=slat_no, rib_no=rib_no
+        )
 
         is_slat_ng = bool(slat_res.get("is_ng", False)) and (slat_res.get("status") == "NG")
         is_rib_ng = bool(rib_res.get("is_ng", False)) and (rib_res.get("status") == "NG")
@@ -1189,49 +1370,51 @@ class CombinedTopInspector:
         if not is_slat_ng and not is_rib_ng:
             return False
 
-        # 3. Hitung severity score (tingkat keparahan cacat) pada frame saat ini
-        slat_score = 0.0
+        updated = False
+
+        # 3a. Update kandidat Best-Shot SLAT jika lebih parah
         if is_slat_ng:
             s_pv = float(slat_res.get("pv_flatness", 0.0) or 0.0)
             s_sag = float(slat_res.get("sagitta", 0.0) or 0.0)
             s_void = float(slat_res.get("center_void", 0) or 0) / 40.0
             slat_score = max(s_pv, s_sag, s_void)
+            if self._best_slat_candidate is None or slat_score > self._best_slat_candidate["severity"]:
+                full_ann = self.render_annotated_fullres(frame_raw, inspect_res, curr_slat_no, curr_rib_no)
+                self._best_slat_candidate = {
+                    "severity": slat_score,
+                    "frame_raw": frame_raw.copy() if frame_raw is not None else None,
+                    "frame_ann": full_ann if full_ann is not None else frame_ann,
+                    "slat_res": dict(slat_res),
+                    "slat_no": curr_slat_no,
+                    "rib_no": curr_rib_no,
+                }
+                updated = True
 
-        rib_score = 0.0
+        # 3b. Update kandidat Best-Shot RIB jika lebih parah
         if is_rib_ng:
-            r_dev = float(rib_res.get("max_dev", rib_res.get("dev", 0.0)) or 0.0)
+            r_dev = self._extract_rib_deviation(rib_res)
             r_sag = float(rib_res.get("sagitta", 0.0) or 0.0)
             rib_score = max(r_dev, r_sag)
+            if self._best_rib_candidate is None or rib_score > self._best_rib_candidate["severity"]:
+                full_ann = self.render_annotated_fullres(frame_raw, inspect_res, curr_slat_no, curr_rib_no)
+                self._best_rib_candidate = {
+                    "severity": rib_score,
+                    "frame_raw": frame_raw.copy() if frame_raw is not None else None,
+                    "frame_ann": full_ann if full_ann is not None else frame_ann,
+                    "rib_res": dict(rib_res),
+                    "slat_no": curr_slat_no,
+                    "rib_no": curr_rib_no,
+                }
+                updated = True
 
-        total_severity = max(slat_score, rib_score)
-
-        # 4. Update kandidat Best-Shot jika frame ini memiliki keparahan lebih tinggi
-        need_update = False
-        if self._best_top_candidate is None:
-            need_update = True
-        elif total_severity > self._best_top_candidate["severity"]:
-            need_update = True
-
-        if need_update:
-            # Render anotasi 1080p full-res hanya saat frame terbaik terdeteksi (Zero FPS impact)
-            full_ann = self.render_annotated_fullres(frame_raw, inspect_res, curr_slat_no, curr_rib_no)
-            self._best_top_candidate = {
-                "severity": total_severity,
-                "frame_raw": frame_raw.copy() if frame_raw is not None else None,
-                "frame_ann": full_ann if full_ann is not None else frame_ann,
-                "slat_res": dict(slat_res),
-                "rib_res": dict(rib_res),
-                "slat_no": curr_slat_no,
-                "rib_no": curr_rib_no
-            }
-            return True
-
-        return False
+        return updated
 
     def close(self):
         """Pembersihan resource saat ditutup."""
         try:
-            self.flush_best_shot_if_needed()
+            if hasattr(self.rib_inspector, "finalize_pending_session"):
+                self.rib_inspector.finalize_pending_session()
+            self.flush_best_shot_if_needed(force_final=True)
         except Exception:
             pass
         if hasattr(self, "db_bridge") and self.db_bridge is not None:
@@ -1258,6 +1441,9 @@ class CombinedTopInspector:
             }
 
         h_f, w_f = frame.shape[:2]
+
+        # Cek hot-reload jika operator sedang memakai mode threshold WEB Dashboard
+        self._check_web_config_hot_reload()
 
         # Proses frame kalibrasi jika mode kalibrasi sedang aktif
         if getattr(self, "is_calibrating", False):
@@ -1312,24 +1498,25 @@ class CombinedTopInspector:
         frame_for_slat = frame_inspected
         is_slat_occluded = False
 
-        # Kumpulkan semua bounding box sirip (active_box + seluruh deteksi YOLO)
+        # Kumpulkan bounding box sirip yang beririsan dengan gerbang slat (hindari frame.copy() 1080p bila jauh di luar zona)
+        y_min_gate = float(getattr(self, "slat_y_min", None) or (0.50 * h_f))
+        y_max_gate = float(getattr(self, "slat_y_max", None) or (0.70 * h_f))
+        gate_top = y_min_gate - 35
+        gate_bot = y_max_gate + 35
+
         all_boxes_to_mask = []
-        if active_box is not None:
+        if active_box is not None and active_box[3] >= gate_top and active_box[1] <= gate_bot:
             all_boxes_to_mask.append(active_box)
         for yb in rib_res.get("yolo_boxes", []):
             b = yb.get("box") if isinstance(yb, dict) else yb
-            if b is not None and b not in all_boxes_to_mask:
+            if b is not None and b[3] >= gate_top and b[1] <= gate_bot and b not in all_boxes_to_mask:
                 all_boxes_to_mask.append(b)
 
         if len(all_boxes_to_mask) > 0:
+            is_slat_occluded = True
             frame_for_slat = frame_inspected.copy()
             for box in all_boxes_to_mask:
                 bx1, by1, bx2, by2 = box
-                # Cek apakah bilah sirip berada di dalam atau mendekati gerbang inspeksi plat slat (aman tanpa None)
-                y_min_gate = float(getattr(self, "slat_y_min", None) or (0.50 * h_f))
-                y_max_gate = float(getattr(self, "slat_y_max", None) or (0.70 * h_f))
-                if by2 >= (y_min_gate - 35) and by1 <= (y_max_gate + 35):
-                    is_slat_occluded = True
 
                 # Ambil sampel warna bersih plat slat dari bawah bilah sirip (atau dari atas jika di dasar frame)
                 sample_y1 = min(h_f - 12, max(0, by2 + 10))
@@ -1520,6 +1707,10 @@ class CombinedTopInspector:
 
         slat_res["is_occluded"] = is_slat_occluded
 
+        # Sinkronkan lifecycle purge/flush kandidat NG secara independen di setiap frame
+        if self.db_bridge is not None and self.db_bridge.is_enabled():
+            self._sync_recording_lifecycle(slat_res, rib_res)
+
         # 6. KONSENSUS STATUS SISTEM TERPADU
         slat_stat = slat_res.get("display_status", slat_res.get("status", "WAIT"))
         rib_stat = rib_res.get("status", "WAIT")
@@ -1656,6 +1847,9 @@ class CombinedTopInspector:
         4. Panel Dashboard Bawah (1000 x 300 px) dengan Kartu Metrologi Plat & Sirip Lengkap.
         """
         h_f, w_f = frame.shape[:2]
+
+        # Cek hot-reload jika operator sedang memakai mode threshold WEB Dashboard
+        self._check_web_config_hot_reload()
         if self._screen_buf is None:
             self._screen_buf = np.zeros((820, 1000, 3), dtype=np.uint8)
 
@@ -1956,8 +2150,9 @@ class CombinedTopInspector:
             eng_badge = "VITERBI"
         else:
             eng_badge = "SOBEL"
-        cv2.putText(hud, f"METROLOGI BILAH SIRIP (HYBRID: {self.rib_inspector.mode} | {eng_badge})", (505, 118),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 2, cv2.LINE_AA)
+        src_badge = "WEB" if getattr(self, "threshold_source_mode", "DATASET") == "WEB" else "DATA"
+        cv2.putText(hud, f"METROLOGI BILAH SIRIP (HYBRID | {eng_badge} | [H]:{src_badge})", (505, 118),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.47, (0, 255, 255), 2, cv2.LINE_AA)
 
         r_pv = rib_res.get("pv_flatness", 0.0) if rib_res else 0.0
         r_sag = rib_res.get("sagitta", 0.0) if rib_res else 0.0
@@ -2265,6 +2460,8 @@ def main():
                 step_backward = True
             else:
                 pipeline.toggle_profile()
+        elif key in [ord('h'), ord('H')]:
+            pipeline.toggle_threshold_source()
         elif key in [ord('k'), ord('K'), ord('a'), ord('A')]:
             if is_paused:
                 step_backward = True

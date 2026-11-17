@@ -71,6 +71,16 @@ try:
 except ImportError:
     HAS_TELEMETRY = False
 
+try:
+    from rib_tip_features import (
+        extract_tip_classifier_features,
+        load_tip_classifier_model,
+        predict_tip_ng_prob,
+    )
+    HAS_TIP_CLASSIFIER = True
+except ImportError:
+    HAS_TIP_CLASSIFIER = False
+
 
 def select_file_dialog(initial_dir=None, title="Pilih File Video / Foto Inspeksi Sirip"):
     """
@@ -182,7 +192,8 @@ class HybridRibInspector:
         tip_thresh=9.5,
         device=None,
         stride=None,
-        tracker_engine="LEGACY"
+        tracker_engine="LEGACY",
+        use_tip_classifier=False
     ):
         """
         :param mode: "HYBRID", "YOLO_ONLY", atau "DUAL_POLARITY_ONLY"
@@ -230,6 +241,11 @@ class HybridRibInspector:
         self.sagitta_thresh = float(sagitta_thresh)
         self.dev_thresh = float(dev_thresh)
         self.tip_thresh = float(tip_thresh)
+        self._base_pv_thresh = self.pv_thresh
+        self._base_sagitta_thresh = self.sagitta_thresh
+        self._base_dev_thresh = self.dev_thresh
+        self._base_tip_thresh = self.tip_thresh
+        self._viterbi_min_tip_thresh = 10.5
 
         # Flag: threshold sudah dimuat dari dataset adaptif (untuk log)
         self._adaptive_loaded = False
@@ -237,6 +253,20 @@ class HybridRibInspector:
         # Pastikan _severity_zones terisi default jika config tidak memuatnya
         if not hasattr(self, "_severity_zones"):
             self._severity_zones = {}
+
+        # Muat Jalur 1 Pure-NumPy Tip Classifier hanya jika diaktifkan (opt-in setelah multi-video training)
+        self.use_tip_classifier = bool(use_tip_classifier)
+        self.tip_classifier_model = None
+        if self.use_tip_classifier and HAS_TIP_CLASSIFIER:
+            _clf_path = os.path.join(parent_dir, "configs", "rib_tip_classifier.json")
+            self.tip_classifier_model = load_tip_classifier_model(_clf_path)
+            if self.tip_classifier_model is not None:
+                _meta = self.tip_classifier_model.get("metadata", {})
+                print(
+                    f"[HybridRibInspector] 🧠 Tip Classifier (Jalur 1) aktif: "
+                    f"n_ok={_meta.get('n_ok', '?')}, n_ng={_meta.get('n_ng', '?')}, "
+                    f"th={self.tip_classifier_model.get('prob_threshold', 0.5):.2f}"
+                )
 
         # 0. Konfigurasi Device Komputasi (CUDA / CPU)
         if device is None or str(device).lower() in ("auto", ""):
@@ -423,6 +453,11 @@ class HybridRibInspector:
         self.ng_count = 0
         self.last_presence = False
         self.current_rib_status = None
+        self._session_committed = False
+        self._committed_rib_statuses = {}
+        self._last_finalized_rib_id = 0
+        self._last_finalized_status = None
+        self._prime_warmup_frames = 0
 
         # Parameter Temporal Voting & Multi-Frame Consensus Anti-Glitch
         self.min_transit_frames = 15
@@ -696,10 +731,11 @@ class HybridRibInspector:
             return "OK"
 
         # Evaluasi severity masing-masing metrik
-        sev_tip  = _zone(eval_tdev,  "tip", self.tip_thresh,         med_add=3.0, high_add=6.0)
-        sev_dev  = _zone(eval_idev,  "dev", self.dev_thresh,         med_add=3.0, high_add=6.0)
-        sev_pv   = _zone(eval_pv,    "pv",  self.pv_thresh,          med_add=2.0, high_add=5.0)
-        sev_sag  = _zone(eval_sag,   "sag", self.sagitta_thresh,     med_add=2.0, high_add=4.0)
+        pv_th, sag_th, dev_th, tip_th = self._get_effective_thresholds()
+        sev_tip  = _zone(eval_tdev,  "tip", tip_th,  med_add=3.0, high_add=6.0)
+        sev_dev  = _zone(eval_idev,  "dev", dev_th,  med_add=3.0, high_add=6.0)
+        sev_pv   = _zone(eval_pv,    "pv",  pv_th,   med_add=2.0, high_add=5.0)
+        sev_sag  = _zone(eval_sag,   "sag", sag_th,  med_add=2.0, high_add=4.0)
 
         # Severity keseluruhan = level tertinggi dari semua metrik
         rank = {"OK": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
@@ -817,9 +853,54 @@ class HybridRibInspector:
         print(f"[HybridRibInspector] Tracker Engine aktif: [{self.tracker_engine}]")
         return self.tracker_engine
 
+    def _commit_rib_session(self):
+        """Mengunci counter QC (ok_count/ng_count) tepat 1 kali saat sesi rib berakhir."""
+        if self.current_rib_status in ("OK", "NG") and not self._session_committed:
+            self._session_committed = True
+            if self.current_rib_status == "NG":
+                self.ng_count += 1
+            else:
+                self.ok_count += 1
+            if self.rib_count > 0:
+                self._committed_rib_statuses[self.rib_count] = self.current_rib_status
+                if len(self._committed_rib_statuses) > 100:
+                    oldest_key = next(iter(self._committed_rib_statuses))
+                    self._committed_rib_statuses.pop(oldest_key, None)
+                self._last_finalized_rib_id = self.rib_count
+                self._last_finalized_status = self.current_rib_status
+
+    def get_committed_status(self, rib_no):
+        """Mengembalikan vonis final yang sudah dikunci untuk rib_no, atau None jika belum final."""
+        if rib_no is None:
+            return None
+        return self._committed_rib_statuses.get(rib_no)
+
+    def finalize_pending_session(self):
+        """Mengunci sesi aktif yang tertunda (misalnya saat video/aplikasi ditutup)."""
+        self._commit_rib_session()
+        return self._last_finalized_status
+
+    def _record_prime_sample(self, pv, sagitta, inner_dev, tip_dev):
+        """Menyimpan sampel metrologi ke buffer Prime Zone setelah melewati warm-up masuk ROI."""
+        self._prime_warmup_frames += 1
+        if self._prime_warmup_frames <= 2:
+            return
+        self.prime_pv_samples.append(pv)
+        self.prime_sagitta_samples.append(sagitta)
+        self.prime_inner_dev_samples.append(inner_dev)
+        self.prime_tip_dev_samples.append(tip_dev)
+        if len(self.prime_pv_samples) > 25:
+            self.prime_pv_samples = self.prime_pv_samples[-25:]
+            self.prime_sagitta_samples = self.prime_sagitta_samples[-25:]
+            self.prime_inner_dev_samples = self.prime_inner_dev_samples[-25:]
+            self.prime_tip_dev_samples = self.prime_tip_dev_samples[-25:]
+
     def _reset_rib_session(self):
-        """Mereset buffer sampel metrologi saat transisi ke sirip baru."""
+        """Mengunci vonis akhir sesi saat ini lalu mereset buffer untuk sirip baru."""
+        self._commit_rib_session()
         self.last_presence = False
+        self._session_committed = False
+        self._prime_warmup_frames = 0
         self._dp_ratio_ema = 0.0
         self._last_unwarp_contour = None
         self._last_unwarp_baseline = None
@@ -907,12 +988,66 @@ class HybridRibInspector:
         bg = cv2.resize(bg_tiny, (w_g, h_g), interpolation=cv2.INTER_LINEAR)
         return cv2.divide(gray_img, np.maximum(bg, 1), scale=scale)
 
+    def _get_effective_thresholds(self):
+        """Return active QC thresholds; TIER1_VITERBI bypasses adaptive ratchet shrinkage."""
+        if self.tracker_engine == "TIER1_VITERBI":
+            return (
+                max(self.pv_thresh, getattr(self, "_base_pv_thresh", self.pv_thresh)),
+                max(self.sagitta_thresh, getattr(self, "_base_sagitta_thresh", self.sagitta_thresh)),
+                max(self.dev_thresh, getattr(self, "_base_dev_thresh", self.dev_thresh)),
+                max(
+                    self.tip_thresh,
+                    getattr(self, "_base_tip_thresh", self.tip_thresh),
+                    getattr(self, "_viterbi_min_tip_thresh", 10.5),
+                ),
+            )
+        return self.pv_thresh, self.sagitta_thresh, self.dev_thresh, self.tip_thresh
+
+    def _compute_prime_consensus_metrics(self, pv, sagitta, inner_dev, tip_dev, min_samples_required=8):
+        """Compute Prime Zone metrics using trimmed median for TIER1_VITERBI, plain median otherwise."""
+        if len(self.prime_pv_samples) < min_samples_required:
+            return pv, sagitta, inner_dev, tip_dev
+
+        def _agg(samples):
+            if self.tracker_engine == "TIER1_VITERBI" and len(samples) >= 8:
+                ordered = sorted(samples)
+                return float(np.median(ordered[1:-1]))
+            return float(np.median(samples))
+
+        return (
+            _agg(self.prime_pv_samples),
+            _agg(self.prime_sagitta_samples),
+            _agg(self.prime_inner_dev_samples),
+            _agg(self.prime_tip_dev_samples),
+        )
+
+    def _update_prime_consensus_vote(self, is_in_prime, full_span_valid, sample_count, min_samples_required, transit_is_ok):
+        """Update consecutive OK/NG consensus counters; TIER1_VITERBI holds votes until min_samples_required."""
+        if self.tracker_engine == "TIER1_VITERBI":
+            can_update = bool(is_in_prime and full_span_valid and sample_count >= min_samples_required)
+        else:
+            can_update = bool(is_in_prime and full_span_valid)
+        if can_update:
+            if transit_is_ok:
+                self.active_consec_ok += 1
+                self.active_consec_ng = 0
+            else:
+                self.active_consec_ng += 1
+                self.active_consec_ok = 0
+        return can_update
+
     def reset_counters(self):
         """Mereset seluruh statistik hitungan sirip (Total Rib, OK, NG)."""
         self.rib_count = 0
         self.ok_count = 0
         self.ng_count = 0
         self.absence_frames = 0
+        self.current_rib_status = None
+        self._session_committed = False
+        self._committed_rib_statuses.clear()
+        self._last_finalized_rib_id = 0
+        self._last_finalized_status = None
+        self._prime_warmup_frames = 0
         self._last_active_box = None
         self._last_active_cy = None
         self._last_yolo_det = (False, None, 0.0, [])
@@ -1608,10 +1743,16 @@ class HybridRibInspector:
 
             if len(results) > 0 and results[0].boxes is not None:
                 boxes = results[0].boxes
-                for i in range(len(boxes)):
-                    xyxy = boxes.xyxy[i].cpu().numpy()
-                    conf = float(boxes.conf[i].cpu().numpy())
-                    cls_id = int(boxes.cls[i].cpu().numpy())
+                if len(boxes) > 0:
+                    boxes_xyxy = boxes.xyxy.cpu().numpy()
+                    boxes_conf = boxes.conf.cpu().numpy()
+                    boxes_cls = boxes.cls.cpu().numpy()
+                else:
+                    boxes_xyxy = boxes_conf = boxes_cls = ()
+                for i in range(len(boxes_xyxy)):
+                    xyxy = boxes_xyxy[i]
+                    conf = float(boxes_conf[i])
+                    cls_id = int(boxes_cls[i])
                     cls_name = self.class_names.get(cls_id, str(cls_id)).lower()
 
                     if "rib" in cls_name or cls_id == 0:
@@ -1894,17 +2035,34 @@ class HybridRibInspector:
         guide_prior_tip = 0.04 * off_sq
         tip_w_t1 = max(120, int(0.09 * (x_limit_right - x_limit_left)))
 
+        # Pre-komputasi Sobel orde-2 (syy) satu kali pada strip ROI agar identik tanpa memanggil Sobel per kolom
+        gy_ends = np.polyval(guide_poly, [x_limit_left, x_limit_right])
+        y1_s = max(0, int(np.floor(min(gy_ends))) - half_band - 6)
+        y2_s = min(h_f, int(np.ceil(max(gy_ends))) + half_band + 9)
+        x1_s = max(0, x_limit_left - 2)
+        x2_s = min(w_f, x_limit_right + 3)
+        if y2_s <= y1_s + 12 or x2_s <= x1_s + 4:
+            return [], [], 0.0, 0, tilt_deg
+        roi_f = gray[y1_s:y2_s, x1_s:x2_s].astype(np.float32)
+        syy_roi = cv2.Sobel(roi_f, cv2.CV_32F, 0, 2, ksize=3)
+
         def get_col_energy(x):
             gy = int(round(np.polyval(guide_poly, x)))
             col_y1 = gy - half_band
             col_y2 = gy + half_band
-            if col_y1 < 4 or col_y2 + 6 >= h_f or x < 1 or x + 1 >= w_f:
+            ry1 = col_y1 - y1_s
+            ry2 = col_y2 - y1_s + 1
+            rx = x - x1_s
+            if (
+                col_y1 < 4 or col_y2 + 6 >= h_f or x < 1 or x + 1 >= w_f
+                or ry1 < 4 or ry2 + 6 >= roi_f.shape[0]
+                or rx < 1 or rx + 1 >= roi_f.shape[1]
+            ):
                 return np.zeros(H_b, dtype=np.float32), gy
-            sub = gray[col_y1 - 1:col_y2 + 2, x - 1:x + 2].astype(np.float32)
-            syy = cv2.Sobel(sub, cv2.CV_32F, 0, 2, ksize=3)[1:-1, 1]
-            center_col = sub[1:-1, 1]
-            below_col = gray[col_y1 + 6:col_y2 + 7, x].astype(np.float32)
-            above_col = gray[col_y1 - 4:col_y2 - 3, x].astype(np.float32)
+            syy = syy_roi[ry1:ry2, rx]
+            center_col = roi_f[ry1:ry2, rx]
+            below_col = roi_f[ry1 + 6:ry2 + 6, rx]
+            above_col = roi_f[ry1 - 4:ry2 - 4, rx]
             lip = np.clip(center_col - below_col, 0.0, 100.0)
             diff_above = np.clip(center_col - above_col, 0.0, 80.0)
             is_tip_col = (x < x_limit_left + tip_w_t1) or (x > x_limit_right - tip_w_t1)
@@ -1920,14 +2078,20 @@ class HybridRibInspector:
                 return pts_out
             V = np.full((H_b, n_cols), -1e9, dtype=np.float32)
             Back = np.zeros((H_b, n_cols), dtype=np.int32)
+            E_cols = np.zeros((H_b, n_cols), dtype=np.float32)
+            gys = np.zeros(n_cols, dtype=np.int32)
             e0, gy0 = get_col_energy(xs_list[0])
+            E_cols[:, 0] = e0
+            gys[0] = gy0
             c_off = int(np.clip(y_center - gy0 + half_band, 0, H_b - 1))
             V[c_off, 0] = e0[c_off] + 50.0
 
             valid_cols = 1
             consec_miss = 0
             for t in range(1, n_cols):
-                et, _ = get_col_energy(xs_list[t])
+                et, gyt = get_col_energy(xs_list[t])
+                E_cols[:, t] = et
+                gys[t] = gyt
                 if np.max(et) < 22.0:
                     consec_miss += 1
                     if consec_miss >= 3 and t > 10:
@@ -1956,8 +2120,18 @@ class HybridRibInspector:
                 path.append(y_b)
             path.reverse()
             for i in range(valid_cols):
-                gy = int(round(np.polyval(guide_poly, xs_list[i])))
-                pts_out.append((xs_list[i], gy - half_band + path[i]))
+                p_i = path[i]
+                y_val = float(gys[i] - half_band + p_i)
+                # Interpolasi parabolik sub-piksel pada puncak energi kolom
+                if 1 <= p_i <= H_b - 2:
+                    e_m1 = float(E_cols[p_i - 1, i])
+                    e_0 = float(E_cols[p_i, i])
+                    e_p1 = float(E_cols[p_i + 1, i])
+                    denom = 2.0 * (e_m1 - 2.0 * e_0 + e_p1)
+                    if abs(denom) > 1e-4:
+                        offset = (e_m1 - e_p1) / denom
+                        y_val += max(-0.5, min(0.5, offset))
+                pts_out.append((xs_list[i], y_val))
             return pts_out
 
         # 4 & 5. Bidirectional Viterbi: Kanan & Kiri (simetris dari titik awal tengah)
@@ -3518,7 +3692,8 @@ class HybridRibInspector:
                         consec_misses = 0
                     else:
                         consec_misses += 1
-                        if consec_misses <= 15:
+                        _max_tip_misses = 2 if is_tip else 15
+                        if consec_misses <= _max_tip_misses:
                             coast_y = np.clip(cur_y + rolling_slope * step_x, gy - ceiling_guard, gy + floor_guard)
                             cur_y = float(coast_y)
                             bridging_buffer.append((x, cur_y))
@@ -3686,7 +3861,11 @@ class HybridRibInspector:
             else:
                 u_pmin, u_pmax = 145.0, 215.0
 
-            is_in_prime = (u_pmin <= med_top_y_u <= u_pmax)
+            box_clear_of_edges = (
+                active_box is None
+                or (active_box[1] >= (zy1 + 10) and med_top_y_u <= (u_pmax + 10))
+            )
+            is_in_prime = (u_pmin <= med_top_y_u <= u_pmax) and box_clear_of_edges
 
             if not full_span_valid:
                 pv = 0.0
@@ -3735,18 +3914,7 @@ class HybridRibInspector:
                 sagitta = abs(float(poly2_u[0])) * ((w_span / 2.0) ** 2)
 
                 if is_in_prime:
-                    self.prime_pv_samples.append(pv)
-                    self.prime_sagitta_samples.append(sagitta)
-                    self.prime_inner_dev_samples.append(inner_dev)
-                    self.prime_tip_dev_samples.append(tip_dev)
-                    # Sliding window cap: pertahankan maksimal 25 sampel terbaru
-                    # agar outlier dari frame awal (kontur belum mapan) tidak terus
-                    # mengotori median consensus setelah rib sudah stabil di prime zone
-                    if len(self.prime_pv_samples) > 25:
-                        self.prime_pv_samples = self.prime_pv_samples[-25:]
-                        self.prime_sagitta_samples = self.prime_sagitta_samples[-25:]
-                        self.prime_inner_dev_samples = self.prime_inner_dev_samples[-25:]
-                        self.prime_tip_dev_samples = self.prime_tip_dev_samples[-25:]
+                    self._record_prime_sample(pv, sagitta, inner_dev, tip_dev)
 
             self._last_unwarp_baseline = baseline_u
             self._last_unwarp_smooth_ys = smooth_u_ys
@@ -3810,12 +3978,16 @@ class HybridRibInspector:
                 except Exception:
                     pass
 
+            box_clear_of_edges = (
+                active_box is None
+                or (active_box[1] >= (zy1 + 10) and med_top_y <= (zy2 - 80))
+            )
             if is_tier4:
                 p_min = min(self.prime_min_y, self._legacy_prime_min_y)
                 p_max = max(self.prime_max_y, self._legacy_prime_max_y)
-                is_in_prime = (p_min <= med_top_y <= p_max)
+                is_in_prime = (p_min <= med_top_y <= p_max) and box_clear_of_edges
             else:
-                is_in_prime = (self._legacy_prime_min_y <= med_top_y <= self._legacy_prime_max_y)
+                is_in_prime = (self._legacy_prime_min_y <= med_top_y <= self._legacy_prime_max_y) and box_clear_of_edges
 
             if not full_span_valid:
                 # Kontur belum membentang utuh -> Tahan penilaian metrologi, hindari lonjakan Sagitta palsu
@@ -3896,35 +4068,27 @@ class HybridRibInspector:
                     else:
                         pv = float(np.percentile(dev, 98) - np.percentile(dev, 2))
                     max_dev = float(np.max(np.abs(dev)))
-                    # Evaluasi TipDev relatif terhadap baseline kuadratik (poly2) agar kelengkungan perspektif
-                    # atau arching global bilah lurus (Sagitta ~7-11px) tidak salah terdeteksi sebagai tekukan ujung lokal.
+                    # Evaluasi TipDev relatif terhadap baseline kuadratik (poly2) dari BADAN TENGAH bilah (inner_mask),
+                    # agar kelengkungan global bilah lurus tetap terkompensasi, namun ujung yang penyok tidak ikut
+                    # menarik kurva referensi ke bawah dan menyamarkan defleksi ujung.
                     poly2 = np.polyfit(r_xs, smooth_ys, deg=2)
                     sagitta = abs(float(poly2[0])) * ((w_span / 2.0) ** 2)
-                    quad_dev = smooth_ys - np.polyval(poly2, r_xs)
-                    bevel_skip_px = 18.0
+                    bevel_skip_px = 14.0
                     tip_zone_px = 92.0
                     left_tip_mask = (r_xs >= (r_xs[0] + bevel_skip_px)) & (r_xs < (r_xs[0] + tip_zone_px))
                     right_tip_mask = (r_xs <= (r_xs[-1] - bevel_skip_px)) & (r_xs > (r_xs[-1] - tip_zone_px))
                     tip_mask = (r_xs < (r_xs[0] + tip_zone_px)) | (r_xs > (r_xs[-1] - tip_zone_px))
+                    inner_mask = ~tip_mask
+                    poly2_tip = np.polyfit(r_xs[inner_mask], smooth_ys[inner_mask], deg=2) if np.sum(inner_mask) >= 20 else poly2
+                    quad_dev = smooth_ys - np.polyval(poly2_tip, r_xs)
                     left_tip_dev = float(np.percentile(np.abs(quad_dev[left_tip_mask]), 95)) if np.any(left_tip_mask) and np.sum(left_tip_mask) >= 4 else 0.0
                     right_tip_dev = float(np.percentile(np.abs(quad_dev[right_tip_mask]), 95)) if np.any(right_tip_mask) and np.sum(right_tip_mask) >= 4 else 0.0
                     tip_dev = max(left_tip_dev, right_tip_dev)
-                    inner_mask = ~tip_mask
                     inner_dev = float(np.percentile(np.abs(dev[inner_mask]), 98)) if np.any(inner_mask) else max_dev
 
                 # Hanya kumpulkan sampel metrologi jika berada di zona prime konveyor dan kontur utuh!
                 if is_in_prime:
-                    self.prime_pv_samples.append(pv)
-                    self.prime_sagitta_samples.append(sagitta)
-                    self.prime_inner_dev_samples.append(inner_dev)
-                    self.prime_tip_dev_samples.append(tip_dev)
-                    # Sliding window cap untuk semua engine: pertahankan maksimal 25 sampel terbaru
-                    # agar sampel transisi awal tergeser setelah rib stabil di tengah zona prime.
-                    if len(self.prime_pv_samples) > 25:
-                        self.prime_pv_samples = self.prime_pv_samples[-25:]
-                        self.prime_sagitta_samples = self.prime_sagitta_samples[-25:]
-                        self.prime_inner_dev_samples = self.prime_inner_dev_samples[-25:]
-                        self.prime_tip_dev_samples = self.prime_tip_dev_samples[-25:]
+                    self._record_prime_sample(pv, sagitta, inner_dev, tip_dev)
 
         # KONSENSUS METROLOGI PRIME ZONE
         # - TIER4_HOUGH_STITCH: 4 sampel agar profil fusi stabil
@@ -3934,47 +4098,58 @@ class HybridRibInspector:
         sample_count = len(self.prime_pv_samples)
         is_tier3_for_consensus = False
 
+        ng_prob = None
+        ml_defect = False
+        pv_th, sag_th, dev_th, tip_th = self._get_effective_thresholds()
         if not is_tier3_for_consensus:
-            if sample_count >= min_samples_required:
-                eval_pv = float(np.median(self.prime_pv_samples))
-                eval_sag = float(np.median(self.prime_sagitta_samples))
-                eval_idev = float(np.median(self.prime_inner_dev_samples))
-                eval_tdev = float(np.median(self.prime_tip_dev_samples))
-            else:
-                eval_pv, eval_sag, eval_idev, eval_tdev = pv, sagitta, inner_dev, tip_dev
+            eval_pv, eval_sag, eval_idev, eval_tdev = self._compute_prime_consensus_metrics(
+                pv, sagitta, inner_dev, tip_dev, min_samples_required=min_samples_required
+            )
 
-            curv_defect = (eval_sag > self.sagitta_thresh and eval_pv > self.pv_thresh) or (eval_sag > 14.5)
-            dev_defect = (eval_idev > self.dev_thresh)
-            tip_defect = (eval_tdev > self.tip_thresh)
+            curv_defect = (eval_sag > sag_th and eval_pv > pv_th) or (eval_sag > 14.5)
+            dev_defect = (eval_idev > dev_th)
+            tip_defect = (eval_tdev > tip_th)
             flat_defect = (eval_pv > 18.0)
-            transit_is_ok = not (curv_defect or dev_defect or tip_defect or flat_defect)
+
+            if self.tip_classifier_model is not None and HAS_TIP_CLASSIFIER and full_span_valid:
+                _tip_feat = extract_tip_classifier_features(
+                    smooth_ys, eval_pv, eval_sag, eval_idev, eval_tdev
+                )
+                if _tip_feat is not None:
+                    ng_prob = predict_tip_ng_prob(_tip_feat, self.tip_classifier_model)
+                    _is_physically_straight = (
+                        eval_pv < 4.5 and eval_idev < 3.5 and eval_tdev < 4.5
+                    )
+                    if _is_physically_straight:
+                        ml_defect = False
+                    else:
+                        ml_defect = bool(
+                            ng_prob >= float(self.tip_classifier_model.get("prob_threshold", 0.5))
+                        )
+
+            if ng_prob is not None:
+                extreme_safety = (eval_pv > 24.0) or (eval_sag > 18.0)
+                transit_is_ok = not (ml_defect or extreme_safety)
+            else:
+                transit_is_ok = not (curv_defect or dev_defect or tip_defect or flat_defect)
         else:
             # TIER 3 Deep Learning Segmentation + Unwarp Metrology:
-            if sample_count >= min_samples_required:
-                eval_pv = float(np.median(self.prime_pv_samples))
-                eval_sag = float(np.median(self.prime_sagitta_samples))
-                eval_idev = float(np.median(self.prime_inner_dev_samples))
-                eval_tdev = float(np.median(self.prime_tip_dev_samples))
-            else:
-                eval_pv, eval_sag, eval_idev, eval_tdev = pv, sagitta, inner_dev, tip_dev
+            eval_pv, eval_sag, eval_idev, eval_tdev = self._compute_prime_consensus_metrics(
+                pv, sagitta, inner_dev, tip_dev, min_samples_required=min_samples_required
+            )
 
-            curv_defect = (eval_sag > self.sagitta_thresh and eval_pv > self.pv_thresh) or (eval_sag > 14.5)
-            dev_defect = (eval_idev > self.dev_thresh)
-            _tier3_tip_thresh = max(self.tip_thresh, 12.0)
+            curv_defect = (eval_sag > sag_th and eval_pv > pv_th) or (eval_sag > 14.5)
+            dev_defect = (eval_idev > dev_th)
+            _tier3_tip_thresh = max(tip_th, 12.0)
             tip_defect = (eval_tdev > _tier3_tip_thresh)
             flat_defect = (eval_pv > 18.0)
             transit_is_ok = not (curv_defect or dev_defect or tip_defect or flat_defect)
 
         # Pembaruan suara konsensus & transisi status hanya diizinkan saat bilah berada di dalam
         # Prime Zone dengan span utuh, sehingga distorsi/foreshortening saat keluar tidak membalik vonis.
-        can_update_vote = bool(is_in_prime and full_span_valid)
-        if can_update_vote:
-            if transit_is_ok:
-                self.active_consec_ok += 1
-                self.active_consec_ng = 0
-            else:
-                self.active_consec_ng += 1
-                self.active_consec_ok = 0
+        can_update_vote = self._update_prime_consensus_vote(
+            is_in_prime, full_span_valid, sample_count, min_samples_required, transit_is_ok
+        )
 
         # Registrasi Objek & Pembaruan Status Berbasis Konsensus Transaksional
         if sample_count < min_samples_required:
@@ -3985,39 +4160,41 @@ class HybridRibInspector:
             # Sampel prime zone cukup → Tentukan status definitif berbasis konsensus
             new_status = "OK" if transit_is_ok else "NG"
             if self.current_rib_status is None:
-                # Butuh minimal 2 konfirmasi berturut-turut di Prime Zone untuk registrasi status pertama kali
+                # Butuh minimal 2 konfirmasi berturut-turut di Prime Zone untuk registrasi status sementara
+                # Counter ok_count/ng_count TIDAK dinaikkan di sini; baru dikunci final saat transit selesai.
                 if can_update_vote and ((new_status == "OK" and self.active_consec_ok >= 2) or (new_status == "NG" and self.active_consec_ng >= 2)):
                     self.rib_count += 1
                     self.current_rib_status = new_status
-                    if new_status == "OK":
-                        self.ok_count += 1
-                    else:
-                        self.ng_count += 1
                 else:
                     status = "WAIT"
                     eval_msg = f"Menunggu Konfirmasi Status ({self.active_consec_ok} OK / {self.active_consec_ng} NG)"
             elif can_update_vote and self.current_rib_status != new_status:
-                # Anti-flicker & Deadband Hysteresis:
+                # Anti-flicker & Deadband Hysteresis untuk status sementara selama rib masih di Prime Zone:
                 # - OK -> NG: butuh 3 frame konfirmasi berturut-turut di Prime Zone
-                # - NG -> OK: hanya jika seluruh metrik turun di bawah deadband histeresis (<= 0.96 * thresh)
-                #   selama >= 5 frame berturut-turut di Prime Zone, cukup untuk memulihkan rib lurus (mis. #10/#12)
-                #   tanpa membalik kasus cacat ujung nyata yang bertahan >7.4px (mis. Rib #3, Fwd #27).
+                # - NG -> OK: hanya jika seluruh metrik turun di bawah deadband histeresis
+                #   selama >= 5 frame berturut-turut di Prime Zone (tanpa mutasi counter sebelum final)
                 if self.current_rib_status == "OK" and new_status == "NG" and self.active_consec_ng >= 3:
                     self.current_rib_status = "NG"
-                    self.ok_count = max(0, self.ok_count - 1)
-                    self.ng_count += 1
                 elif self.current_rib_status == "NG" and new_status == "OK" and self.active_consec_ok >= 5:
-                    hyst_ok = (
-                        eval_tdev <= 0.96 * self.tip_thresh
-                        and eval_idev <= 0.96 * self.dev_thresh
-                        and eval_pv <= 0.96 * 18.0
-                        and eval_sag <= 0.96 * 14.5
-                        and not (eval_sag > 0.96 * self.sagitta_thresh and eval_pv > 0.96 * self.pv_thresh)
-                    )
+                    if ng_prob is not None and self.tip_classifier_model is not None:
+                        _ml_th = float(self.tip_classifier_model.get("prob_threshold", 0.5))
+                        _phys_ok = (eval_pv < 4.5 and eval_idev < 3.5 and eval_tdev < 4.5)
+                        hyst_ok = (
+                            (not ml_defect)
+                            and (_phys_ok or ng_prob < max(0.05, _ml_th - 0.08))
+                            and eval_pv <= 24.0
+                            and eval_sag <= 18.0
+                        )
+                    else:
+                        hyst_ok = (
+                            eval_tdev <= 0.85 * tip_th
+                            and eval_idev <= 0.96 * dev_th
+                            and eval_pv <= 0.96 * 18.0
+                            and eval_sag <= 0.96 * 14.5
+                            and not (eval_sag > 0.96 * sag_th and eval_pv > 0.96 * pv_th)
+                        )
                     if hyst_ok:
                         self.current_rib_status = "OK"
-                        self.ng_count = max(0, self.ng_count - 1)
-                        self.ok_count += 1
 
             status = self.current_rib_status if self.current_rib_status is not None else "WAIT"
             # Hitung severity level bending (LOW/MEDIUM/HIGH) konsisten dengan vonis aktual
@@ -4030,15 +4207,17 @@ class HybridRibInspector:
                 eval_msg = f"SIRIP LURUS (OK) | Top Y={med_top_y}px | PV={eval_pv:.1f}px, Sag={eval_sag:.1f}px, Dev={eval_idev:.1f}px, Tip={eval_tdev:.1f}px"
             elif status == "NG":
                 ng_reasons = []
+                if ng_prob is not None and ml_defect:
+                    ng_reasons.append(f"ML_TipProb={ng_prob:.2f}")
                 if flat_defect:
-                    ng_reasons.append(f"PV={eval_pv:.1f}>{self.pv_thresh:.1f}px")
+                    ng_reasons.append(f"PV={eval_pv:.1f}>{pv_th:.1f}px")
                 if curv_defect:
-                    ng_reasons.append(f"Sag={eval_sag:.1f}>{self.sagitta_thresh:.1f}px")
+                    ng_reasons.append(f"Sag={eval_sag:.1f}>{sag_th:.1f}px")
                 if dev_defect:
-                    ng_reasons.append(f"Dev={eval_idev:.1f}>{self.dev_thresh:.1f}px")
+                    ng_reasons.append(f"Dev={eval_idev:.1f}>{dev_th:.1f}px")
                 if tip_defect:
-                    ng_reasons.append(f"TipDev={eval_tdev:.1f}>{self.tip_thresh:.1f}px")
-                self.last_ng_reason = " | ".join(ng_reasons) if ng_reasons else f"TipDev={eval_tdev:.1f}>{self.tip_thresh:.1f}px"
+                    ng_reasons.append(f"TipDev={eval_tdev:.1f}>{tip_th:.1f}px")
+                self.last_ng_reason = " | ".join(ng_reasons) if ng_reasons else f"TipDev={eval_tdev:.1f}>{tip_th:.1f}px"
                 eval_msg = f"SIRIP BENGKOK (NG - {ng_severity}) | {self.last_ng_reason}"
             else:
                 eval_msg = f"Menunggu Konfirmasi Status ({self.active_consec_ok} OK / {self.active_consec_ng} NG | Span={w_span:.0f}px)"
@@ -4067,7 +4246,12 @@ class HybridRibInspector:
             "is_ng": (status == "NG"),
             "ng_severity": ng_severity,          # 'OK' | 'LOW' | 'MEDIUM' | 'HIGH'
             "final_consensus_ready": bool(sample_count >= min_samples_required and self.current_rib_status is not None),
+            "is_final_verdict": bool(self._session_committed),
+            "committed_rib_id": self._last_finalized_rib_id,
+            "committed_rib_status": self._last_finalized_status,
             "rib_count": self.rib_count,
+            "ok_count": self.ok_count,
+            "ng_count": self.ng_count,
             "mode": self.mode,
             "tracker_engine": self.tracker_engine,
             "message": eval_msg,
@@ -4078,6 +4262,7 @@ class HybridRibInspector:
             "max_deviation": max_dev,
             "inner_dev": eval_idev,
             "tip_dev": eval_tdev,
+            "ng_prob": ng_prob,
             "coverage": coverage,
             "active_rib_frames": self.active_rib_frames,
             "rib_height": 110,

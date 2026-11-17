@@ -78,3 +78,6 @@ Database/
 *.db
 *.sqlite
 *.log
+
+# File Test Lokal / Untracked
+tests/

@@ -203,6 +203,7 @@ def record_rib_dataset_step(
     total_frames,
     last_rib_no,
     previous,
+    hud_out=None,
 ):
     """Advance rib dataset state for one inspected frame with lazy annotation rendering."""
     if recorder is None or not inspector or not inspector.is_db_enabled():
@@ -235,6 +236,8 @@ def record_rib_dataset_step(
                 frame_idx=frame_idx,
                 total_frames=total_frames,
             )
+            if hud_out is not None:
+                hud_out["frame"] = annotated
             recorder.observe(rib_result, frame, annotated, current_rib_no, slat_number)
         previous = (dict(rib_result), current_rib_no, slat_number)
     return last_rib_no, previous
@@ -899,6 +902,16 @@ def _run_top_worker(
     last_gui_render = 0.0
     dataset_last_rib_no = 0
     dataset_previous = None
+    total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
+
+    _torch = None
+    try:
+        import torch as _torch_mod
+        _torch = _torch_mod
+        if _torch.cuda.is_available() and device != "cpu":
+            _torch.backends.cudnn.benchmark = True
+    except Exception:
+        _torch = None
 
     print("[*] Worker CAM-01 Top Inspection AKTIF dan mulai memproses...")
 
@@ -916,6 +929,7 @@ def _run_top_worker(
                     inspector.reset_counters()
                     cap.release()
                     cap = cv2.VideoCapture(cap_src)
+                    total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
                     ret, frame = cap.read()
                     if not ret or frame is None:
                         time.sleep(0.02)
@@ -926,7 +940,11 @@ def _run_top_worker(
 
             # Jalankan inspeksi terpadu plat slat & rib (ukur latensi murni pipeline AI)
             t_infer_start = time.time()
-            inspect_res = inspector.inspect(frame)
+            if _torch is not None:
+                with _torch.inference_mode():
+                    inspect_res = inspector.inspect(frame)
+            else:
+                inspect_res = inspector.inspect(frame)
             t_frame_end = time.time()
             latency_ms = (t_frame_end - t_infer_start) * 1000.0
 
@@ -947,6 +965,7 @@ def _run_top_worker(
             curr_stat = inspect_res.get("status", "WAIT")
             status_buf.value = curr_stat.encode("utf-8")[:63]
 
+            hud_cache = {}
             dataset_last_rib_no, dataset_previous = record_rib_dataset_step(
                 dataset_recorder,
                 inspector,
@@ -954,25 +973,27 @@ def _run_top_worker(
                 inspect_res,
                 avg_fps,
                 frame_count,
-                int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0,
+                total_frames_top,
                 dataset_last_rib_no,
                 dataset_previous,
+                hud_out=hud_cache,
             )
 
             # Render Visual jika mode dual (Decoupled GUI Rendering)
-            hud = None
+            hud = hud_cache.get("frame")
             is_ng = inspect_res.get("status") == "NG"
             if mode == "dual":
                 t_now = time.time()
                 should_render = ((t_now - last_gui_render) >= gui_interval) or is_ng
                 if should_render:
-                    hud = inspector.render_combined_dashboard(
-                        frame=frame,
-                        inspect_result=inspect_res,
-                        fps=avg_fps,
-                        frame_idx=frame_count,
-                        total_frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
-                    )
+                    if hud is None:
+                        hud = inspector.render_combined_dashboard(
+                            frame=frame,
+                            inspect_result=inspect_res,
+                            fps=avg_fps,
+                            frame_idx=frame_count,
+                            total_frames=total_frames_top
+                        )
                     cv2.imshow(win_name, hud)
                     if getattr(inspector, "show_rib_unwarp_window", False):
                         rib_unwarp = getattr(inspector.rib_inspector, "last_rib_unwarped_annotated", None)
@@ -1008,6 +1029,9 @@ def _run_top_worker(
                 elif key in [ord("p"), ord("P")]:
                     if hasattr(inspector, "toggle_profile"):
                         inspector.toggle_profile()
+                elif key in [ord("h"), ord("H")]:
+                    if hasattr(inspector, "toggle_threshold_source"):
+                        inspector.toggle_threshold_source()
                 elif key in [ord("u"), ord("U"), ord("0")]:
                     if hasattr(inspector, "restore_default_profile"):
                         inspector.restore_default_profile()
@@ -1031,6 +1055,7 @@ def _run_top_worker(
                         new_cap, is_cam, cap_src = create_capture(new_src)
                         if new_cap.isOpened():
                             cap = new_cap
+                            total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
                             frame_count = 0
                             fps_history.clear()
                             inspector.reset_counters()
@@ -1042,6 +1067,7 @@ def _run_top_worker(
                         new_cap, is_cam, cap_src = create_capture(new_src)
                         if new_cap.isOpened():
                             cap = new_cap
+                            total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
                             frame_count = 0
                             fps_history.clear()
                             inspector.reset_counters()
@@ -1058,6 +1084,7 @@ def _run_top_worker(
                         new_cap, is_cam, cap_src = create_capture(new_src)
                         if new_cap.isOpened():
                             cap = new_cap
+                            total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
                             frame_count = 0
                             fps_history.clear()
                             inspector.reset_counters()
@@ -1066,6 +1093,7 @@ def _run_top_worker(
                         else:
                             print(f"[!] [CAM-01 TOP] Gagal membuka sumber baru: {new_src}, kembali ke sumber sebelumnya.")
                             cap, is_cam, cap_src = create_capture(cap_src)
+                            total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
                 elif key in [ord("t"), ord("T"), ord("e"), ord("E")]:
                     if hasattr(inspector, "rib_inspector"):
                         new_eng = inspector.rib_inspector.toggle_tracker_engine()
@@ -1084,6 +1112,7 @@ def _run_top_worker(
                         new_cap, is_cam, cap_src = create_capture(new_top)
                         if new_cap.isOpened():
                             cap = new_cap
+                            total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
                             frame_count = 0
                             fps_history.clear()
                             inspector.reset_counters()
@@ -1811,7 +1840,7 @@ def _run_threaded_engine(args):
         threads.append(th_side)
 
     # Windows GUI Setup
-    win_top = "CAM-01 TOP (SLAT & RIB) | [K]: Align Rel Instan | [1]/[V]: Video | [G]: Panduan | [L]: Wizard | [D]: DB | [Q]: Keluar"
+    win_top = "CAM-01 TOP (SLAT & RIB) | [K]: Align | [H]: Web/Data Thresh | [1]/[V]: Video | [G]: Panduan | [D]: DB | [Q]: Keluar"
     win_side = f"{args.side_cam_id} SIDE [{args.side_cam_id} {args.side_name}] | [2]/[O]: Video | [W]: Setup | [M]: Preset | [D]: DB | [Q]: Keluar"
     if args.mode != "headless":
         if top_inspector is not None:
@@ -1939,6 +1968,10 @@ def _run_threaded_engine(args):
                 if top_inspector and hasattr(top_inspector, "toggle_profile"):
                     with top_lock:
                         top_inspector.toggle_profile()
+            elif key in [ord("h"), ord("H")]:
+                if top_inspector and hasattr(top_inspector, "toggle_threshold_source"):
+                    with top_lock:
+                        top_inspector.toggle_threshold_source()
             elif key in [ord("u"), ord("U"), ord("0")]:
                 if top_inspector and hasattr(top_inspector, "restore_default_profile"):
                     with top_lock:

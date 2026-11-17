@@ -8,38 +8,26 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
-# Path default ke file database SQLite
-DB_PATH = r"c:\File Rayidha\Internship\Project\5. Project AI Slat Rib Conveyor\Database\AI_Slat_Rib_Conveyor.db"
+PROGRAM_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROGRAM_DIR not in sys.path:
+    sys.path.insert(0, PROGRAM_DIR)
+
+from conveyor_db_path import load_project_env, resolve_db_path as _canonical_resolve_db_path
+
+load_project_env()
+
+# Path default ke file database SQLite (dipertahankan untuk kompatibilitas impor lama)
+DB_PATH = _canonical_resolve_db_path()
 
 
 def resolve_db_path():
     """
-    Mencari lokasi file database SQLite dengan prioritas fleksibel untuk Windows & Linux Jetson:
-    1. Environment variable CONVEYOR_DB_PATH
-    2. Path folder ../../Database/AI_Slat_Rib_Conveyor.db (struktur project lokal & Jetson)
-    3. Path folder ../Database/AI_Slat_Rib_Conveyor.db (jika diletakkan di dalam Program)
-    4. Path lokal folder saat ini AI_Slat_Rib_Conveyor.db
-    5. Path default Windows DB_PATH
+    Menggunakan lokasi database SQLite kanonik bersama dengan Vision Engine
+    (CONVEYOR_DB_PATH -> SQLITE_DB_PATH -> Program/Database/AI_Slat_Rib_Conveyor.db).
     """
-    env_path = os.environ.get("CONVEYOR_DB_PATH")
-    if env_path and os.path.exists(env_path):
-        return env_path
-
-    candidates = [
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Database", "AI_Slat_Rib_Conveyor.db")),
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Database", "AI_Slat_Rib_Conveyor.db")),
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "AI_Slat_Rib_Conveyor.db")),
-        DB_PATH
-    ]
-
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-
-    # Fallback default aman jika belum ada (memastikan direktori dibuat)
-    default_target = candidates[0]
-    os.makedirs(os.path.dirname(default_target), exist_ok=True)
-    return default_target
+    target = _canonical_resolve_db_path()
+    os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+    return target
 
 
 def get_connection():
@@ -47,7 +35,12 @@ def get_connection():
     Membuat koneksi ke database SQLite AI_Slat_Rib_Conveyor.db.
     """
     target = resolve_db_path()
-    return sqlite3.connect(target, timeout=5.0)
+    conn = sqlite3.connect(target, timeout=15.0)
+    try:
+        conn.execute("PRAGMA busy_timeout = 15000;")
+    except Exception:
+        pass
+    return conn
 
 
 def map_plat_rib_status(is_ng, status_str=""):

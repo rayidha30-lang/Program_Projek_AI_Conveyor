@@ -66,8 +66,9 @@ class RibDatasetRecorder:
         return None
 
     @staticmethod
-    def _quality_key(rib_result: Mapping[str, Any]) -> tuple[float, float]:
+    def _quality_key(rib_result: Mapping[str, Any]) -> tuple[int, float, float]:
         return (
+            1 if rib_result.get("final_consensus_ready") else 0,
             float(rib_result.get("coverage", 0.0) or 0.0),
             float(rib_result.get("confidence", 0.0) or 0.0),
         )

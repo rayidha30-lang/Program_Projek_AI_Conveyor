@@ -30,7 +30,7 @@ from datetime import datetime
 
 from collections import deque
 import cv2
-from conveyor_db_path import resolve_db_path
+from conveyor_db_path import resolve_captures_dir, resolve_db_path
 
 # Impor modul Notifikasi MS Teams via Node-RED
 PROGRAM_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Program"))
@@ -59,11 +59,7 @@ class InspectionDBBridge:
 
         # 2. Tentukan lokasi direktori captures
         if captures_dir is None:
-            env_captures = os.environ.get("CAPTURES_DIR")
-            if env_captures:
-                captures_dir = os.path.abspath(env_captures)
-            else:
-                captures_dir = os.path.join(os.path.dirname(self.db_path), "captures")
+            captures_dir = resolve_captures_dir(self.db_path)
         self.captures_dir = captures_dir
 
         # 3. Status saklar on/off (cek parameter atau environment variable)
@@ -641,7 +637,17 @@ class InspectionDBBridge:
 
         max_dev_val = 0.0
         if is_rib_ng:
-            rib_dev = float(rib_res.get("max_dev", rib_res.get("dev", 0.0)) or 0.0)
+            rib_dev = 0.0
+            for _rk in ("max_deviation", "max_dev", "dev"):
+                _rv = rib_res.get(_rk)
+                if _rv is not None and float(_rv) > 0.0:
+                    rib_dev = float(_rv)
+                    break
+            if rib_dev <= 0.0:
+                rib_dev = max(
+                    float(rib_res.get("inner_dev", 0.0) or 0.0),
+                    float(rib_res.get("tip_dev", 0.0) or 0.0),
+                )
             max_dev_val = max(max_dev_val, rib_dev)
         if is_plat_ng:
             slat_pv = float(slat_res.get("pv_flatness", slat_res.get("pv", 0.0)) or 0.0)
@@ -689,7 +695,7 @@ class InspectionDBBridge:
                 # A. Komponen RIB (jika NG)
                 if is_rib_ng:
                     rib_conf = float(rib_res.get("confidence", 95.0) or 95.0)
-                    rib_dev = float(rib_res.get("max_dev", rib_res.get("dev", max_dev_val)) or max_dev_val)
+                    rib_dev = max_dev_val
                     rib_pv = float(rib_res.get("pv_flatness", 0.0) or 0.0)
                     cursor.execute(
                         """

@@ -100,6 +100,11 @@ class HoughStitchingInspector:
 
         self.canonical_w = 1000
         self.canonical_h = 140
+        self._k_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+        self._k_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
+        self._warp_cache_key = None
+        self._warp_src_pts = None
+        self._warp_M = None
 
         # Anti-Flicker Line Persistence (Diadopsi dari video_hough_line_inspector)
         self.cached_lines = None
@@ -212,12 +217,10 @@ class HoughStitchingInspector:
         edges_directional = cv2.bitwise_and(edges_raw, h_mask)
 
         # 4. Morphological Horizontal Bridging (25x1)
-        k_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
-        bridged_edges = cv2.morphologyEx(edges_directional, cv2.MORPH_CLOSE, k_bridge)
+        bridged_edges = cv2.morphologyEx(edges_directional, cv2.MORPH_CLOSE, self._k_bridge)
 
         # 5. Morphological Opening (Membersihkan bintik non-garis yang tersisa)
-        k_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
-        cleaned_edges = cv2.morphologyEx(bridged_edges, cv2.MORPH_OPEN, k_clean)
+        cleaned_edges = cv2.morphologyEx(bridged_edges, cv2.MORPH_OPEN, self._k_clean)
 
         return cleaned_edges, mode_tag, v_mean, max_line_gap
 
@@ -739,22 +742,29 @@ class HoughStitchingInspector:
         Menggunakan Virtual Center Beam Debounce Latch untuk stabilitas pembacaan 100%.
         """
         h_f, w_f = frame.shape[:2]
-        pts_px = []
-        for p in polygon_pts:
-            x = p[0] * w_f if p[0] <= 1.0 else p[0]
-            y = p[1] * h_f if p[1] <= 1.0 else p[1]
-            pts_px.append([x, y])
+        cache_key = (w_f, h_f, tuple((float(p[0]), float(p[1])) for p in polygon_pts))
+        if self._warp_cache_key != cache_key or self._warp_M is None or self._warp_src_pts is None:
+            pts_px = []
+            for p in polygon_pts:
+                x = p[0] * w_f if p[0] <= 1.0 else p[0]
+                y = p[1] * h_f if p[1] <= 1.0 else p[1]
+                pts_px.append([x, y])
 
-        src_pts = order_quad_points(pts_px)
-        dst_pts = np.array([
-            [0, 0],
-            [self.canonical_w - 1, 0],
-            [self.canonical_w - 1, self.canonical_h - 1],
-            [0, self.canonical_h - 1]
-        ], dtype=np.float32)
+            src_pts = order_quad_points(pts_px)
+            dst_pts = np.array([
+                [0, 0],
+                [self.canonical_w - 1, 0],
+                [self.canonical_w - 1, self.canonical_h - 1],
+                [0, self.canonical_h - 1]
+            ], dtype=np.float32)
 
-        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
-        unwarped = cv2.warpPerspective(frame, M, (self.canonical_w, self.canonical_h))
+            self._warp_src_pts = src_pts
+            self._warp_M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+            self._warp_cache_key = cache_key
+        else:
+            src_pts = self._warp_src_pts
+
+        unwarped = cv2.warpPerspective(frame, self._warp_M, (self.canonical_w, self.canonical_h))
 
         # 0. Deteksi Gerakan Konveyor (Conveyor Motion Detector)
         # Menghitung perbedaan intensitas piksel frame-ke-frame pada pelat baja kanonikal

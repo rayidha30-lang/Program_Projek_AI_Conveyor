@@ -159,30 +159,15 @@ elif [ -f "Vision_Engine_Core/02_Top_Inspection_Slat_Rib/models/best_rib_v5.pt" 
 fi
 
 # Prioritas pencarian model Side Inspection (Baut, Pin & Bracket)
-SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v26n.pt"
-if [ -f "Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v26n.engine" ]; then
-    SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v26n.engine"
+SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v26_ok.pt"
+if [ -f "Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v26_ok.engine" ]; then
+    SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v26_ok.engine"
     echo -e "${GREEN}✅ Ditemukan TensorRT Side Model: $SIDE_MODEL${NC}"
-elif [ -f "Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v26n.onnx" ]; then
-    SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v26n.onnx"
+elif [ -f "Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v26_ok.onnx" ]; then
+    SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v26_ok.onnx"
     echo -e "${GREEN}✅ Ditemukan ONNX Side Model: $SIDE_MODEL${NC}"
-elif [ -f "Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v26n.pt" ]; then
-    SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v26n.pt"
-    echo -e "${GREEN}✅ Ditemukan PyTorch Side Model: $SIDE_MODEL${NC}"
-elif [ -f "Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v2.engine" ]; then
-    SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v2.engine"
-    echo -e "${GREEN}✅ Ditemukan TensorRT Side Model: $SIDE_MODEL${NC}"
-elif [ -f "01_Side_Inspection_Bolt_Pin/models/best_v2.engine" ]; then
-    SIDE_MODEL="01_Side_Inspection_Bolt_Pin/models/best_v2.engine"
-    echo -e "${GREEN}✅ Ditemukan TensorRT Side Model: $SIDE_MODEL${NC}"
-elif [ -f "Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v2.onnx" ]; then
-    SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v2.onnx"
-    echo -e "${GREEN}✅ Ditemukan ONNX Side Model: $SIDE_MODEL${NC}"
-elif [ -f "01_Side_Inspection_Bolt_Pin/models/best_v2.onnx" ]; then
-    SIDE_MODEL="01_Side_Inspection_Bolt_Pin/models/best_v2.onnx"
-    echo -e "${GREEN}✅ Ditemukan ONNX Side Model: $SIDE_MODEL${NC}"
-elif [ -f "Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v2.pt" ]; then
-    SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v2.pt"
+elif [ -f "Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v26_ok.pt" ]; then
+    SIDE_MODEL="Vision_Engine_Core/01_Side_Inspection_Bolt_Pin_Lekukan/models/best_v26_ok.pt"
     echo -e "${GREEN}✅ Ditemukan PyTorch Side Model: $SIDE_MODEL${NC}"
 fi
 

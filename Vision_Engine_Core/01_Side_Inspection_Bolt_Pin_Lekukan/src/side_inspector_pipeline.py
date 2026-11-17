@@ -172,11 +172,9 @@ class SideConveyorInspector:
             if env_side_model and os.path.exists(env_side_model):
                 yolo_model_path = env_side_model
             else:
-                # 2. Prioritaskan kandidat model terbaru (best_v26_ok -> best_v26n -> best_v2)
+                # 2. Prioritaskan kandidat model aktif (best_v26_ok)
                 for cand_name in [
                     "best_v26_ok.engine", "best_v26_ok.onnx", "best_v26_ok.pt",
-                    "best_v26n.engine", "best_v26n.onnx", "best_v26n.pt",
-                    "best_v2.engine", "best_v2.onnx", "best_v2.pt"
                 ]:
                     cand_p = os.path.join(base_dir, "models", cand_name)
                     if os.path.exists(cand_p):
@@ -679,10 +677,17 @@ class SideConveyorInspector:
         px2 = int((max_poly_x - 0.009) * w_frame)
         py = int((min_poly_y + 0.057) * h_frame)
 
-        # Mengukur kecerahan refleksi logam pada garis sensor photocell
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        beam_roi = gray_frame[max(0, py - 2):min(h_frame, py + 2), px1:px2]
-        beam_val = float(np.mean(beam_roi)) if beam_roi.size > 0 else 0.0
+        # Mengukur kecerahan refleksi logam pada garis sensor photocell (konversi ROI strip saja, hemat CPU)
+        py1_b = max(0, py - 2)
+        py2_b = min(h_frame, py + 2)
+        px1_b = max(0, px1)
+        px2_b = min(w_frame, px2)
+        if py2_b > py1_b and px2_b > px1_b:
+            beam_bgr = frame[py1_b:py2_b, px1_b:px2_b]
+            beam_roi = cv2.cvtColor(beam_bgr, cv2.COLOR_BGR2GRAY)
+            beam_val = float(np.mean(beam_roi))
+        else:
+            beam_val = 0.0
 
         # Ukur delta waktu antar-frame untuk mendeteksi frame jump / lag sesaat
         t_now = time.time()

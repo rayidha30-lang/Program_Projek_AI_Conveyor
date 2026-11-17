@@ -40,10 +40,10 @@
   ],
   "thresholds": {
     "rib_conf_threshold": 0.55,
-    "rib_pv_threshold": 16.5,
-    "rib_dev_threshold": 9.5,
-    "rib_max_dev_threshold": 9.5,
-    "rib_tip_threshold": 9.5,
+    "rib_pv_threshold": 11.5,
+    "rib_dev_threshold": 8.0,
+    "rib_max_dev_threshold": 8.0,
+    "rib_tip_threshold": 8.5,
     "rib_sagitta_threshold": 11.5,
     "slat_delta_limit": 14.0,
     "slat_max_gap_limit": 45.0,
@@ -57,8 +57,8 @@
     "max_center_void": 1450,
     "scale_factor_mm_per_px": 0.515,
     "scale_factor_y_mm_per_px": 0.442,
-    "rib_prime_min_y": 290,
-    "rib_prime_max_y": 520
+    "rib_prime_min_y": 315,
+    "rib_prime_max_y": 505
   },
   "physical_dimensions": {
     "slat_width_flat_mm": 820.0,

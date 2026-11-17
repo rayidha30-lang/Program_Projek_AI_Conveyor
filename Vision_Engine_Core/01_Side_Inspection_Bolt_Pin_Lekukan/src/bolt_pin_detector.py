@@ -30,7 +30,7 @@ class BoltPinDetector:
     def __init__(self, model_path, conf_threshold=0.55, iou_threshold=0.35, max_pin_distance=140.0, agnostic_nms=True, device=None, crop_before_infer=False):
         """
         Inisialisasi Model YOLO.
-        :param model_path: Path file bobot .pt YOLO (misal: 'models/best_v26n.pt')
+        :param model_path: Path file bobot .pt/.onnx/.engine YOLO (misal: 'models/best_v26_ok.pt')
         :param conf_threshold: Ambang batas confidence deteksi (default: 0.55 untuk menekan false positive)
         :param iou_threshold: Ambang batas IoU untuk Non-Maximum Suppression (default: 0.35 anti kotak ganda)
         :param max_pin_distance: Jarak toleransi maksimum pusat baut ke pin (px, default: 140.0)
@@ -124,14 +124,6 @@ class BoltPinDetector:
                 os.path.join(p_d, "models", "best_v26_ok.engine"),
                 os.path.join(p_d, "models", "best_v26_ok.onnx"),
                 os.path.join(p_d, "models", "best_v26_ok.pt"),
-                os.path.join(p_d, "models", "best_v26n.engine"),
-                os.path.join(p_d, "models", "best_v26n.onnx"),
-                os.path.join(p_d, "models", "best_v26n.pt"),
-                os.path.join(p_d, "models", "best_v2.engine"),
-                os.path.join(p_d, "models", "best_v2.onnx"),
-                os.path.join(p_d, "models", "best_v2.pt"),
-                os.path.join(p_d, "models", "best_v3.pt"),
-                os.path.join(cur_d, "..", "..", "..", "Dataset Yolo", "best_v2.pt")
             ]
             for bc in bolt_cands:
                 if os.path.exists(bc):
@@ -402,10 +394,9 @@ if __name__ == "__main__":
     # 1. Cari path model YOLO
     model_candidates = [
         args.model,
-        os.path.join(parent_dir, "models", "best_v26n.pt"),
-        os.path.join(parent_dir, "models", "best_v2.pt"),
-        os.path.join(parent_dir, "models", "best_v3.pt"),
-        os.path.join(parent_dir, "..", "..", "Program AI", "1. Inspeksi Bolt & Pin", "3. Model Hybrid (YOLO + PatchCore)", "best_v2.pt")
+        os.path.join(parent_dir, "models", "best_v26_ok.engine"),
+        os.path.join(parent_dir, "models", "best_v26_ok.onnx"),
+        os.path.join(parent_dir, "models", "best_v26_ok.pt"),
     ]
     model_path = next((m for m in model_candidates if m and os.path.exists(m)), None)
     if not model_path:
