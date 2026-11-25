@@ -521,6 +521,8 @@ def _run_isolated_dialog(dialog_mode, **kwargs):
                 res["top"] = line.split(":", 1)[1].strip()
             elif line.startswith("RESULT_DUAL_SIDE:"):
                 res["side"] = line.split(":", 1)[1].strip()
+            elif line.startswith("RESULT_DUAL_MODE:"):
+                res["mode"] = line.split(":", 1)[1].strip()
         return res
     except Exception as e:
         print(f"[!] Gagal mengeksekusi dialog subprocess ({dialog_mode}): {e}")
@@ -549,13 +551,28 @@ def select_source_dialog(title="Pilih Sumber Kamera / Video", default_source=Non
     return default_source
 
 
-def select_dual_camera_setup_dialog(default_top, default_side, side_cam_id="CAM-02"):
+def select_dual_camera_setup_dialog(
+    default_top,
+    default_side,
+    side_cam_id="CAM-02",
+    default_mode=None,
+    include_mode=False,
+):
     """
-    Dialog visual terpadu untuk mengatur sumber CAM-01 Top dan CAM-02 Side secara aman di subprocess terisolasi.
+    Dialog visual terpadu untuk mengatur sumber CAM-01 Top, CAM-02 Side, dan opsional Mode Operasional.
     """
-    res = _run_isolated_dialog("dual", top=default_top, side=default_side, side_id=side_cam_id)
+    res = _run_isolated_dialog(
+        "dual",
+        top=default_top,
+        side=default_side,
+        side_id=side_cam_id,
+        mode=default_mode,
+    )
     new_top = res.get("top", default_top)
     new_side = res.get("side", default_side)
+    new_mode = res.get("mode", default_mode)
+    if include_mode:
+        return new_top, new_side, new_mode
     return new_top, new_side
 
 
@@ -586,6 +603,7 @@ def _handle_isolated_gui_dialog():
     parser.add_argument("--top", type=str, default="")
     parser.add_argument("--side", type=str, default="")
     parser.add_argument("--side-id", type=str, default="CAM-02")
+    parser.add_argument("--mode", type=str, default="dual")
     args, _ = parser.parse_known_args()
 
     try:
@@ -737,12 +755,13 @@ def _handle_isolated_gui_dialog():
     elif args.gui_dialog == "dual":
         try:
             root = tk.Tk()
-            root.title("Pengaturan Sumber Dual Kamera (CAM-01 Top & CAM-02 Side)")
+            root.title("Pengaturan Dual Kamera & Mode (CAM-01 Top & CAM-02 Side)")
             _apply_x11_safe_window_props(root)
-            root.geometry("620x540")
-            root.minsize(560, 480)
+            root.geometry("640x650")
+            root.minsize(580, 560)
 
-            res = {"top": args.top, "side": args.side}
+            init_mode = args.mode if args.mode in ("dual", "web", "headless") else "dual"
+            res = {"top": args.top, "side": args.side, "mode": init_mode}
 
             lbl_t = tk.Label(root, text="🎥 PENGATURAN SUMBER DUAL KAMERA", font=F_TITLE, pady=8)
             lbl_t.pack()
@@ -816,6 +835,15 @@ def _handle_isolated_gui_dialog():
 
             tk.Button(f_side_file, text="Pilih...", command=browse_side, font=F_SM).pack(side="right")
 
+            # --- PANEL MODE OPERASIONAL ---
+            f_mode = tk.LabelFrame(root, text="[MODE OPERASIONAL] Tampilan & Arsitektur Streaming", font=F_SEC, padx=12, pady=6)
+            f_mode.pack(fill="x", padx=15, pady=6)
+
+            var_mode = tk.StringVar(master=root, value=init_mode)
+            tk.Radiobutton(f_mode, text="Dual GUI (dual) — Tampilkan 2 Jendela OpenCV (+ WebSocket)", variable=var_mode, value="dual", font=F_REG, anchor="w").pack(fill="x", pady=1)
+            tk.Radiobutton(f_mode, text="Web Dashboard Only (web) — Tanpa GUI Desktop (Hybrid + WebSocket 3-Kamera)", variable=var_mode, value="web", font=F_REG, anchor="w").pack(fill="x", pady=1)
+            tk.Radiobutton(f_mode, text="Headless (headless) — Tanpa GUI Desktop (Murni Inferensi)", variable=var_mode, value="headless", font=F_REG, anchor="w").pack(fill="x", pady=1)
+
             def on_confirm_all():
                 if var_top_choice.get() == "webcam":
                     res["top"] = str(var_top_cam.get())
@@ -827,9 +855,10 @@ def _handle_isolated_gui_dialog():
                 elif side_file_path["path"]:
                     res["side"] = side_file_path["path"]
 
+                res["mode"] = var_mode.get()
                 root.destroy()
 
-            f_bottom = tk.Frame(root, pady=15)
+            f_bottom = tk.Frame(root, pady=12)
             f_bottom.pack(side="bottom", fill="x", padx=15)
             tk.Button(f_bottom, text="Terapkan & Mulai", bg="#007acc", fg="white", font=F_SEC, width=18, command=on_confirm_all).pack(side="right", padx=5)
             tk.Button(f_bottom, text="Gunakan Bawaan", font=F_REG, width=15, command=root.destroy).pack(side="right")
@@ -839,6 +868,8 @@ def _handle_isolated_gui_dialog():
                 print(f"RESULT_DUAL_TOP:{res['top']}")
             if res.get("side"):
                 print(f"RESULT_DUAL_SIDE:{res['side']}")
+            if res.get("mode"):
+                print(f"RESULT_DUAL_MODE:{res['mode']}")
             sys.exit(0)
         except Exception as e:
             sys.stderr.write(f"[!] Error dual dialog: {e}\n")
@@ -2299,6 +2330,7 @@ def _run_threaded_engine(args):
     t0 = None
     last_print = 0.0
     last_gui_render = 0.0
+    restart_request = None
 
     try:
         while not stop_event.is_set():
@@ -2573,12 +2605,25 @@ def _run_threaded_engine(args):
                         side_inspector.reset_session()
                     print(f"[*] {args.side_cam_id} Side berhasil beralih ke video: {os.path.basename(str(side_source_path))}")
             elif key in [ord("w"), ord("W")]:
-                print("\n[*] Membuka Dialog Pengaturan Sumber Dual Kamera (Webcam / File Video)...")
-                new_top, new_side = select_dual_camera_setup_dialog(
+                print("\n[*] Membuka Dialog Pengaturan Sumber Dual Kamera & Mode...")
+                new_top, new_side, new_mode = select_dual_camera_setup_dialog(
                     default_top=top_source_path,
                     default_side=side_source_path,
-                    side_cam_id=args.side_cam_id
+                    side_cam_id=args.side_cam_id,
+                    default_mode=args.mode,
+                    include_mode=True,
                 )
+                norm_mode = str(new_mode).strip().lower() if new_mode else args.mode
+                if norm_mode in ("dual", "web", "headless") and norm_mode != args.mode:
+                    restart_request = {
+                        "top_source": new_top or top_source_path,
+                        "side_source": new_side or side_source_path,
+                        "mode": norm_mode,
+                    }
+                    print(f"[*] Mempersiapkan peralihan mode '{args.mode}' -> '{norm_mode}'...")
+                    stop_event.set()
+                    break
+
                 if new_top and str(new_top) != str(top_source_path):
                     with top_lock:
                         if cap_top is not None:
@@ -2670,8 +2715,11 @@ def _run_threaded_engine(args):
         if csv_file is not None:
             csv_file.close()
 
+    if restart_request is not None:
+        return restart_request
+
     # Executive Summary Report
-    total_elapsed = time.time() - t0
+    total_elapsed = (time.time() - t0) if t0 is not None else 0.0
     f_top = top_state["frames"]
     f_side = side_state["frames"]
     avg_top_fps = f_top / total_elapsed if total_elapsed > 0 else 0.0
@@ -2983,7 +3031,7 @@ def _run_hybrid_engine(args):
         th_s.start()
         threads.append(th_s)
 
-    win_side = f"{args.side_cam_id} SIDE [HYBRID] | [Q]: Keluar"
+    win_side = f"{args.side_cam_id} SIDE [HYBRID] | [W]: Setup | [Q]: Keluar"
     if args.mode == "dual" and side_workers:
         cv2.namedWindow(win_side, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win_side, 920, 518)
@@ -3004,6 +3052,7 @@ def _run_hybrid_engine(args):
     t0 = None
     last_print = 0.0
     t_spawn = time.time()
+    restart_request = None
 
     try:
         while not stop_event.is_set():
@@ -3035,9 +3084,31 @@ def _run_hybrid_engine(args):
                     side_state["has_new"] = False
                 if has_new and disp_s is not None:
                     cv2.imshow(win_side, disp_s)
-                if (cv2.waitKey(1) & 0xFF) in [ord("q"), ord("Q"), 27]:
+                k_hyb = cv2.waitKey(1) & 0xFF
+                if k_hyb in [ord("q"), ord("Q"), 27]:
                     stop_event.set()
                     break
+                elif k_hyb in [ord("w"), ord("W")]:
+                    new_top, new_side, new_mode = select_dual_camera_setup_dialog(
+                        default_top=args.top_source,
+                        default_side=args.side_source,
+                        side_cam_id=args.side_cam_id,
+                        default_mode=args.mode,
+                        include_mode=True,
+                    )
+                    norm_mode = str(new_mode).strip().lower() if new_mode else args.mode
+                    if (
+                        (norm_mode in ("dual", "web", "headless") and norm_mode != args.mode)
+                        or (new_top and str(new_top) != str(args.top_source))
+                        or (new_side and str(new_side) != str(args.side_source))
+                    ):
+                        restart_request = {
+                            "top_source": new_top or args.top_source,
+                            "side_source": new_side or args.side_source,
+                            "mode": norm_mode if norm_mode in ("dual", "web", "headless") else args.mode,
+                        }
+                        stop_event.set()
+                        break
             else:
                 time.sleep(0.05)
 
@@ -3088,6 +3159,9 @@ def _run_hybrid_engine(args):
             cv2.destroyAllWindows()
         if csv_file is not None:
             csv_file.close()
+
+    if restart_request is not None:
+        return restart_request
 
     total_elapsed = (time.time() - t0) if t0 is not None else (time.time() - t_spawn)
     f_top = frames_top.value
@@ -3339,6 +3413,26 @@ def resolve_mode_defaults(args, argv=None):
     return args
 
 
+def apply_setup_handoff(args, new_top=None, new_side=None, new_mode=None):
+    """
+    Menerapkan hasil dialog setup [W] (sumber kamera & mode operasional).
+    Mengembalikan True jika mode berubah sehingga runner aktif perlu handoff/restart.
+    """
+    if new_top:
+        args.top_source = str(new_top)
+    if new_side:
+        args.side_source = str(new_side)
+
+    norm_new = str(new_mode).strip().lower() if new_mode else ""
+    cur_mode = str(getattr(args, "mode", "")).strip().lower()
+    if norm_new in ("dual", "web", "headless", "top-only", "side-only") and norm_new != cur_mode:
+        args.mode = norm_new
+        if norm_new == "web":
+            resolve_mode_defaults(args, argv=[])
+        return True
+    return False
+
+
 def main():
     if "--gui-dialog" in sys.argv:
         _handle_isolated_gui_dialog()
@@ -3406,16 +3500,17 @@ def main():
     missing_side_source = side_is_active and not is_usable_source(args.side_source)
 
     if args.select_webcam or args.browse or str(args.top_source).lower() == "browse" or str(args.side_source).lower() == "browse" or (missing_top_source and missing_side_source):
-        print("\n[*] Menampilkan dialog pengaturan sumber kamera...")
-        ch_top, ch_side = select_dual_camera_setup_dialog(
+        print("\n[*] Menampilkan dialog pengaturan sumber kamera & mode...")
+        ch_top, ch_side, ch_mode = select_dual_camera_setup_dialog(
             default_top=args.top_source,
             default_side=args.side_source,
-            side_cam_id=args.side_cam_id
+            side_cam_id=args.side_cam_id,
+            default_mode=args.mode,
+            include_mode=True,
         )
-        if ch_top:
-            args.top_source = ch_top
-        if ch_side:
-            args.side_source = ch_side
+        apply_setup_handoff(args, ch_top, ch_side, ch_mode)
+        top_is_active = args.mode in ["dual", "headless", "web", "top-only"]
+        side_is_active = args.mode in ["dual", "headless", "web", "side-only"]
     else:
         if missing_top_source or args.select_top or str(args.top_source).lower() in ["select", "dialog", "file"]:
             ch_top = select_source_dialog(title="[CAM-01 TOP] Pilih Sumber Plat & Rib", default_source=args.top_source)
@@ -3450,36 +3545,48 @@ def main():
         print("    Jalankan kembali dan pilih file video pada dialog, atau gunakan --side-source \"C:\\path\\video.mp4\".")
         return
 
-    print("=" * 86)
-    print("🚀 MULTI-CAMERA INSPECTION BENCHMARK RUNNER")
-    print("=" * 86)
-    engine_lbl = {
-        "threads": "THREADS (Hemat RAM 8GB, Berbagi VRAM Bersama)",
-        "hybrid": "HYBRID 2-PROSES (CAM-01 Bebas GIL + CAM-02/03 & WebSocket)",
-        "process": "PROCESS (Multiprocessing Terisolasi)",
-    }.get(args.engine, args.engine.upper())
-    print(f"[*] Engine Arsitektur  : {engine_lbl}")
-    print(f"[*] Mode Operasional   : {args.mode.upper()}")
-    if args.mode not in ("headless", "web"):
-        print(f"[*] GUI Render Mode    : DECOUPLED ({args.gui_fps:.1f} FPS GUI Display Pacing, AI Full Speed 35+ FPS)")
-    print(f"[*] CAM-01 Top Source  : {os.path.basename(str(args.top_source)) if os.path.exists(str(args.top_source)) else args.top_source}")
-    print(f"[*] {args.side_cam_id} Side Source : {os.path.basename(str(args.side_source)) if os.path.exists(str(args.side_source)) else args.side_source} ({args.side_name})")
-    print(f"[*] Rib Model Mode     : {args.rib_mode}")
-    print(f"[*] Profil Parameter   : DEFAULT_STABIL (Awal Pabrik - Tekan [P] untuk Kalibrasi)")
-    print(f"[*] Durasi Uji Coba    : {'Tak Terbatas (Tekan [Q] / Ctrl+C)' if args.duration <= 0 else f'{args.duration} detik'}")
-    print(f"[*] Database Logging   : {'AKTIF [RECORDING & TEAMS NOTIFIER]' if args.enable_db else 'OFF (DRY-RUN BENCHMARK - Tekan [D] di jendela untuk aktifkan)'}")
-    print("=" * 86)
+    def _print_runner_banner():
+        print("=" * 86)
+        print("🚀 MULTI-CAMERA INSPECTION BENCHMARK RUNNER")
+        print("=" * 86)
+        engine_lbl = {
+            "threads": "THREADS (Hemat RAM 8GB, Berbagi VRAM Bersama)",
+            "hybrid": "HYBRID 2-PROSES (CAM-01 Bebas GIL + CAM-02/03 & WebSocket)",
+            "process": "PROCESS (Multiprocessing Terisolasi)",
+        }.get(args.engine, args.engine.upper())
+        print(f"[*] Engine Arsitektur  : {engine_lbl}")
+        print(f"[*] Mode Operasional   : {args.mode.upper()}")
+        if args.mode not in ("headless", "web"):
+            print(f"[*] GUI Render Mode    : DECOUPLED ({args.gui_fps:.1f} FPS GUI Display Pacing, AI Full Speed 35+ FPS)")
+        print(f"[*] CAM-01 Top Source  : {os.path.basename(str(args.top_source)) if os.path.exists(str(args.top_source)) else args.top_source}")
+        print(f"[*] {args.side_cam_id} Side Source : {os.path.basename(str(args.side_source)) if os.path.exists(str(args.side_source)) else args.side_source} ({args.side_name})")
+        print(f"[*] Rib Model Mode     : {args.rib_mode}")
+        print(f"[*] Profil Parameter   : DEFAULT_STABIL (Awal Pabrik - Tekan [P] untuk Kalibrasi)")
+        print(f"[*] Durasi Uji Coba    : {'Tak Terbatas (Tekan [Q] / Ctrl+C)' if args.duration <= 0 else f'{args.duration} detik'}")
+        print(f"[*] Database Logging   : {'AKTIF [RECORDING & TEAMS NOTIFIER]' if args.enable_db else 'OFF (DRY-RUN BENCHMARK - Tekan [D] di jendela untuk aktifkan)'}")
+        print("=" * 86)
 
-    # 1. Terapkan konfigurasi Anti-Throttling & Prioritas Windows
+    # 1. Jalankan runner threads/hybrid dengan dukungan handoff mode dinamis dari tombol [W]
+    while args.engine in ("threads", "hybrid"):
+        _print_runner_banner()
+        configure_windows_process_performance()
+        if args.engine == "threads":
+            restart_req = _run_threaded_engine(args)
+        else:
+            restart_req = _run_hybrid_engine(args)
+        if not restart_req:
+            return
+        apply_setup_handoff(
+            args,
+            restart_req.get("top_source"),
+            restart_req.get("side_source"),
+            restart_req.get("mode"),
+        )
+        print(f"\n[*] Handoff Setup [W] selesai -> Mode: {args.mode.upper()} | Engine: {args.engine.upper()}")
+
+    # 2. Fallback engine 'process' penuh
+    _print_runner_banner()
     configure_windows_process_performance()
-
-    # 2. Jika mode engine THREADS atau HYBRID, jalankan masing-masing orkestrator
-    if args.engine == "threads":
-        _run_threaded_engine(args)
-        return
-    if args.engine == "hybrid":
-        _run_hybrid_engine(args)
-        return
 
     # Inisialisasi Shared Memory untuk Telemetri Antar-Proses
     stop_event = mp.Event()

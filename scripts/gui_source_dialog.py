@@ -164,10 +164,10 @@ def run_zenity_source(title="Pilih Sumber Kamera / Video", default_source=None):
     return False
 
 
-def run_zenity_dual(default_top=None, default_side=None, side_id="CAM-02"):
+def run_zenity_dual(default_top=None, default_side=None, side_id="CAM-02", default_mode="dual"):
     """
     Membuka pengaturan dual camera terpadu menggunakan Zenity --forms.
-    Menampilkan pilihan CAM-01 Top dan CAM-02 Side dalam SATU dialog GTK bersamaan (bukan satu-satu).
+    Menampilkan pilihan CAM-01 Top, CAM-02 Side, dan Mode Operasional dalam SATU dialog GTK.
     """
     cams = get_available_cameras()
 
@@ -187,17 +187,28 @@ def run_zenity_dual(default_top=None, default_side=None, side_id="CAM-02"):
     side_options.append("Pilih File Video Baru...")
     side_combo_str = "|".join(side_options)
 
+    cur_mode = default_mode if default_mode in ("dual", "web", "headless") else "dual"
+    mode_map = {
+        "dual": "dual (2 Jendela GUI OpenCV)",
+        "web": "web (Tanpa GUI OpenCV, Hybrid WS 3-Kam)",
+        "headless": "headless (Tanpa GUI OpenCV)",
+    }
+    ordered_modes = [cur_mode] + [m for m in ("dual", "web", "headless") if m != cur_mode]
+    mode_combo_str = "|".join(mode_map[m] for m in ordered_modes)
+
     cmd = [
         "zenity",
         "--forms",
-        f"--title=🎥 Pengaturan Sumber Dual Kamera (CAM-01 Top & {side_id} Side)",
-        "--text=Atur sumber input untuk CAM-01 Top dan CAM-02 Side secara bersamaan:",
+        f"--title=🎥 Pengaturan Dual Kamera & Mode (CAM-01 Top & {side_id} Side)",
+        "--text=Atur sumber input dan mode operasional secara bersamaan:",
         "--separator=:::",
         f"--add-combo=[CAM-01 TOP] Plat & Sirip Rib",
         f"--combo-values={top_combo_str}",
         f"--add-combo=[{side_id} SIDE] Baut & Pin",
         f"--combo-values={side_combo_str}",
-        "--width=560"
+        "--add-combo=[MODE] Mode Operasional",
+        f"--combo-values={mode_combo_str}",
+        "--width=580"
     ]
 
     try:
@@ -207,6 +218,7 @@ def run_zenity_dual(default_top=None, default_side=None, side_id="CAM-02"):
             parts = output.split(":::")
             ch_top = parts[0].strip() if len(parts) > 0 else ""
             ch_side = parts[1].strip() if len(parts) > 1 else ""
+            ch_mode = parts[2].strip() if len(parts) > 2 else ""
 
             # 1. Resolusi Sumber CAM-01 Top
             final_top = str(default_top) if default_top else "0"
@@ -230,10 +242,17 @@ def run_zenity_dual(default_top=None, default_side=None, side_id="CAM-02"):
             elif ch_side == side_def_label:
                 final_side = str(default_side) if default_side else "1"
 
+            final_mode = cur_mode
+            if ch_mode:
+                final_mode = ch_mode.split(" ", 1)[0].strip().lower()
+                if final_mode not in ("dual", "web", "headless"):
+                    final_mode = cur_mode
+
             if final_top:
                 print(f"RESULT_DUAL_TOP:{final_top}")
             if final_side:
                 print(f"RESULT_DUAL_SIDE:{final_side}")
+            print(f"RESULT_DUAL_MODE:{final_mode}")
             return True
     except Exception as e:
         sys.stderr.write(f"[Zenity Dual] Error: {e}\n")
@@ -384,9 +403,9 @@ def run_tkinter_source(title="Pilih Sumber Kamera / Video", default_source=None)
     return False
 
 
-def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
+def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02", default_mode="dual"):
     """
-    Dialog visual pengaturan dual camera terpadu (CAM-01 Top & CAM-02 Side dalam 1 jendela).
+    Dialog visual pengaturan dual camera terpadu (CAM-01 Top, CAM-02 Side & Mode Operasional).
     Tampilan bawaan untuk Windows.
     """
     import tkinter as tk
@@ -394,7 +413,7 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
 
     cams = get_available_cameras()
     root = tk.Tk()
-    root.title(f"Pengaturan Dual Kamera (CAM-01 Top & {side_id} Side)")
+    root.title(f"Pengaturan Dual Kamera & Mode (CAM-01 Top & {side_id} Side)")
 
     if sys.platform.startswith("win"):
         try:
@@ -402,8 +421,8 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
         except Exception:
             pass
 
-    root.geometry("620x540")
-    root.minsize(560, 480)
+    root.geometry("640x650")
+    root.minsize(580, 560)
 
     f_fam = "Segoe UI" if sys.platform.startswith("win") else "DejaVu Sans"
     f_title = (f_fam, 11, "bold")
@@ -411,7 +430,8 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
     f_reg = (f_fam, 9)
     f_sm = (f_fam, 8)
 
-    res = {"top": default_top, "side": default_side}
+    init_mode = default_mode if default_mode in ("dual", "web", "headless") else "dual"
+    res = {"top": default_top, "side": default_side, "mode": init_mode}
 
     lbl_t = tk.Label(root, text="🎥 PENGATURAN SUMBER DUAL KAMERA", font=f_title, pady=8)
     lbl_t.pack()
@@ -485,10 +505,41 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
 
     tk.Button(f_side_file, text="Pilih...", command=browse_side, font=f_sm).pack(side="right")
 
+    # --- PANEL MODE OPERASIONAL ---
+    f_mode = tk.LabelFrame(root, text="[MODE OPERASIONAL] Tampilan & Arsitektur Streaming", font=f_sec, padx=12, pady=6)
+    f_mode.pack(fill="x", padx=15, pady=6)
+
+    var_mode = tk.StringVar(master=root, value=init_mode)
+    tk.Radiobutton(
+        f_mode,
+        text="Dual GUI (dual) — Tampilkan 2 Jendela OpenCV (+ WebSocket)",
+        variable=var_mode,
+        value="dual",
+        font=f_reg,
+        anchor="w",
+    ).pack(fill="x", pady=1)
+    tk.Radiobutton(
+        f_mode,
+        text="Web Dashboard Only (web) — Tanpa GUI Desktop (Hybrid + WebSocket 3-Kamera)",
+        variable=var_mode,
+        value="web",
+        font=f_reg,
+        anchor="w",
+    ).pack(fill="x", pady=1)
+    tk.Radiobutton(
+        f_mode,
+        text="Headless (headless) — Tanpa GUI Desktop (Murni Inferensi)",
+        variable=var_mode,
+        value="headless",
+        font=f_reg,
+        anchor="w",
+    ).pack(fill="x", pady=1)
+
     root.var_top_choice = var_top_choice
     root.var_top_cam = var_top_cam
     root.var_side_choice = var_side_choice
     root.var_side_cam = var_side_cam
+    root.var_mode = var_mode
 
     def on_confirm_all():
         if var_top_choice.get() == "webcam":
@@ -501,9 +552,10 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
         elif side_file_path["path"]:
             res["side"] = str(side_file_path["path"])
 
+        res["mode"] = var_mode.get()
         root.destroy()
 
-    f_bottom = tk.Frame(root, pady=15)
+    f_bottom = tk.Frame(root, pady=12)
     f_bottom.pack(side="bottom", fill="x", padx=15)
     tk.Button(f_bottom, text="Terapkan & Mulai", bg="#007acc", fg="white", font=(f_fam, 10, "bold"), width=18, command=on_confirm_all).pack(side="right", padx=5)
     tk.Button(f_bottom, text="Gunakan Bawaan", font=f_reg, width=15, command=root.destroy).pack(side="right")
@@ -513,6 +565,8 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02"):
         print(f"RESULT_DUAL_TOP:{res['top']}")
     if res.get("side"):
         print(f"RESULT_DUAL_SIDE:{res['side']}")
+    if res.get("mode"):
+        print(f"RESULT_DUAL_MODE:{res['mode']}")
     return True
 
 
@@ -529,12 +583,13 @@ def main():
     parser.add_argument("--top", type=str, default="")
     parser.add_argument("--side", type=str, default="")
     parser.add_argument("--side-id", type=str, default="CAM-02")
+    parser.add_argument("--mode", type=str, default="dual")
     args = parser.parse_args()
 
     # Prioritas Linux: Gunakan Zenity 100% native GTK untuk garansi kebal stack smashing Tkinter
     if sys.platform.startswith("linux") and has_zenity():
         if args.dialog == "dual":
-            ok = run_zenity_dual(default_top=args.top, default_side=args.side, side_id=args.side_id)
+            ok = run_zenity_dual(default_top=args.top, default_side=args.side, side_id=args.side_id, default_mode=args.mode)
             if ok:
                 sys.exit(0)
         elif args.dialog == "source":
@@ -548,7 +603,7 @@ def main():
 
     # Windows / Fallback Non-Zenity: Gunakan Tkinter
     if args.dialog == "dual":
-        ok = run_tkinter_dual(default_top=args.top, default_side=args.side, side_id=args.side_id)
+        ok = run_tkinter_dual(default_top=args.top, default_side=args.side, side_id=args.side_id, default_mode=args.mode)
         sys.exit(0 if ok else 1)
     elif args.dialog == "source":
         ok = run_tkinter_source(title=args.title or "Pilih Sumber Kamera / Video", default_source=args.default)
