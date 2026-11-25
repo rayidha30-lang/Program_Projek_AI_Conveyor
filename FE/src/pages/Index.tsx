@@ -57,6 +57,11 @@ import {
   type Severity,
 } from "@/lib/api";
 import TuningSettings from "@/components/TuningSettings";
+import {
+  useLiveCameraStream,
+  type CameraId,
+  type CameraStreamState,
+} from "@/hooks/useLiveCameraStream";
 
 type View = "dashboard" | "live" | "abnormality" | "evidence" | "analytics" | "settings";
 
@@ -234,6 +239,12 @@ export default function Index() {
   const [recordsData, setRecordsData] = useState<RecordRow[]>(records);
   const [evidenceData, setEvidenceData] = useState<EvidenceItem[]>([]);
   const [analyticsData, setAnalyticsData] = useState<AnalyticsData | null>(null);
+  const {
+    connected: wsConnected,
+    showOverlay,
+    toggleOverlay,
+    streams,
+  } = useLiveCameraStream(view === "dashboard" || view === "live");
 
   // Pengendali tema (Dark / Light) dengan persistensi localStorage
   const [theme, setTheme] = useState<"light" | "dark">(() => {
@@ -342,13 +353,27 @@ export default function Index() {
         <Header
           view={view}
           apiStatus={apiStatus}
+          wsConnected={wsConnected}
           theme={theme}
           onToggleTheme={toggleTheme}
           contextActions={
             view === "live" ? (
               <div className="hidden md:flex items-center gap-1.5">
-                <StatusPill text="Bounding Box: ON" />
-                <StatusPill text="Shutter Sync: 100%" />
+                <button
+                  type="button"
+                  onClick={toggleOverlay}
+                  className="cursor-pointer"
+                  title="Toggle overlay bounding box & kontur deteksi"
+                >
+                  <StatusPill
+                    text={showOverlay ? "Bounding Box: ON" : "Bounding Box: OFF"}
+                    online={showOverlay}
+                  />
+                </button>
+                <StatusPill
+                  text={wsConnected ? "WS Stream: Live" : "WS Stream: Standby"}
+                  online={wsConnected}
+                />
               </div>
             ) : view === "evidence" ? (
               <div className="flex items-center gap-1.5">
@@ -382,9 +407,11 @@ export default function Index() {
               onSelectRecord={handleSelectRecord}
               statsList={statsData}
               recentRecords={recordsData}
+              streams={streams}
+              wsConnected={wsConnected}
             />
           )}
-          {view === "live" && <LiveCamera />}
+          {view === "live" && <LiveCamera streams={streams} wsConnected={wsConnected} />}
           {view === "abnormality" && (
             <Abnormality
               allRecords={recordsData}
@@ -747,12 +774,14 @@ function Sidebar({
 function Header({
   view,
   apiStatus,
+  wsConnected,
   theme,
   onToggleTheme,
   contextActions,
 }: {
   view: View;
   apiStatus: { status: string; database: string };
+  wsConnected: boolean;
   theme: "light" | "dark";
   onToggleTheme: () => void;
   contextActions?: React.ReactNode;
@@ -803,7 +832,10 @@ function Header({
         <div className="hidden items-center gap-2 sm:flex">
           <StatusPill text={isOnline ? "API: Online" : "API: Offline"} online={isOnline} />
           <StatusPill text={isDb ? "SSMS: Connected" : "SSMS: Disconnected"} online={isDb} />
-          <StatusPill text="3 Cams: Online" online={true} />
+          <StatusPill
+            text={wsConnected ? "3 Cams: Live WS" : "3 Cams: Standby"}
+            online={wsConnected}
+          />
           <span className="flex items-center gap-1.5 rounded-lg border border-border/60 bg-card px-2.5 py-1.5 font-mono text-[9px] font-semibold text-muted-foreground shadow-xs">
             <Clock3 className="size-3" />
             {timeStr || "15 Sep 2026 | 09:00 WIB"}
@@ -901,11 +933,15 @@ function Dashboard({
   onSelectRecord,
   statsList,
   recentRecords,
+  streams,
+  wsConnected,
 }: {
   onViewAll: () => void;
   onSelectRecord?: (record: RecordRow) => void;
   statsList: AbnormalComponentSummary[];
   recentRecords: RecordRow[];
+  streams: Record<CameraId, CameraStreamState>;
+  wsConnected: boolean;
 }) {
   const statsMeta: Record<
     string,
@@ -1022,7 +1058,9 @@ function Dashboard({
           subtitle="Tampilan sinkron 3 sudut optik dengan AI bounding box real-time"
           aside={
             <span className="text-[9px] font-mono text-muted-foreground">
-              1080p @ 30 FPS • Synchronous Ingest
+              {wsConnected
+                ? "640×360 (16:9) • Binary WebSocket Live"
+                : "Standby • Menunggu Stream (:8765)"}
             </span>
           }
         />
@@ -1030,28 +1068,29 @@ function Dashboard({
           <CameraFeed
             camera="CAM-01"
             area="Plate / Rib"
-            object="SLAT #4928 INTERSECT"
+            object="Conveyor Plate / Rib"
             objectType="RIB"
-            conf="96.8%"
-            fps="30"
+            conf="-"
+            fps="--"
+            streamState={streams["CAM-01"]}
           />
           <CameraFeed
             camera="CAM-02"
             area="Bolt / Pin RH Side"
-            object="BOLT M16 SECURED"
-            objectType="BOLT"
-            conf="98.1%"
-            fps="30"
+            object="Bolt / Pin RH"
+            objectType="BOLT / PIN"
+            conf="-"
+            fps="--"
+            streamState={streams["CAM-02"]}
           />
           <CameraFeed
             camera="CAM-03"
             area="Bolt / Pin LH Side"
-            object="PIN DISLODGED / MISSING"
-            objectType="PIN MISSING"
-            conf="95.2%"
-            fps="30"
-            sev="HIGH"
-            alert
+            object="Bolt / Pin LH"
+            objectType="BOLT / PIN"
+            conf="-"
+            fps="--"
+            streamState={streams["CAM-03"]}
           />
         </div>
       </Panel>
@@ -1088,9 +1127,10 @@ function CameraFeed({
   object,
   objectType,
   conf,
-  fps = "30",
+  fps = "--",
   sev,
   alert = false,
+  streamState,
 }: {
   camera: string;
   area: string;
@@ -1100,11 +1140,32 @@ function CameraFeed({
   fps?: string;
   sev?: string;
   alert?: boolean;
+  streamState?: CameraStreamState;
 }) {
+  const liveMeta = streamState?.meta;
+  const frameUrl = streamState?.frameUrl;
+  const hasLive = Boolean(frameUrl);
+  const isAlarm = hasLive ? liveMeta?.status === "NG" : alert;
+  const statusText = hasLive
+    ? isAlarm
+      ? "ALARM ACTIVE"
+      : liveMeta?.status || "ONLINE"
+    : "STANDBY";
+  const displayFps = hasLive && liveMeta?.fps !== undefined ? liveMeta.fps.toFixed(1) : fps;
+  const displayObject = hasLive && liveMeta?.object ? liveMeta.object : objectType;
+  const displayConf =
+    hasLive && liveMeta?.conf !== null && liveMeta?.conf !== undefined
+      ? `${(liveMeta.conf * 100).toFixed(1)}%`
+      : conf;
+  const displaySev =
+    hasLive && liveMeta?.severity && liveMeta.severity !== "NONE"
+      ? liveMeta.severity
+      : sev;
+
   return (
     <div
       className={`overflow-hidden rounded-lg border ${
-        alert ? "border-danger/50" : "border-border"
+        isAlarm ? "border-danger/50" : "border-border"
       }`}
     >
       <div className="flex items-center justify-between bg-secondary px-3 py-2 text-[10px]">
@@ -1112,50 +1173,63 @@ function CameraFeed({
           {camera}{" "}
           <span className="font-medium text-muted-foreground">({area})</span>
         </span>
-        <span className={`font-bold ${alert ? "text-danger" : "text-success"}`}>
-          {alert ? "ALARM ACTIVE" : "ONLINE"}
-        </span>
-      </div>
-      <div className="camera-grid relative flex aspect-video items-center justify-center overflow-hidden">
-        <div
-          className={`absolute inset-x-0 top-0 h-px ${
-            alert ? "bg-danger" : "bg-success"
-          } scan-line`}
-        />
-        <div
-          className={`h-20 w-32 border-2 ${
-            alert ? "border-danger" : "border-success"
+        <span
+          className={`font-bold ${
+            !hasLive
+              ? "text-muted-foreground"
+              : isAlarm
+                ? "text-danger"
+                : "text-success"
           }`}
         >
-          <span
-            className={`-mt-5 block w-fit px-1 font-mono text-[8px] ${
-              alert
-                ? "bg-danger text-primary-foreground"
-                : "bg-success text-primary-foreground"
-            }`}
-          >
-            {object}
-          </span>
-        </div>
+          {statusText}
+        </span>
+      </div>
+      <div className="camera-grid relative flex aspect-video items-center justify-center overflow-hidden bg-black/90">
+        {frameUrl ? (
+          <img
+            src={frameUrl}
+            alt={`${camera} live stream`}
+            className="size-full object-cover"
+          />
+        ) : (
+          <>
+            <div
+              className={`absolute inset-x-0 top-0 h-px ${
+                isAlarm ? "bg-danger" : "bg-muted-foreground/40"
+              } scan-line`}
+            />
+            <div className="flex flex-col items-center gap-1.5 text-center px-4">
+              <Camera className="size-6 text-muted-foreground/70" />
+              <span className="font-mono text-[10px] text-muted-foreground">
+                Menunggu stream {camera} ({object})
+              </span>
+            </div>
+          </>
+        )}
       </div>
       <div className="flex flex-wrap items-center justify-between gap-1.5 bg-card px-3 py-2 font-mono text-[9px] text-muted-foreground border-t">
         <div className="flex items-center gap-1.5 sm:gap-2">
           <span>
-            Object: <strong className="text-foreground">{objectType}</strong>
+            Object: <strong className="text-foreground">{displayObject}</strong>
           </span>
           <span className="text-border">|</span>
           <span>
-            Conf: <strong className="text-foreground">{conf}</strong>
+            Conf: <strong className="text-foreground">{displayConf}</strong>
           </span>
           <span className="text-border">|</span>
           <span className="flex items-center gap-1 font-bold text-foreground">
-            <span className="size-1.5 rounded-full bg-success animate-pulse" />
-            FPS: <strong className="text-foreground">{fps}</strong>
+            <span
+              className={`size-1.5 rounded-full ${
+                hasLive ? "bg-success animate-pulse" : "bg-muted-foreground/50"
+              }`}
+            />
+            FPS: <strong className="text-foreground">{displayFps}</strong>
           </span>
         </div>
-        {sev && (
+        {displaySev && (
           <span className="rounded border border-danger/30 bg-danger-soft px-1.5 py-0.5 text-[8px] font-bold text-danger">
-            Sev: {sev}
+            Sev: {displaySev}
           </span>
         )}
       </div>
@@ -1163,83 +1237,126 @@ function CameraFeed({
   );
 }
 
-function LiveCamera() {
-  const cameras = [
+function LiveCamera({
+  streams,
+  wsConnected,
+}: {
+  streams: Record<CameraId, CameraStreamState>;
+  wsConnected: boolean;
+}) {
+  const cameras: {
+    cam: CameraId;
+    station: string;
+    title: string;
+    desc: string;
+    fallbackObj: string;
+  }[] = [
     {
       cam: "CAM-01",
-      status: "ONLINE",
       station: "Station: ST-01 / Overhead",
       title: "Plat / Rib Inspection Area",
-      desc: "Mendeteksi deformasi profil rib conveyor.",
-      obj: "Object: Slat Rib #4928",
-      alert: false,
+      desc: "Mendeteksi kelurusan celah plat slat & deformasi profil rib conveyor.",
+      fallbackObj: "Conveyor Plate / Rib",
     },
     {
       cam: "CAM-02",
-      status: "ONLINE",
       station: "Station: ST-01 / Right Oblique",
       title: "Bolt / Pin Right Side Area",
-      desc: "Inspeksi baut penahan samping dan keberadaan washer flange.",
-      obj: "Object: Fastener M16",
-      alert: false,
+      desc: "Inspeksi baut penahan samping kanan, pin, dan retakan bracket.",
+      fallbackObj: "Bolt / Pin RH",
     },
     {
       cam: "CAM-03",
-      status: "ALARM",
-      station: "Station: ST-01 / Left Undercarriage",
+      station: "Station: ST-01 / Left Oblique",
       title: "Bolt / Pin Left Side Area",
-      desc: "Terdeteksi pin penghubung rantai atau pin hilang.",
-      obj: "Pin Missing On Link #11",
-      alert: true,
+      desc: "Inspeksi baut penahan samping kiri, pin, dan retakan bracket.",
+      fallbackObj: "Bolt / Pin LH",
     },
   ];
 
   return (
     <div className="grid gap-5 xl:grid-cols-3">
-      {cameras.map((c) => (
-        <Panel key={c.cam} className="overflow-hidden">
-          <div className="flex justify-between p-4 pb-3">
-            <div>
-              <p className="text-xs font-extrabold">
-                {c.cam}{" "}
-                <span className={c.alert ? "text-danger" : "text-success"}>
-                  {c.status}
+      {cameras.map((c) => {
+        const st = streams[c.cam];
+        const meta = st?.meta;
+        const hasLive = Boolean(st?.frameUrl);
+        const isAlert = hasLive && meta?.status === "NG";
+        const statusLabel = hasLive ? (meta?.status || "ONLINE") : "STANDBY";
+        const fpsLabel = hasLive && meta?.fps !== undefined ? meta.fps.toFixed(1) : "--";
+        const objLabel = hasLive && meta?.object ? meta.object : c.fallbackObj;
+
+        return (
+          <Panel key={c.cam} className="overflow-hidden">
+            <div className="flex justify-between p-4 pb-3">
+              <div>
+                <p className="text-xs font-extrabold">
+                  {c.cam}{" "}
+                  <span
+                    className={
+                      !hasLive
+                        ? "text-muted-foreground"
+                        : isAlert
+                          ? "text-danger"
+                          : "text-success"
+                    }
+                  >
+                    {statusLabel}
+                  </span>
+                </p>
+                <p className="mt-1 text-[9px] text-muted-foreground">
+                  {c.station}
+                </p>
+              </div>
+              <Camera className="size-5 text-muted-foreground" />
+            </div>
+            <div className="camera-grid relative flex aspect-video items-center justify-center overflow-hidden bg-black/90">
+              {st?.frameUrl ? (
+                <img
+                  src={st.frameUrl}
+                  alt={`${c.cam} live view`}
+                  className="size-full object-cover"
+                />
+              ) : (
+                <div className="flex flex-col items-center gap-1.5 text-center px-4">
+                  <Camera className="size-7 text-muted-foreground/60" />
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    {wsConnected
+                      ? `Menunggu frame ${c.cam}...`
+                      : "Standby (jalankan runner dengan --ws-stream)"}
+                  </span>
+                </div>
+              )}
+              <div
+                className={`absolute bottom-2.5 left-2.5 rounded px-2 py-0.5 font-mono text-[9px] font-bold ${
+                  !hasLive
+                    ? "bg-black/70 text-muted-foreground border border-white/10"
+                    : isAlert
+                      ? "bg-danger text-primary-foreground"
+                      : "bg-success text-primary-foreground"
+                }`}
+              >
+                {!hasLive
+                  ? "STREAM STANDBY"
+                  : isAlert
+                    ? "CRITICAL DEFECT DETECTED"
+                    : "STREAM VIEW • OK"}
+              </div>
+            </div>
+            <div className="p-4">
+              <h3 className="text-sm font-bold">{c.title}</h3>
+              <p className="mt-1 text-[10px] text-muted-foreground">{c.desc}</p>
+              <div className="mt-4 flex justify-between border-t pt-3 text-[9px] font-mono">
+                <span>
+                  FPS: <b>{fpsLabel}</b> • 360p WS Live
                 </span>
-              </p>
-              <p className="mt-1 text-[9px] text-muted-foreground">
-                {c.station}
-              </p>
+                <b className={isAlert ? "text-danger" : hasLive ? "text-success" : "text-muted-foreground"}>
+                  {objLabel}
+                </b>
+              </div>
             </div>
-            <Camera className="size-5 text-muted-foreground" />
-          </div>
-          <div className="camera-grid relative flex aspect-4/3 items-center justify-center overflow-hidden">
-            <div
-              className={`h-32 w-40 border-2 ${
-                c.alert ? "border-danger" : "border-success"
-              }`}
-            />
-            <div
-              className={`absolute bottom-3 left-3 rounded px-2 py-1 font-mono text-[9px] ${
-                c.alert ? "bg-danger" : "bg-success"
-              } text-primary-foreground`}
-            >
-              {c.alert ? "CRITICAL DEFECT DETECTED" : "STREAM VIEW • OK"}
-            </div>
-          </div>
-          <div className="p-4">
-            <h3 className="text-sm font-bold">{c.title}</h3>
-            <p className="mt-1 text-[10px] text-muted-foreground">{c.desc}</p>
-            <div className="mt-4 flex justify-between border-t pt-3 text-[9px] font-mono">
-              <span>
-                FPS: <b>30</b> • 1080p RAW
-              </span>
-              <b className={c.alert ? "text-danger" : "text-success"}>
-                {c.obj}
-              </b>
-            </div>
-          </div>
-        </Panel>
-      ))}
+          </Panel>
+        );
+      })}
     </div>
   );
 }
