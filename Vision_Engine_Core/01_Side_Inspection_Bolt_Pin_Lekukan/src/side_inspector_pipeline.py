@@ -1026,6 +1026,8 @@ class SideConveyorInspector:
             "slat_number": self.slat_cycle_count,
             "emit_raw_frame": emit_raw,
             "emit_ann_frame": emit_ann,
+            "bolts": bolts,
+            "pins": pins,
             "components": [
                 {"name": "BOLT", "result": bolt_display, "confidence": max_b_conf},
                 {"name": "PIN", "result": pin_display, "confidence": max_p_conf},

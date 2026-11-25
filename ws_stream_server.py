@@ -210,6 +210,7 @@ def render_clean_side_360p(
 
     if payload:
         for key in ("bolts", "pins"):
+            default_label = "BOLT" if key == "bolts" else "PIN"
             for item in payload.get(key) or []:
                 box = item.get("box")
                 if box is not None and len(box) >= 4:
@@ -217,6 +218,19 @@ def render_clean_side_360p(
                     bx2, by2 = int(box[2] * sx), int(box[3] * sy)
                     col = (0, 30, 255) if item.get("is_ng") else (0, 230, 0)
                     cv2.rectangle(canvas, (bx1, by1), (bx2, by2), col, 2)
+                    cls_name = str(item.get("class_name") or default_label).upper()
+                    conf_v = item.get("confidence")
+                    lbl = f"{cls_name} {float(conf_v):.2f}" if conf_v is not None else cls_name
+                    cv2.putText(
+                        canvas,
+                        lbl,
+                        (bx1, max(12, by1 - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.38,
+                        col,
+                        1,
+                        cv2.LINE_AA,
+                    )
 
     return canvas
 
