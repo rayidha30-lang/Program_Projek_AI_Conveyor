@@ -95,6 +95,7 @@ class DualRailCalibrator:
         self.calib_frame_w = 1920
         self.calib_frame_h = 1080
         self.metrology = {}
+        self.aruco_landmarks = {}
 
     def load_golden_reference(self):
         """Memuat acuan emas dari konfigurasi jika tersedia."""
@@ -303,6 +304,11 @@ class DualRailCalibrator:
         self.pts[1] = np.array([float(lb_x), self.y_bot])
         self.pts[2] = np.array([float(rt_x), self.y_top])
         self.pts[3] = np.array([float(rb_x), self.y_bot])
+        try:
+            from camera_pose_watchdog import detect_aruco_landmarks
+            self.aruco_landmarks = detect_aruco_landmarks(frame_bgr)
+        except Exception:
+            self.aruco_landmarks = {}
         self.is_saved = False
         print(f"[*] Auto-Snap Rel Berhasil: Kiri=[{lt_x}, {lb_x}], Kanan=[{rt_x}, {rb_x}]")
 
@@ -485,23 +491,29 @@ class DualRailCalibrator:
             "recommended_prime_min_y": self.metrology.get("recommended_prime_min_y", 315),
             "recommended_min_span_px": self.metrology.get("recommended_min_span_px", 680.0),
             "left_rail_pts": [self.pts[0].tolist(), self.pts[1].tolist()],
-            "right_rail_pts": [self.pts[2].tolist(), self.pts[3].tolist()]
+            "right_rail_pts": [self.pts[2].tolist(), self.pts[3].tolist()],
+            "aruco_landmarks": {str(k): v for k, v in getattr(self, "aruco_landmarks", {}).items()},
         })
 
-        # Sesuaikan batas atas zona rib saat rel menyempit (kamera agak mendongak ke atas)
+        # Sesuaikan batas atas zona rib sesuai profil kalibrasi rel
         rec_top_y = float(self.metrology.get("recommended_rib_y_top_frac", 0.28))
         rec_prime_min = int(self.metrology.get("recommended_prime_min_y", 315))
-        if rec_top_y < 0.28 and isinstance(cfg_data.get("rib_polygon"), list) and len(cfg_data["rib_polygon"]) >= 4:
+        if isinstance(cfg_data.get("rib_polygon"), list) and len(cfg_data["rib_polygon"]) >= 4:
             updated_poly = [list(pt) for pt in cfg_data["rib_polygon"]]
-            updated_poly[0][1] = min(float(updated_poly[0][1]), rec_top_y)
-            updated_poly[1][1] = min(float(updated_poly[1][1]), rec_top_y)
-            cfg_data["rib_polygon"] = updated_poly
-            if "rib_prime_min_y" in cfg_data["thresholds"]:
-                cfg_data["thresholds"]["rib_prime_min_y"] = min(
-                    int(cfg_data["thresholds"]["rib_prime_min_y"]), rec_prime_min
-                )
-            else:
-                cfg_data["thresholds"]["rib_prime_min_y"] = rec_prime_min
+            if rec_top_y < 0.28:
+                updated_poly[0][1] = min(float(updated_poly[0][1]), rec_top_y)
+                updated_poly[1][1] = min(float(updated_poly[1][1]), rec_top_y)
+                cfg_data["rib_polygon"] = updated_poly
+                if "rib_prime_min_y" in cfg_data["thresholds"]:
+                    cfg_data["thresholds"]["rib_prime_min_y"] = min(
+                        int(cfg_data["thresholds"]["rib_prime_min_y"]), rec_prime_min
+                    )
+                else:
+                    cfg_data["thresholds"]["rib_prime_min_y"] = rec_prime_min
+            elif float(updated_poly[0][1]) < rec_top_y or float(updated_poly[1][1]) < rec_top_y:
+                updated_poly[0][1] = max(float(updated_poly[0][1]), rec_top_y)
+                updated_poly[1][1] = max(float(updated_poly[1][1]), rec_top_y)
+                cfg_data["rib_polygon"] = updated_poly
 
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:

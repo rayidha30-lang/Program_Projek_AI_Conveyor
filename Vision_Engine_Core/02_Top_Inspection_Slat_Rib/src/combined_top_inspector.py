@@ -133,18 +133,32 @@ from hough_stitching_inspector import (
     get_adaptive_slat_polygon
 )
 from conveyor_motion_calibrator import ConveyorMotionCalibrator
+from frame_health_monitor import FrameHealthMonitor
+from camera_pose_watchdog import CameraPoseWatchdog
 
 # Impor Modul Jembatan Database SQLite dari root Program/ (fallback ke Program/Database)
 PROGRAM_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", ".."))
 for _db_cand in (PROGRAM_DIR, os.path.join(PROGRAM_DIR, "Database")):
-    if os.path.exists(os.path.join(_db_cand, "db_bridge.py")) and _db_cand not in sys.path:
-        sys.path.insert(0, _db_cand)
+    if os.path.exists(os.path.join(_db_cand, "db_bridge.py")):
+        if _db_cand not in sys.path:
+            sys.path.insert(0, _db_cand)
         break
 
 try:
     from db_bridge import InspectionDBBridge
 except ImportError:
     InspectionDBBridge = None
+
+from video_nav_utils import (
+    SPEED_STEPS,
+    IdleConveyorSkipper,
+    compute_seek_target_from_key,
+    format_seconds_mmss,
+    format_speed_label,
+    next_speed_step,
+    parse_time_to_seconds,
+    prompt_jump_time_dialog,
+)
 
 
 class AsyncFrameGrabber:
@@ -153,9 +167,8 @@ class AsyncFrameGrabber:
     
     Arsitektur Produsen-Konsumen (Producer-Consumer):
     - Untuk FILE VIDEO (Offline/Testing):
-      Menyimpan antrean frame (buffer_size=2) TANPA membuang frame (ZERO DROPPED FRAMES).
-      Ketika buffer penuh, thread produsen menunggu main loop selesai memproses frame aktif.
-      Ini menghilangkan latency decode 9.4ms per frame TANPA melompati frame (mencegah efek speed up / fast-forward).
+      Menyimpan antrean frame (buffer_size=2) TANPA membuang frame (ZERO DROPPED FRAMES) pada speed 1x.
+      Mendukung fast-forward speed multiplier, seek berbasis epoch (bebas stale frame), dan fast-grab skip.
     - Untuk KAMERA LIVE (RTSP/USB Stream):
       Membuang frame lama jika buffer penuh agar visualisasi selalu real-time dengan latensi terendah.
     """
@@ -163,8 +176,8 @@ class AsyncFrameGrabber:
     def __init__(self, source_path, buffer_size=2):
         self.source_path = source_path
         self.is_live = False
-        src_str = str(source_path)
-        if src_str.isdigit() or src_str.startswith(("rtsp://", "http://", "https://", "/dev/video")):
+        src_str = str(source_path).strip()
+        if src_str.isdigit() or src_str.startswith(("rtsp://", "http://", "https://", "/dev/video", "nvarguscamerasrc", "v4l2src")):
             self.is_live = True
 
         self.cap = cv2.VideoCapture(int(source_path) if src_str.isdigit() else source_path)
@@ -172,6 +185,8 @@ class AsyncFrameGrabber:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._seek_target = None
+        self._seek_epoch = 0
+        self._speed_mult = 1
         self._current_pos = 0
 
         # Ambil FPS native dan total frame dari video
@@ -184,25 +199,58 @@ class AsyncFrameGrabber:
         self._thread = threading.Thread(target=self._grab_loop, daemon=True, name="FrameGrabber")
         self._thread.start()
 
+    def _drain_buffer_locked(self):
+        while not self._buf.empty():
+            try:
+                self._buf.get_nowait()
+            except queue.Empty:
+                break
+
+    def _clamp_pos(self, pos: int) -> int:
+        if self._total_frames > 0:
+            return max(0, min(self._total_frames - 1, int(pos)))
+        return max(0, int(pos))
+
+    def set_speed_multiplier(self, speed_mult: int) -> int:
+        """Atur pengali kecepatan baca file video (1x..16x)."""
+        val = max(1, int(speed_mult))
+        with self._lock:
+            self._speed_mult = val
+        return val
+
     def _grab_loop(self):
         while not self._stop.is_set():
+            did_explicit_seek = False
             # 1. Cek permintaan seek
             with self._lock:
+                my_epoch = self._seek_epoch
+                speed_mult = self._speed_mult
                 if self._seek_target is not None:
                     target = self._seek_target
                     self._seek_target = None
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-                    while not self._buf.empty():
-                        try:
-                            self._buf.get_nowait()
-                        except queue.Empty:
-                            break
+                    self._drain_buffer_locked()
+                    if not self.is_live:
+                        cap_cur = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+                        delta_fwd = target - cap_cur
+                        if 0 < delta_fwd <= 75:
+                            for _ in range(delta_fwd):
+                                if not self.cap.grab():
+                                    break
+                        elif delta_fwd != 0:
+                            self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+                    did_explicit_seek = True
 
             # 2. Untuk file video: jika buffer penuh, tunggu main loop (JANGAN BACA & JANGAN BUANG FRAME!)
-            # Ini kunci vital agar video TIDAK speed up atau melompati bilah slat/sirip!
+            # Ini kunci vital agar video TIDAK speed up atau melompati bilah slat/sirip pada speed 1x.
             if not self.is_live and self._buf.full():
                 time.sleep(0.003)
                 continue
+
+            # Fast-forward frame skipping saat speed > 1x pada pemutaran normal
+            if not self.is_live and speed_mult > 1 and not did_explicit_seek:
+                for _ in range(speed_mult - 1):
+                    if not self.cap.grab():
+                        break
 
             pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
             ret, frame = self.cap.read()
@@ -216,7 +264,13 @@ class AsyncFrameGrabber:
                     time.sleep(0.01)
                     continue
 
+            # Pastikan tidak menaruh frame basi sebelum seek ke antrean buffer
+            with self._lock:
+                if my_epoch != self._seek_epoch or self._seek_target is not None:
+                    continue
+
             # 3. Masukkan ke antrean buffer
+            item = (my_epoch, pos, frame)
             if self.is_live:
                 if self._buf.full():
                     try:
@@ -224,48 +278,71 @@ class AsyncFrameGrabber:
                     except queue.Empty:
                         pass
                 try:
-                    self._buf.put((pos, frame), timeout=0.02)
+                    self._buf.put(item, timeout=0.02)
                 except queue.Full:
                     pass
             else:
-                while not self._stop.is_set() and self._seek_target is None:
+                while not self._stop.is_set():
+                    with self._lock:
+                        if my_epoch != self._seek_epoch or self._seek_target is not None:
+                            break
                     try:
-                        self._buf.put((pos, frame), timeout=0.05)
+                        self._buf.put(item, timeout=0.03)
                         break
                     except queue.Full:
                         continue
 
-    def read(self):
-        """Ambil frame berikutnya dari antrean buffer (non-blocking)."""
-        try:
-            pos, frame = self._buf.get(timeout=0.25)
+    def read(self, timeout: float = 0.25):
+        """Ambil frame berikutnya dari antrean buffer sesuai epoch seek terbaru."""
+        deadline = time.time() + max(0.02, float(timeout))
+        while time.time() < deadline and not self._stop.is_set():
+            rem = max(0.01, deadline - time.time())
+            try:
+                ep, pos, frame = self._buf.get(timeout=min(0.05, rem))
+            except queue.Empty:
+                continue
+            with self._lock:
+                cur_ep = self._seek_epoch
+            if ep != cur_ep:
+                continue
             self._current_pos = pos
             return True, frame
-        except queue.Empty:
-            return False, None
+        return False, None
 
     def get_pos_frames(self):
         """Posisi nomor frame yang sedang diproses di layar."""
         return self._current_pos
 
     def set_pos_frames(self, pos):
-        """Seek video ke nomor frame tertentu."""
+        """Seek video ke nomor frame tertentu dengan epoch invalidation."""
+        target = self._clamp_pos(pos)
         with self._lock:
-            self._seek_target = max(0, pos)
-            self._current_pos = max(0, pos)
-            while not self._buf.empty():
-                try:
-                    self._buf.get_nowait()
-                except queue.Empty:
-                    break
+            self._seek_epoch += 1
+            self._seek_target = target
+            self._current_pos = target
+            self._drain_buffer_locked()
+            return self._seek_epoch
+
+    def read_after_seek(self, pos: int, timeout: float = 1.5):
+        """Seek ke target pos dan tunggu hingga frame segar pasca-seek tersedia."""
+        req_ep = self.set_pos_frames(pos)
+        deadline = time.time() + max(0.1, float(timeout))
+        while time.time() < deadline and not self._stop.is_set():
+            rem = max(0.01, deadline - time.time())
+            try:
+                ep, got_pos, frame = self._buf.get(timeout=min(0.05, rem))
+            except queue.Empty:
+                continue
+            if ep != req_ep:
+                continue
+            self._current_pos = got_pos
+            return True, frame
+        return False, None
 
     def release(self):
         self._stop.set()
-        while not self._buf.empty():
-            try:
-                self._buf.get_nowait()
-            except queue.Empty:
-                break
+        with self._lock:
+            self._drain_buffer_locked()
         self._thread.join(timeout=1.0)
         if self.cap is not None and self.cap.isOpened():
             self.cap.release()
@@ -328,10 +405,12 @@ class CombinedTopInspector:
         self.ref_bot_right_rail_px = 1808.0
         self.show_alignment_guides = False  # Sakelar Garis Panduan [G]
 
-        # Inisialisasi Database Bridge (Default: False / Dry Run)
+        # Inisialisasi Database Bridge (Default: False / Dry Run) & Konfigurasi TOP_CAMERA_ID Satu Pintu
+        raw_env_cam = os.environ.get("TOP_CAMERA_ID", "CAM-01").strip().upper()
+        self.top_camera_id = raw_env_cam if raw_env_cam in ("CAM-01", "CAM-02", "CAM-03") else "CAM-01"
         self.db_bridge = None
         if InspectionDBBridge is not None:
-            self.db_bridge = InspectionDBBridge(enabled=enable_db, camera_id="CAM-01")
+            self.db_bridge = InspectionDBBridge(enabled=enable_db, camera_id=self.top_camera_id)
 
         # 1. Parameter Default Plat Slat
         calib_mll = 0.70
@@ -478,9 +557,11 @@ class CombinedTopInspector:
         # Fase 2: Muat adaptive threshold dari Rib_Dataset jika db_bridge sudah tersedia,
         # difilter per profil kamera agar dataset posisi berbeda tidak tercampur
         if self.db_bridge is not None and hasattr(self.db_bridge, "db_path"):
+            fb_prof = "DEFAULT_STABIL" if self.active_profile_name == "HASIL_KALIBRASI" else None
             self.rib_inspector.load_adaptive_thresholds(
                 db_path=self.db_bridge.db_path,
-                camera_profile=self.active_profile_name or None
+                camera_profile=self.active_profile_name or None,
+                fallback_profile=fb_prof,
             )
 
         # Konfigurasi Prime Zone Sirip (Adaptif & Fleksibel)
@@ -535,6 +616,23 @@ class CombinedTopInspector:
         # Pre-allocated zero-copy canvas buffer (1000 x 820 px: 520 view + 300 HUD)
         self._screen_buf = np.zeros((820, 1000, 3), dtype=np.uint8)
 
+        # Fase 4: GPU Stage-0 Frame Health + cuFFT Auto-Direction & GPU/ArUco Camera Pose Watchdog
+        self.health_monitor = FrameHealthMonitor(device=device)
+        self.pose_watchdog = CameraPoseWatchdog(device=device)
+        if cfg_to_load is not None and isinstance(cfg_to_load, dict):
+            cp_init = cfg_to_load.get("calibration_profile", {}) or {}
+            self.pose_watchdog.set_aruco_reference(
+                cp_init.get("aruco_landmarks"),
+                calib_w=self._rect_calib_size[0],
+                calib_h=self._rect_calib_size[1],
+            )
+            self.total_slats_in_loop = max(1, int(cfg_to_load.get("thresholds", {}).get("total_slats_in_loop", 16)))
+        else:
+            self.total_slats_in_loop = 16
+        self._loop_anomaly_memory = {}
+        self._last_tracked_rib_loop_id = None
+        self._last_tracked_slat_loop_id = None
+
     def _apply_golden_reference(self, cp):
         """Memuat koordinat acuan emas (termasuk trapesium rel Posisi 3) dari calibration_profile."""
         gref = cp.get("golden_reference", {})
@@ -549,6 +647,10 @@ class CombinedTopInspector:
         self.ref_top_right_rail_px = float(gref.get("top_right_rail_px", self.ref_top_right_rail_px))
         self.ref_bot_left_rail_px = float(gref.get("bot_left_rail_px", self.ref_bot_left_rail_px))
         self.ref_bot_right_rail_px = float(gref.get("bot_right_rail_px", self.ref_bot_right_rail_px))
+        if hasattr(self, "pose_watchdog") and self.pose_watchdog is not None:
+            cw = int(cp.get("calib_frame_w", self._rect_calib_size[0]))
+            ch = int(cp.get("calib_frame_h", self._rect_calib_size[1]))
+            self.pose_watchdog.set_aruco_reference(cp.get("aruco_landmarks"), calib_w=cw, calib_h=ch)
 
     def _golden_rail_x(self, side, y_val, w_f=1920, h_f=1080):
         """Interpolasi linier X rel Acuan Emas pada tinggi y_val di koordinat frame."""
@@ -648,6 +750,13 @@ class CombinedTopInspector:
             self._current_rib_cycle_id = None
             self._last_emitted_slat_id = None
             self._last_emitted_rib_id = None
+            self._loop_anomaly_memory.clear()
+            self._last_tracked_rib_loop_id = None
+            self._last_tracked_slat_loop_id = None
+            if hasattr(self, "health_monitor") and self.health_monitor is not None:
+                self.health_monitor.reset()
+            if hasattr(self, "pose_watchdog") and self.pose_watchdog is not None:
+                self.pose_watchdog.reset_reference()
             if self.db_bridge is not None and hasattr(self.db_bridge, "reset_entity_cache"):
                 self.db_bridge.reset_entity_cache()
 
@@ -656,6 +765,8 @@ class CombinedTopInspector:
         with self._inspect_lock:
             if hasattr(self.rib_inspector, "reset_active_tracking"):
                 self.rib_inspector.reset_active_tracking()
+            if hasattr(self, "health_monitor") and self.health_monitor is not None and hasattr(self.health_monitor, "reset_phase_memory"):
+                self.health_monitor.reset_phase_memory()
             self.slat_history_samples.clear()
             self.latched_slat_data = None
             self.latched_hold_frames = 0
@@ -748,9 +859,11 @@ class CombinedTopInspector:
     def _apply_dataset_adaptive_thresholds(self):
         """Memuat ulang adaptive threshold dari Rib_Dataset untuk profil aktif."""
         if self.db_bridge is not None and hasattr(self.db_bridge, "db_path"):
+            fb_prof = "DEFAULT_STABIL" if self.active_profile_name == "HASIL_KALIBRASI" else None
             return self.rib_inspector.load_adaptive_thresholds(
                 db_path=self.db_bridge.db_path,
-                camera_profile=self.active_profile_name or None
+                camera_profile=self.active_profile_name or None,
+                fallback_profile=fb_prof,
             )
         return False
 
@@ -1071,6 +1184,8 @@ class CombinedTopInspector:
                         json.dump(cfg_data, f, indent=2)
 
                 self.active_profile_name = "HASIL_KALIBRASI"
+                if hasattr(self, "pose_watchdog") and self.pose_watchdog is not None:
+                    self.pose_watchdog.reset_reference()
                 self.calib_status_msg = calib_res["status_message"]
                 self.calib_banner_timer = 150
                 self.profile_banner_text = f"KALIBRASI SUKSES: Koreksi {calib_res['angle_correction_deg']:+.2f} deg, Geser {calib_res['lateral_offset_px']:+.1f} px"
@@ -1141,6 +1256,13 @@ class CombinedTopInspector:
                         pass
                 self._sync_config_mtime()
                 self.active_profile_name = "HASIL_KALIBRASI"
+                if hasattr(self, "pose_watchdog") and self.pose_watchdog is not None:
+                    self.pose_watchdog.set_aruco_reference(
+                        getattr(calib, "aruco_landmarks", None),
+                        calib_w=int(frame.shape[1]),
+                        calib_h=int(frame.shape[0]),
+                    )
+                    self.pose_watchdog.reset_reference()
                 # Terapkan adaptasi zona & bentang minimum langsung di memori tanpa menarik batas ke lorong jauh
                 rec_top_y = max(0.26, float(calib.metrology.get("recommended_rib_y_top_frac", 0.28)))
                 rec_prime_min = max(295, int(calib.metrology.get("recommended_prime_min_y", 315)))
@@ -1295,7 +1417,8 @@ class CombinedTopInspector:
         conf_slat_hdr = f" ({slat_conf:.2f})" if slat_conf > 0 else ""
         conf_rib_hdr = f" ({rib_conf:.2f})" if rib_conf > 0 else ""
 
-        title = f"[AI METROLOGY EVIDENCE] TOP CAM-01 | SLAT #{slat_no if slat_no is not None else '-'}: [{s_stat}]{conf_slat_hdr} | RIB #{rib_no if rib_no is not None else '-'}: [{r_stat}]{conf_rib_hdr}"
+        cam_lbl = getattr(self, "top_camera_id", "CAM-01")
+        title = f"[AI METROLOGY EVIDENCE] TOP {cam_lbl} | SLAT #{slat_no if slat_no is not None else '-'}: [{s_stat}]{conf_slat_hdr} | RIB #{rib_no if rib_no is not None else '-'}: [{r_stat}]{conf_rib_hdr}"
         cv2.putText(ann, title, (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 230, 255), 2, cv2.LINE_AA)
 
         rib_scale = float(rib_res.get("rib_mm_per_px", 750.0 / 1200.0) or (750.0 / 1200.0))
@@ -1512,12 +1635,13 @@ class CombinedTopInspector:
             and not bool(slat_res.get("is_seam_masked_occluded", False))
         )
         is_rib_ng = bool(rib_res.get("is_ng", False)) and (rib_res.get("status") == "NG")
+        is_rib_coasting = bool(rib_res.get("is_coasting", False))
 
-        # Filter eliminasi false alarm: Abaikan vonis NG jika kontur garis sirip belum membentang penuh
+        # Filter eliminasi false alarm: Abaikan vonis NG saat kinematic coasting (0.35) atau span belum penuh
         rib_xs = rib_res.get("xs_contour")
         rib_span = float(rib_xs[-1] - rib_xs[0]) if (rib_xs is not None and len(rib_xs) > 10) else 0.0
         min_span_thresh = min(750.0, 0.45 * frame_raw.shape[1]) if (frame_raw is not None and frame_raw.ndim >= 2) else 750.0
-        if is_rib_ng and rib_span < min_span_thresh:
+        if is_rib_ng and (rib_span < min_span_thresh or is_rib_coasting):
             is_rib_ng = False
 
         if not is_slat_ng and not is_rib_ng:
@@ -1618,13 +1742,94 @@ class CombinedTopInspector:
         if not hasattr(self, "slat_y_min") or self.slat_y_min is None:
             self._update_slat_y_bounds(w_f, h_f)
 
-        # Virtual Image Rectification (Metode 4) jika profil terkalibrasi aktif (otomatis diskalakan ke resolusi frame)
+        # Stage 0 (Fase 4 GPU): Evaluasi Kesehatan Citra, Oklusi Ingot, & Kecepatan cuFFT Phase-Correlation
+        health_res = self.health_monitor.evaluate(frame)
+        if hasattr(self.rib_inspector, "sync_external_conveyor_velocity"):
+            self.rib_inspector.sync_external_conveyor_velocity(
+                health_res.get("conveyor_vy", 0.0),
+                health_res.get("conveyor_direction", "UNKNOWN"),
+            )
+
+        # Stage 1 (Fase 4 GPU/ArUco): Watchdog Pergeseran & Getaran Holder Kamera
+        if not getattr(self, "is_calibrating", False):
+            pose_res = self.pose_watchdog.update(frame, gpu_thumb=self.health_monitor.last_gpu_thumb)
+        else:
+            pose_res = self.pose_watchdog.last_status
+
+        if health_res.get("is_invalid", False) or pose_res.get("is_invalid", False):
+            inv_code = health_res["invalid_code"] if health_res.get("is_invalid") else pose_res.get("invalid_code")
+            inv_reason = health_res["invalid_reason"] if health_res.get("is_invalid") else pose_res.get("invalid_reason")
+            # Bersihkan buffer transien sebelum INVALID agar tidak bocor menjadi False NG
+            self.slat_history_samples.clear()
+            if self._best_slat_candidate is not None:
+                self._best_slat_candidate = None
+            slat_inv = {
+                "status": "INVALID",
+                "display_status": "INVALID",
+                "is_ok": False,
+                "is_ng": False,
+                "is_occluded": False,
+                "is_conveyor_moving": False,
+                "pv_flatness": 0.0,
+                "sagitta": 0.0,
+                "center_void": 0,
+                "coverage": 0.0,
+                "confidence": 0.0,
+                "eval_mode": inv_reason,
+            }
+            rib_inv = {
+                "status": "INVALID",
+                "is_rib_present": False,
+                "is_ok": False,
+                "is_ng": False,
+                "pv_flatness": 0.0,
+                "sagitta": 0.0,
+                "inner_dev": 0.0,
+                "tip_dev": 0.0,
+                "max_deviation": 0.0,
+                "confidence": 0.0,
+                "message": inv_reason,
+                "yolo_boxes": [],
+                "pre_gate_rib_boxes": [],
+            }
+            if self.db_bridge is not None and self.db_bridge.is_enabled() and hasattr(self.db_bridge, "emit_invalid_inspection"):
+                self.db_bridge.emit_invalid_inspection(
+                    frame_raw=frame,
+                    frame_ann=None,
+                    invalid_code=str(inv_code or "INVALID"),
+                    invalid_reason=str(inv_reason or "Kondisi kamera tidak layak inspeksi"),
+                    slat_number=self.slat_inspector.slat_count,
+                )
+            return {
+                "status": "INVALID",
+                "invalid_code": inv_code,
+                "invalid_reason": inv_reason,
+                "frame_health": health_res,
+                "pose_status": pose_res,
+                "conveyor_direction": health_res.get("conveyor_direction", "UNKNOWN"),
+                "slat_res": slat_inv,
+                "rib_res": rib_inv,
+                "is_conveyor_moving": False,
+                "elapsed_ms": (time.time() - t0) * 1000.0,
+            }
+
+        # Virtual Image Rectification (Metode 4) + Kompensasi Micro-Drift Watchdog (digabung 1x warp)
         rect_m = self._get_scaled_rect_matrix(w_f, h_f)
-        if rect_m is not None:
-            if rect_m.shape == (3, 3):
+        pose_corr_m = self.pose_watchdog.get_scaled_corrective_matrix(w_f, h_f)
+        eff_warp_m = rect_m
+        if pose_corr_m is not None:
+            if rect_m is None:
+                eff_warp_m = pose_corr_m
+            else:
+                r3 = rect_m.astype(np.float64) if rect_m.shape == (3, 3) else np.vstack([rect_m.astype(np.float64), [0.0, 0.0, 1.0]])
+                p3 = pose_corr_m.astype(np.float64) if pose_corr_m.shape == (3, 3) else np.vstack([pose_corr_m.astype(np.float64), [0.0, 0.0, 1.0]])
+                eff_warp_m = (r3 @ p3).astype(np.float32)
+
+        if eff_warp_m is not None:
+            if eff_warp_m.shape == (3, 3):
                 frame_inspected = cv2.warpPerspective(
                     frame,
-                    rect_m,
+                    eff_warp_m,
                     (w_f, h_f),
                     flags=cv2.INTER_LINEAR,
                     borderMode=cv2.BORDER_REPLICATE
@@ -1632,7 +1837,7 @@ class CombinedTopInspector:
             else:
                 frame_inspected = cv2.warpAffine(
                     frame,
-                    rect_m,
+                    eff_warp_m,
                     (w_f, h_f),
                     flags=cv2.INTER_LINEAR,
                     borderMode=cv2.BORDER_REPLICATE
@@ -1672,6 +1877,18 @@ class CombinedTopInspector:
             b = pb.get("box") if isinstance(pb, dict) else pb
             if b is not None and b[3] >= gate_top and b[1] <= gate_bot and b not in all_boxes_to_mask:
                 all_boxes_to_mask.append(b)
+
+        is_foreign_ingot_occl = bool(health_res.get("is_foreign_occluded", False))
+        foreign_box = health_res.get("foreign_box")
+        if is_foreign_ingot_occl and foreign_box is not None:
+            if foreign_box[3] >= gate_top and foreign_box[1] <= gate_bot:
+                all_boxes_to_mask.append(foreign_box)
+            # Tahan vonis NG rib sesaat bila gumpalan ingot terang menutupi area kerja
+            if rib_res.get("is_ng", False):
+                rib_res["status"] = "WAIT"
+                rib_res["is_ng"] = False
+                rib_res["is_ok"] = False
+                rib_res["message"] = "WAIT (Oklusi Benda Asing / Ingot)"
 
         masked_y_intervals = []
         if len(all_boxes_to_mask) > 0:
@@ -1794,7 +2011,8 @@ class CombinedTopInspector:
             cov = slat_res.get("coverage", 0.0)
             void = slat_res.get("center_void", 0)
 
-            # Simpan sampel bersih selama celah berada di zona tengah optimal (58-86 px)
+            # Simpan sampel bersih selama celah berada di zona tengah optimal (58-86 px) dengan bobot kualitas
+            _slat_w = max(0.20, float(cov) * min(2.0, float(seam_energy) / 30.0))
             self.slat_history_samples.append({
                 "pv": pv,
                 "sagitta": sag,
@@ -1802,12 +2020,13 @@ class CombinedTopInspector:
                 "center_void": void,
                 "y_seam": y_seam,
                 "energy": seam_energy,
+                "weight": _slat_w,
                 "xs": xs,
                 "ys": ys,
                 "polygon_px": slat_res.get("polygon_px")
             })
 
-            # Evaluasi berbasis konsensus multi-frame (minimal 3 sampel stabil di zona prime)
+            # Evaluasi berbasis konsensus multi-frame berbobot kualitas (minimal 3 sampel stabil di zona prime)
             if len(self.slat_history_samples) < 3:
                 slat_res["status"] = "WAIT"
                 slat_res["display_status"] = "WAIT"
@@ -1818,10 +2037,11 @@ class CombinedTopInspector:
                 all_sags = [s["sagitta"] for s in self.slat_history_samples]
                 all_pvs = [s["pv"] for s in self.slat_history_samples]
                 all_voids = [s["center_void"] for s in self.slat_history_samples]
+                all_ws = [s.get("weight", 1.0) for s in self.slat_history_samples]
 
-                eval_sag = float(np.median(all_sags))
-                eval_pv = float(np.median(all_pvs))
-                eval_void = int(np.median(all_voids)) if all_voids else 0
+                eval_sag = self.rib_inspector._weighted_median(all_sags, all_ws)
+                eval_pv = self.rib_inspector._weighted_median(all_pvs, all_ws)
+                eval_void = int(round(self.rib_inspector._weighted_median(all_voids, all_ws))) if all_voids else 0
 
                 is_flat_ok = bool(eval_pv <= self.slat_inspector.max_flatness_pv)
                 is_curv_ok = bool(eval_sag <= self.slat_inspector.max_sagitta)
@@ -1939,7 +2159,43 @@ class CombinedTopInspector:
                 slat_res["is_ng"] = False
                 slat_res["eval_mode"] = "WAIT (Oklusi Bagian Bawah Rib / Sirip)"
 
-        slat_res["is_occluded"] = bool(is_slat_occluded or seam_masked_occluded or is_rib_base_occ)
+        if is_foreign_ingot_occl:
+            self.slat_history_samples.clear()
+            if self.latched_slat_data is not None and self.latched_slat_data.get("is_ng", False):
+                self.latched_slat_data = None
+                self.latched_hold_frames = 0
+            if slat_res.get("is_ng", False):
+                slat_res["status"] = "WAIT"
+                slat_res["display_status"] = "WAIT"
+                slat_res["is_ng"] = False
+                slat_res["is_ok"] = False
+                slat_res["eval_mode"] = "WAIT (Oklusi Benda Asing / Ingot)"
+
+        slat_res["is_occluded"] = bool(is_slat_occluded or seam_masked_occluded or is_rib_base_occ or is_foreign_ingot_occl)
+
+        # Loop-Aware Anomaly Memory (total_slats_in_loop = 16): lacak anomali berulang antar-putaran tanpa menunda NG
+        loop_n = max(1, int(getattr(self, "total_slats_in_loop", 16)))
+        curr_rib_c = int(getattr(self.rib_inspector, "rib_count", 0))
+        if curr_rib_c > 0 and curr_rib_c != self._last_tracked_rib_loop_id and rib_res.get("status") in ("OK", "NG"):
+            self._last_tracked_rib_loop_id = curr_rib_c
+            r_slot = ("RIB", curr_rib_c % loop_n)
+            if rib_res.get("is_ng", False) or rib_res.get("review_anomaly", False):
+                self._loop_anomaly_memory[r_slot] = int(self._loop_anomaly_memory.get(r_slot, 0)) + 1
+            else:
+                self._loop_anomaly_memory[r_slot] = max(0, int(self._loop_anomaly_memory.get(r_slot, 0)) - 1)
+        if curr_rib_c > 0:
+            rib_res["repeat_pass_anomaly"] = int(self._loop_anomaly_memory.get(("RIB", curr_rib_c % loop_n), 0)) >= 2
+
+        curr_slat_c = int(getattr(self.slat_inspector, "slat_count", 0))
+        if curr_slat_c > 0 and curr_slat_c != self._last_tracked_slat_loop_id and slat_res.get("status") in ("OK", "NG"):
+            self._last_tracked_slat_loop_id = curr_slat_c
+            s_slot = ("SLAT", curr_slat_c % loop_n)
+            if slat_res.get("is_ng", False):
+                self._loop_anomaly_memory[s_slot] = int(self._loop_anomaly_memory.get(s_slot, 0)) + 1
+            else:
+                self._loop_anomaly_memory[s_slot] = max(0, int(self._loop_anomaly_memory.get(s_slot, 0)) - 1)
+        if curr_slat_c > 0:
+            slat_res["repeat_pass_anomaly"] = int(self._loop_anomaly_memory.get(("SLAT", curr_slat_c % loop_n), 0)) >= 2
 
         # Sinkronkan lifecycle purge/flush kandidat NG secara independen di setiap frame
         if self.db_bridge is not None and self.db_bridge.is_enabled():
@@ -1962,6 +2218,11 @@ class CombinedTopInspector:
         elapsed_ms = (time.time() - t0) * 1000.0
         return {
             "status": overall_status,
+            "invalid_code": None,
+            "invalid_reason": "",
+            "frame_health": health_res,
+            "pose_status": pose_res,
+            "conveyor_direction": health_res.get("conveyor_direction", "UNKNOWN"),
             "slat_res": slat_res,
             "rib_res": rib_res,
             "is_conveyor_moving": is_conveyor_moving,
@@ -2210,6 +2471,14 @@ class CombinedTopInspector:
             rib_stat = rib_res.get("status", "WAIT")
             rib_ok = rib_res.get("is_ok", False)
 
+            # Indikator pasif tipis khusus Plat A yang sudah [LOCKED] (~0.02 ms, tanpa turun FPS)
+            for lb in (rib_res.get("locked_boxes") or [])[:1]:
+                if lb and len(lb) >= 4:
+                    lx1, ly1, lx2, ly2 = int(lb[0] * sx), int(lb[1] * sy), int(lb[2] * sx), int(lb[3] * sy)
+                    cv2.rectangle(main_resized, (lx1, ly1), (lx2, ly2), (160, 175, 190), 1, cv2.LINE_AA)
+                    cv2.putText(main_resized, "LOCKED", (lx1, max(18, ly1 - 5)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 175, 190), 1, cv2.LINE_AA)
+
             # Gambar Bounding Box Sirip jika terdeteksi
             box = rib_res.get("active_box")
             if is_rib_present and box:
@@ -2272,15 +2541,15 @@ class CombinedTopInspector:
 
         # Indikator Banner PAUSED jika video dijeda
         if is_paused:
-            bw, bh = 430, 52
+            bw, bh = 510, 52
             bx = 15
             by = 12
             cv2.rectangle(main_resized, (bx, by), (bx + bw, by + bh), (20, 110, 220), -1)
             cv2.rectangle(main_resized, (bx, by), (bx + bw, by + bh), (40, 180, 255), 2, cv2.LINE_AA)
             cv2.putText(main_resized, f"|| PAUSED | Frame {frame_idx}/{total_frames}", (bx + 14, by + 24),
                         cv2.FONT_HERSHEY_DUPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(main_resized, "[SPACE]: Play | [N]: +1 Frame | [P]: -1 Frame", (bx + 14, by + 44),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 240, 200), 1, cv2.LINE_AA)
+            cv2.putText(main_resized, "[SPACE]: Play | [N/P]: +-1f | [,/.]: +-10f | [;/']: +-60f", (bx + 14, by + 44),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 240, 200), 1, cv2.LINE_AA)
 
         # Indikator Banner Kalibrasi Konveyor Otomatis
         if getattr(self, "is_calibrating", False):
@@ -2303,6 +2572,13 @@ class CombinedTopInspector:
             cv2.putText(main_resized, self.profile_banner_text, (25, cal_y + 27),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 2, cv2.LINE_AA)
 
+        # Indikator Banner INVALID (PRD §25.6) jika lingkungan/kamera tidak layak inspeksi
+        if overall_status == "INVALID":
+            inv_txt = str(inspect_result.get("invalid_reason") or "INVALID: Kondisi Kamera / Lingkungan Tidak Layak Inspeksi")
+            cv2.rectangle(main_resized, (15, 14), (985, 64), (135, 0, 145), -1)
+            cv2.rectangle(main_resized, (15, 14), (985, 64), (255, 120, 255), 2, cv2.LINE_AA)
+            cv2.putText(main_resized, inv_txt[:88], (28, 46), cv2.FONT_HERSHEY_DUPLEX, 0.56, (255, 255, 255), 2, cv2.LINE_AA)
+
         # ======================================================================
         # 4. PANEL DASHBOARD BAWAH (1000 x 300 px) DENGAN KARTU METROLOGI GANDA
         # ======================================================================
@@ -2314,20 +2590,29 @@ class CombinedTopInspector:
             badge_bg = (0, 160, 0)
         elif overall_status == "NG":
             badge_bg = (0, 0, 200)
+        elif overall_status == "INVALID":
+            badge_bg = (145, 0, 155)
         elif overall_status == "HOLD":
             badge_bg = (30, 80, 160)
         else:
             badge_bg = (140, 90, 30)
 
         cv2.rectangle(hud, (15, 12), (180, 72), badge_bg, -1)
-        stat_x = 55 if len(overall_status) == 2 else (35 if len(overall_status) == 4 else 45)
-        cv2.putText(hud, overall_status, (stat_x, 56), cv2.FONT_HERSHEY_DUPLEX, 1.35, (255, 255, 255), 3, cv2.LINE_AA)
+        if overall_status == "INVALID":
+            cv2.putText(hud, "INVALID", (22, 53), cv2.FONT_HERSHEY_DUPLEX, 1.05, (255, 255, 255), 2, cv2.LINE_AA)
+        else:
+            stat_x = 55 if len(overall_status) == 2 else (35 if len(overall_status) == 4 else 45)
+            cv2.putText(hud, overall_status, (stat_x, 56), cv2.FONT_HERSHEY_DUPLEX, 1.35, (255, 255, 255), 3, cv2.LINE_AA)
 
         # Header Status Terpadu (DIBESARKAN) & Badge Profil
         prof_tag = "[DEFAULT STABIL]" if "DEFAULT" in getattr(self, "active_profile_name", "") else "[HASIL KALIBRASI]"
+        pose_st = inspect_result.get("pose_status", {}) or {}
+        if pose_st.get("has_correction"):
+            prof_tag += " [AUTO-POSE]"
         prof_col = (100, 255, 140) if "DEFAULT" in getattr(self, "active_profile_name", "") else (255, 200, 50)
-        cv2.putText(hud, f"CAM-01 TOP INSPECTION PIPELINE {prof_tag}",
-                    (195, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.62, prof_col, 2, cv2.LINE_AA)
+        cam_hdr = getattr(self, "top_camera_id", "CAM-01")
+        cv2.putText(hud, f"{cam_hdr} TOP INSPECTION PIPELINE {prof_tag}",
+                    (195, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.60, prof_col, 2, cv2.LINE_AA)
 
         # Badge Status Database Logging (ON / OFF)
         db_on = self.is_db_enabled()
@@ -2429,18 +2714,18 @@ class CombinedTopInspector:
         # ----------------------------------------------------------------------
         cv2.rectangle(hud, (15, 192), (985, 292), (22, 22, 28), -1)
         cv2.rectangle(hud, (15, 192), (985, 292), (45, 45, 55), 1)
-        cv2.putText(hud, "PANDUAN KONTROL & PINTASAN KEYBOARD (HOTKEYS):", (25, 214),
+        cv2.putText(hud, "PANDUAN KONTROL & PINTASAN KEYBOARD (HOTKEYS):", (25, 213),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (150, 180, 220), 2, cv2.LINE_AA)
-        cv2.putText(hud, "[SPACE]: Pause | [ / ]: -/+10s | [-/=]: -/+60s | [X]: Speed | [I]: Skip-Diam | [Z]: Loncat", (25, 238),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.39, (220, 220, 220), 1, cv2.LINE_AA)
-        cv2.putText(hud, "[K]: Align Rel | [L]: Wizard Rel | [G]: Acuan | [P]: Profil | [T]/[E]: Engine | [R]: Reset | [D]: DB | [Q]: Keluar", (25, 260),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(hud, "[SPACE]: Pause | [,/.]: -/+10f | [;/']: -/+60f | [[/]]: -/+10s | [-/=]: -/+60s | [Z]: Loncat", (25, 235),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.37, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(hud, "[X]: Speed | [I]: Skip-Diam | [T]: Sync | [E]: Engine | [K]: Align | [G]: Acuan | [P]: Profil | [R]: Reset | [D]: DB | [Q]: Keluar", (25, 257),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (220, 220, 220), 1, cv2.LINE_AA)
         pos_parts = [f"File: {inspect_result.get('filename', '-')}", f"Frame: {frame_idx}/{total_frames}"]
         if video_time_str:
             pos_parts.append(f"Waktu: {video_time_str}")
         if speed_label:
             pos_parts.append(speed_label)
-        cv2.putText(hud, " | ".join(pos_parts), (25, 282),
+        cv2.putText(hud, " | ".join(pos_parts), (25, 280),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 210, 140), 1, cv2.LINE_AA)
 
         # Selesai: kembalikan buffer terpadu yang sudah terisi penuh (thread-safe copy)
@@ -2457,10 +2742,16 @@ def main():
     parser.add_argument("--config", type=str, default=None, help="Path ke file config JSON")
     parser.add_argument("--enable-db", action="store_true", default=False,
                         help="Aktifkan pencatatan SQLite database dan penyimpanan captures secara langsung (Default: OFF / Dry-Run)")
+    parser.add_argument("--start-time", type=str, default=None,
+                        help="Mulai pemutaran video pada waktu tertentu (contoh: 05:30 atau 330)")
+    parser.add_argument("--speed", type=int, default=1, choices=list(SPEED_STEPS),
+                        help="Pengali kecepatan pemutaran file video awal (1, 2, 4, 8, atau 16)")
+    parser.add_argument("--skip-idle", action="store_true", default=False,
+                        help="Aktifkan Auto-Skip segmen conveyor diam sejak awal")
     args = parser.parse_args()
 
     print("\n" + "=" * 78)
-    print("🚀 MEMULAI PIPELINE TERPADU INSPEKSI TAMPAK ATAS KONVEYOR (CAM-03)")
+    print(f"🚀 MEMULAI PIPELINE TERPADU INSPEKSI TAMPAK ATAS KONVEYOR")
     print("=" * 78)
 
     # Inisialisasi Master Orchestrator
@@ -2484,7 +2775,7 @@ def main():
     if not current_source:
         env_top = os.environ.get("TOP_CAMERA_SOURCE")
         if env_top:
-            if env_top.isdigit() or env_top.startswith(("rtsp://", "http://", "https://", "nvarguscamerasrc")):
+            if env_top.isdigit() or env_top.startswith(("rtsp://", "http://", "https://", "nvarguscamerasrc", "v4l2src")):
                 current_source = env_top
             elif os.path.exists(env_top):
                 current_source = os.path.abspath(env_top)
@@ -2538,60 +2829,256 @@ def main():
     if _cap_probe is not None:
         _cap_probe.release()  # tutup probe segera; grabber akan membuka ulang
 
+    speed_mult = max(1, int(getattr(args, "speed", 1) or 1))
+    idle_skipper = IdleConveyorSkipper(enabled=bool(getattr(args, "skip_idle", False)))
+    pending_seek = {"frame": None, "from_trackbar": False}
+
     if is_image:
-        # Sumber gambar statis — tidak perlu grabber
         pass
     else:
-        # Sumber video — gunakan AsyncFrameGrabber (background decode thread)
         grabber = AsyncFrameGrabber(current_source, buffer_size=2)
         if not grabber.isOpened():
             print(f"[ERROR] Gagal membuka sumber media: {current_source}")
             grabber.release()
             return
         total_frames = grabber.total_frames
-        print(f"[✔] AsyncFrameGrabber aktif: frame decode non-blocking di background thread")
+        grabber.set_speed_multiplier(speed_mult)
+        if args.start_time and not grabber.is_live and total_frames > 0:
+            s_sec = parse_time_to_seconds(args.start_time)
+            if s_sec is not None:
+                init_f = max(0, min(total_frames - 1, int(round(s_sec * grabber.fps_native))))
+                pending_seek["frame"] = init_f
+                print(f"[*] [START-TIME] Melompat awal ke {format_seconds_mmss(s_sec)} (Frame {init_f}/{total_frames})")
+        print("[✔] AsyncFrameGrabber aktif: frame decode non-blocking di background thread")
 
-
-    win_name = "CAM-03 TOP INSPECTION PIPELINE (SLAT & RIB INTEGRATED)"
+    win_name = (
+        f"{pipeline.top_camera_id} TOP INSPECTION | [SPACE]: Pause | [,/.]: +-10f | [;/']: +-60f | "
+        f"[[/]]: +-10s | [-/=]: +-60s | [X]: Speed | [I]: Skip-Diam | [Z]: Loncat | [Q]: Keluar"
+    )
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win_name, 1200, 920)
 
+    trackbar_name = "Seek (s)"
+    trackbar_state = {"attached": False, "ignore": False, "last_set_sec": 0}
+
+    def _is_seekable_video():
+        return (not is_image) and (grabber is not None) and (not grabber.is_live) and (total_frames > 0)
+
+    def _on_seek_trackbar(sec_val):
+        if trackbar_state["ignore"] or int(sec_val) == int(trackbar_state["last_set_sec"]) or not _is_seekable_video():
+            return
+        tgt = max(0, min(total_frames - 1, int(round(float(sec_val) * grabber.fps_native))))
+        pending_seek["frame"] = tgt
+        pending_seek["from_trackbar"] = True
+
+    def _sync_trackbar_bounds():
+        if not _is_seekable_video():
+            return
+        max_sec = max(1, int(total_frames / max(1e-5, grabber.fps_native)))
+        if not trackbar_state["attached"]:
+            cv2.createTrackbar(trackbar_name, win_name, 0, max_sec, _on_seek_trackbar)
+            trackbar_state["attached"] = True
+        else:
+            try:
+                cv2.setTrackbarMax(trackbar_name, win_name, max_sec)
+            except Exception:
+                pass
+
+    def _update_trackbar_pos(frame_pos: int):
+        if trackbar_state["attached"] and _is_seekable_video():
+            cur_sec = int(max(0, round(float(frame_pos) / max(1e-5, grabber.fps_native))))
+            if cur_sec == trackbar_state["last_set_sec"]:
+                return
+            trackbar_state["last_set_sec"] = cur_sec
+            trackbar_state["ignore"] = True
+            try:
+                cv2.setTrackbarPos(trackbar_name, win_name, cur_sec)
+            except Exception:
+                pass
+            trackbar_state["ignore"] = False
+
+    _sync_trackbar_bounds()
+
     is_paused = False
     step_forward = False
-    step_backward = False
     cached_frame = None
     fps_val = 30.0
     sync_realtime = True
     current_vid_idx = sorted_videos.index(current_source) if current_source in sorted_videos else 0
     t_last_frame = time.time()
     last_video_pos = 0
+    cur_pos = 0
+
+    def _load_media_file(new_file: str):
+        nonlocal grabber, is_image, static_frame, total_frames, cached_frame
+        nonlocal current_source, fname, last_video_pos, cur_pos
+        if grabber is not None:
+            grabber.release()
+            grabber = None
+        new_cap, new_is_img, new_static, new_tot, new_fn = open_media_source(new_file)
+        cached_frame = None
+        if new_is_img:
+            is_image = True
+            static_frame = new_static
+            total_frames = 1
+            cached_frame = static_frame.copy()
+        elif new_cap is not None and new_cap.isOpened():
+            new_cap.release()
+            grabber = AsyncFrameGrabber(new_file, buffer_size=2)
+            grabber.set_speed_multiplier(speed_mult)
+            is_image = False
+            total_frames = grabber.total_frames
+            ret_f0, f0 = grabber.read(timeout=1.0)
+            if ret_f0 and f0 is not None:
+                cached_frame = f0.copy()
+        current_source = new_file
+        fname = new_fn
+        last_video_pos = 0
+        cur_pos = 0
+        pending_seek["frame"] = None
+        idle_skipper.reset_scan_state()
+        pipeline.reset_counters()
+        _sync_trackbar_bounds()
+        _update_trackbar_pos(0)
+
+    def _handle_key(key_code: int, calib_frame=None) -> str:
+        nonlocal is_paused, step_forward, sync_realtime, speed_mult, current_vid_idx
+        if key_code in (ord('q'), ord('Q'), 27):
+            print("\n[*] Menutup pipeline inspeksi...")
+            return "BREAK"
+        if key_code == 32:  # [SPACE]
+            is_paused = not is_paused
+            idle_skipper.reset_scan_state()
+            print(f"[*] Status: {'PAUSED' if is_paused else 'RUNNING'}")
+            return "HANDLED"
+        if key_code in (ord('d'), ord('D')):
+            st = pipeline.toggle_db()
+            print(f"[*] SAKLAR DATABASE LOGGING: {'AKTIF (RECORDING)' if st else 'MATI (DRY-RUN)'}")
+            return "HANDLED"
+        if key_code in (ord('t'), ord('T')):
+            sync_realtime = not sync_realtime
+            print(f"[*] Mode Kecepatan Video: {'1.0x Realtime Sync' if sync_realtime else 'TURBO (Uncapped FPS)'}")
+            return "HANDLED"
+        if key_code in (ord('e'), ord('E')):
+            new_eng = pipeline.rib_inspector.toggle_tracker_engine()
+            print(f"[*] 🔄 SAKELAR TRACKER ENGINE SIRIP: [{new_eng}]")
+            return "HANDLED"
+        if key_code in (ord('x'), ord('X'), ord('>')):
+            speed_mult = next_speed_step(speed_mult)
+            if grabber is not None:
+                grabber.set_speed_multiplier(speed_mult)
+            print(f"[*] [SPEED] Kecepatan pemutaran diubah ke: {speed_mult}x")
+            return "HANDLED"
+        if key_code in (ord('i'), ord('I')):
+            sk_on = idle_skipper.toggle()
+            print(f"[*] [AUTO-SKIP DIAM] Mode skip conveyor diam: {'AKTIF' if sk_on else 'NON-AKTIF'}")
+            return "HANDLED"
+        if key_code in (ord('n'), ord('N')):
+            if is_paused:
+                step_forward = True
+            return "HANDLED"
+        if key_code in (ord('p'), ord('P')):
+            if is_paused and _is_seekable_video():
+                pending_seek["frame"] = max(0, cur_pos - 1)
+            elif not is_paused:
+                pipeline.toggle_profile()
+            return "HANDLED"
+        if key_code in (ord('h'), ord('H')):
+            pipeline.toggle_threshold_source()
+            return "HANDLED"
+        if key_code in (ord('k'), ord('K'), ord('a'), ord('A')):
+            if is_paused and _is_seekable_video():
+                pending_seek["frame"] = max(0, cur_pos - 1)
+            elif calib_frame is not None:
+                pipeline.auto_align_rails_instant(calib_frame)
+            return "HANDLED"
+        if key_code in (ord('u'), ord('U'), ord('0')):
+            pipeline.restore_default_profile()
+            return "HANDLED"
+        if key_code in (ord('r'), ord('R')):
+            pipeline.reset_counters()
+            return "HANDLED"
+        if key_code in (ord('g'), ord('G')):
+            st = pipeline.toggle_alignment_guides()
+            print(f"[*] 📐 GARIS REFERENSI REL & SUMBU KONVEYOR: {'AKTIF (RETICLE ACUAN EMAS)' if st else 'NON-AKTIF'}")
+            return "HANDLED"
+        if key_code in (ord('l'), ord('L')):
+            print("\n[*] 🚀 Membuka Wizard Kalibrasi Interaktif Rel Ganda...")
+            calib_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibrate_dual_rails.py")
+            subprocess.Popen([sys.executable, calib_script, "--source", str(current_source)])
+            return "HANDLED"
+        if _is_seekable_video():
+            tgt_f, lbl = compute_seek_target_from_key(key_code, cur_pos, total_frames, grabber.fps_native)
+            if tgt_f is not None:
+                pending_seek["frame"] = tgt_f
+                t_sec = float(tgt_f) / max(1e-5, grabber.fps_native)
+                print(f"[*] [SEEK {lbl}] -> Frame {tgt_f}/{total_frames} ({format_seconds_mmss(t_sec)})")
+                return "HANDLED"
+            if key_code in (ord('z'), ord('Z')):
+                v_fps = max(1e-5, grabber.fps_native)
+                tot_s = float(total_frames) / v_fps
+                cur_s = float(cur_pos) / v_fps
+                entered = prompt_jump_time_dialog(format_seconds_mmss(cur_s), format_seconds_mmss(tot_s))
+                cv2.waitKey(1)
+                tgt_sec = parse_time_to_seconds(entered) if entered else None
+                if tgt_sec is not None:
+                    tgt_j = max(0, min(total_frames - 1, int(round(tgt_sec * v_fps))))
+                    pending_seek["frame"] = tgt_j
+                    print(f"[*] [JUMP-TIME] Melompat ke {format_seconds_mmss(tgt_sec)} (Frame {tgt_j}/{total_frames})")
+                return "HANDLED"
+        if key_code in (ord('w'), ord('W'), ord('o'), ord('O'), ord('f'), ord('F')):
+            print("\n[*] Membuka File Dialog Explorer...")
+            new_file = select_file_dialog(
+                initial_dir=os.path.dirname(str(current_source)) if os.path.exists(str(current_source)) else os.getcwd(),
+                title="Pilih File Video / Foto Baru untuk Inspeksi Terpadu"
+            )
+            cv2.waitKey(1)  # Refresh OpenCV window focus setelah Tkinter
+            if new_file and os.path.exists(new_file):
+                _load_media_file(new_file)
+                if new_file not in sorted_videos:
+                    sorted_videos.append(new_file)
+                current_vid_idx = sorted_videos.index(new_file)
+                print(f"[OK] Berhasil memuat media: {fname}")
+            return "HANDLED"
+        if key_code in (ord('v'), ord('V')) and sorted_videos:
+            current_vid_idx = (current_vid_idx + 1) % len(sorted_videos)
+            _load_media_file(sorted_videos[current_vid_idx])
+            print(f"\n[OK] Beralih ke media: {fname}")
+            return "HANDLED"
+        return "NONE"
 
     print(f"\n[OK] Memulai inspeksi pada media: {fname} (Total Frame: {total_frames})")
-    print("Tekan [SPACE] untuk Pause/Play | [T] Toggle Realtime/Turbo | [Q] untuk Keluar\n")
+    print(
+        "Kontrol: [SPACE]: Pause | [,/.]: -/+10 frame | [;/']: -/+60 frame | "
+        "[[/]]: -/+10s | [-/=]: -/+60s | [X]: Speed | [I]: Skip-Diam | [Z]: Loncat | [Q]: Keluar\n"
+    )
 
     while True:
         t_loop_start = time.time()
         frame = None
+        force_render_seek = False
 
         if is_image:
-            # Sumber gambar statis
             frame = static_frame.copy()
             cur_pos = 1
+        elif pending_seek["frame"] is not None and _is_seekable_video():
+            req_seek = pending_seek["frame"]
+            pending_seek["frame"] = None
+            pending_seek["from_trackbar"] = False
+            pipeline.reset_active_tracking()
+            idle_skipper.reset_scan_state()
+            ret, frame = grabber.read_after_seek(req_seek)
+            if ret and frame is not None:
+                cur_pos = grabber.get_pos_frames()
+                last_video_pos = cur_pos
+                cached_frame = frame.copy()
+                force_render_seek = True
         elif is_paused:
-            # Mode Pause: frame sudah ter-cache, hanya step forward/backward yang membaca baru
             if step_forward:
                 ret, frame = grabber.read()
                 if ret and frame is not None:
                     cached_frame = frame.copy()
                 step_forward = False
-            elif step_backward:
-                target_pos = max(0, grabber.get_pos_frames() - 2)
-                grabber.set_pos_frames(target_pos)
-                time.sleep(0.02)
-                ret, frame = grabber.read()
-                if ret and frame is not None:
-                    cached_frame = frame.copy()
-                step_backward = False
             else:
                 if cached_frame is None and grabber is not None:
                     ret, fr = grabber.read()
@@ -2600,39 +3087,73 @@ def main():
                 frame = cached_frame.copy() if cached_frame is not None else None
             cur_pos = grabber.get_pos_frames() if grabber else 1
         else:
-            # Mode Running: ambil frame pre-decoded dari buffer (non-blocking)
             ret, frame = grabber.read()
             if not ret or frame is None:
-                k = cv2.waitKey(5) & 0xFF
-                if k in [ord('q'), ord('Q'), 27]:
+                if _handle_key(cv2.waitKey(5) & 0xFF) == "BREAK":
                     break
-                elif k in [ord('d'), ord('D')]:
-                    pipeline.toggle_db()
                 continue
             cur_pos = grabber.get_pos_frames()
             if cur_pos < last_video_pos - 15:
-                # Video loop kembali ke frame awal: reset cache deduplikasi
                 pipeline.logged_slat_id = None
                 pipeline.logged_rib_id = None
+                pipeline.reset_active_tracking()
+                idle_skipper.reset_scan_state()
                 if pipeline.db_bridge is not None and hasattr(pipeline.db_bridge, "reset_entity_cache"):
                     pipeline.db_bridge.reset_entity_cache()
             last_video_pos = cur_pos
             cached_frame = frame.copy()
 
         if frame is None:
-            # Cegah UI hang / 'Not Responding' dengan tetap memproses window message loop OpenCV
-            k = cv2.waitKey(20) & 0xFF
-            if k in [ord('q'), ord('Q'), 27]:
-                print("\n[*] Menutup pipeline inspeksi...")
+            if _handle_key(cv2.waitKey(20) & 0xFF) == "BREAK":
                 break
-            elif k == 32:  # [SPACE]
-                is_paused = not is_paused
-                print(f"[*] Status: {'PAUSED' if is_paused else 'RUNNING'}")
-            elif k in [ord('d'), ord('D')]:
-                st = pipeline.toggle_db()
-                mode_str = "AKTIF (RECORDING)" if st else "MATI (DRY-RUN)"
-                print(f"[*] SAKLAR DATABASE LOGGING: {mode_str}")
             continue
+
+        # Smart Auto-Skip Conveyor Diam ([I] / --skip-idle)
+        if idle_skipper.enabled and _is_seekable_video() and not is_paused and not force_render_seek:
+            skip_action, skip_info = idle_skipper.evaluate(cur_pos, frame, grabber.fps_native, speed_mult)
+            if skip_action == "SKIP_FORWARD":
+                next_pos = cur_pos + skip_info["skip_frames"]
+                if total_frames > 0 and next_pos >= total_frames:
+                    pipeline.reset_counters()
+                    idle_skipper.reset_scan_state()
+                    pending_seek["frame"] = 0
+                else:
+                    grabber.set_pos_frames(next_pos)
+                    cur_pos = next_pos
+                    last_video_pos = cur_pos
+                    stub_res = dict(skip_info["stub_result"])
+                    stub_res["filename"] = fname
+                    v_fps = max(1e-5, grabber.fps_native)
+                    t_str = f"{format_seconds_mmss(cur_pos / v_fps)}/{format_seconds_mmss(total_frames / v_fps)}"
+                    s_lbl = format_speed_label(speed_mult, idle_skipper.enabled, idle_skipper.is_scanning_idle, sync_realtime)
+                    dash_skip = pipeline.render_combined_dashboard(
+                        frame,
+                        stub_res,
+                        fps=fps_val,
+                        is_paused=False,
+                        frame_idx=cur_pos,
+                        total_frames=total_frames,
+                        sync_realtime=sync_realtime,
+                        video_time_str=t_str,
+                        speed_label=s_lbl,
+                    )
+                    _update_trackbar_pos(cur_pos)
+                    cv2.imshow(win_name, dash_skip)
+                    if _handle_key(cv2.waitKey(1) & 0xFF, calib_frame=frame) == "BREAK":
+                        break
+                continue
+            elif skip_action == "REWIND_RESUME":
+                rewind_f = skip_info["rewind_frame"]
+                pending_seek["frame"] = rewind_f
+                print(
+                    f"\n[*] [AUTO-SKIP] Gerakan conveyor terdeteksi! Kembali ke 1x di "
+                    f"{format_seconds_mmss(rewind_f / max(1e-5, grabber.fps_native))} (Frame {rewind_f}).\n"
+                )
+                continue
+
+        # Reset state in-flight bila speed >= 4x agar voting rib tidak mencampur frame berjarak jauh
+        if speed_mult >= 4 and not is_image and not is_paused and not force_render_seek:
+            pipeline.reset_active_tracking()
 
         # Jalankan KEDUA inspeksi secara bebarengan
         inspect_res = pipeline.inspect(frame)
@@ -2645,6 +3166,13 @@ def main():
         if dt_frame > 0:
             fps_val = 0.9 * fps_val + 0.1 * (1.0 / dt_frame)
 
+        video_time_str = ""
+        speed_label = ""
+        if _is_seekable_video():
+            v_fps = max(1e-5, grabber.fps_native)
+            video_time_str = f"{format_seconds_mmss(cur_pos / v_fps)}/{format_seconds_mmss(total_frames / v_fps)}"
+            speed_label = format_speed_label(speed_mult, idle_skipper.enabled, idle_skipper.is_scanning_idle, sync_realtime)
+
         # Render antarmuka dashboard visual
         dashboard_screen = pipeline.render_combined_dashboard(
             frame,
@@ -2653,11 +3181,13 @@ def main():
             is_paused=is_paused,
             frame_idx=cur_pos,
             total_frames=total_frames,
-            sync_realtime=sync_realtime
+            sync_realtime=sync_realtime,
+            video_time_str=video_time_str,
+            speed_label=speed_label,
         )
 
         # Rekam ke database SQLite dan folder captures jika ada NG dan DB Logging aktif (Single-Capture per Objek)
-        if inspect_res.get("status") == "NG":
+        if inspect_res.get("status") == "NG" and not force_render_seek:
             pipeline.record_if_ng(
                 frame_raw=frame,
                 frame_ann=dashboard_screen,
@@ -2666,136 +3196,21 @@ def main():
                 rib_no=getattr(pipeline.rib_inspector, "rib_count", None)
             )
 
+        _update_trackbar_pos(cur_pos)
         cv2.imshow(win_name, dashboard_screen)
 
         # Tangani interaksi keyboard & pacing kecepatan playback video secara presisi
         t_work = time.time() - t_loop_start
         if is_paused:
             delay = 30
-        elif sync_realtime and grabber is not None and not grabber.is_live:
-            # Pacing agar kecepatan video tepat 1.0x (sesuai FPS asli rekaman video)
+        elif sync_realtime and speed_mult == 1 and grabber is not None and not grabber.is_live:
             target_dt = 1.0 / grabber.fps_native
-            remaining_ms = int(max(1, (target_dt - t_work) * 1000.0))
-            delay = remaining_ms
+            delay = int(max(1, (target_dt - t_work) * 1000.0))
         else:
             delay = 1
 
-        key = cv2.waitKey(delay) & 0xFF
-
-        if key in [ord('q'), ord('Q'), 27]:
-            print("\n[*] Menutup pipeline inspeksi...")
+        if _handle_key(cv2.waitKey(delay) & 0xFF, calib_frame=frame) == "BREAK":
             break
-        elif key == 32:  # [SPACE]
-            is_paused = not is_paused
-            print(f"[*] Status: {'PAUSED' if is_paused else 'RUNNING'}")
-        elif key in [ord('t'), ord('T')]:
-            sync_realtime = not sync_realtime
-            sync_mode = "1.0x Realtime Sync" if sync_realtime else "TURBO (Uncapped FPS)"
-            print(f"[*] Mode Kecepatan Video: {sync_mode}")
-        elif key in [ord('e'), ord('E')]:
-            new_eng = pipeline.rib_inspector.toggle_tracker_engine()
-            print(f"[*] 🔄 SAKELAR TRACKER ENGINE SIRIP (CAM-03): [{new_eng}]")
-        elif key in [ord('n'), ord('N')]:
-            if is_paused:
-                step_forward = True
-        elif key in [ord('d'), ord('D')]:
-            st = pipeline.toggle_db()
-            mode_str = "AKTIF (RECORDING)" if st else "MATI (DRY-RUN)"
-            print(f"[*] SAKLAR DATABASE LOGGING: {mode_str}")
-        elif key in [ord('p'), ord('P')]:
-            if is_paused:
-                step_backward = True
-            else:
-                pipeline.toggle_profile()
-        elif key in [ord('h'), ord('H')]:
-            pipeline.toggle_threshold_source()
-        elif key in [ord('k'), ord('K'), ord('a'), ord('A')]:
-            if is_paused:
-                step_backward = True
-            else:
-                pipeline.auto_align_rails_instant(frame)
-        elif key in [ord('u'), ord('U'), ord('0')]:
-            pipeline.restore_default_profile()
-        elif key in [ord('r'), ord('R')]:
-            pipeline.reset_counters()
-        elif key in [ord('g'), ord('G')]:
-            st = pipeline.toggle_alignment_guides()
-            mode_str = "AKTIF (RETICLE ACUAN EMAS)" if st else "NON-AKTIF"
-            print(f"[*] 📐 GARIS REFERENSI REL & SUMBU KONVEYOR: {mode_str}")
-        elif key in [ord('l'), ord('L')]:
-            print("\n[*] 🚀 Membuka Wizard Kalibrasi Interaktif Rel Ganda...")
-            calib_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibrate_dual_rails.py")
-            subprocess.Popen([sys.executable, calib_script, "--source", str(current_source)])
-        elif key in [ord('w'), ord('W'), ord('o'), ord('O'), ord('f'), ord('F')]:
-            # Buka dialog explorer
-            print("\n[*] Membuka File Dialog Explorer...")
-            new_file = select_file_dialog(
-                initial_dir=os.path.dirname(current_source),
-                title="Pilih File Video / Foto Baru untuk Inspeksi Terpadu"
-            )
-            cv2.waitKey(1)  # Refresh OpenCV window focus setelah Tkinter
-            if new_file and os.path.exists(new_file):
-                if grabber is not None:
-                    grabber.release()
-                    grabber = None
-                new_cap, new_is_img, new_static, new_tot, new_fn = open_media_source(new_file)
-                cached_frame = None
-                if new_is_img:
-                    is_image = True
-                    static_frame = new_static
-                    total_frames = 1
-                    cached_frame = static_frame.copy()
-                elif new_cap is not None and new_cap.isOpened():
-                    new_cap.release()
-                    grabber = AsyncFrameGrabber(new_file, buffer_size=2)
-                    is_image = False
-                    total_frames = grabber.total_frames
-                    # Segera ambil frame pertama agar cached_frame langsung siap
-                    t_w0 = time.time()
-                    while time.time() - t_w0 < 1.0:
-                        ret_f0, f0 = grabber.read()
-                        if ret_f0 and f0 is not None:
-                            cached_frame = f0.copy()
-                            break
-                        time.sleep(0.01)
-                current_source = new_file
-                fname = new_fn
-                pipeline.reset_counters()
-                if new_file not in sorted_videos:
-                    sorted_videos.append(new_file)
-                current_vid_idx = sorted_videos.index(new_file)
-                print(f"[OK] Berhasil memuat media: {fname}")
-        elif key in [ord('v'), ord('V')]:
-            if sorted_videos:
-                current_vid_idx = (current_vid_idx + 1) % len(sorted_videos)
-                new_file = sorted_videos[current_vid_idx]
-                if grabber is not None:
-                    grabber.release()
-                    grabber = None
-                new_cap, new_is_img, new_static, new_tot, new_fn = open_media_source(new_file)
-                cached_frame = None
-                if new_is_img:
-                    is_image = True
-                    static_frame = new_static
-                    total_frames = 1
-                    cached_frame = static_frame.copy()
-                elif new_cap is not None and new_cap.isOpened():
-                    new_cap.release()
-                    grabber = AsyncFrameGrabber(new_file, buffer_size=2)
-                    is_image = False
-                    total_frames = grabber.total_frames
-                    # Segera ambil frame pertama agar cached_frame langsung siap
-                    t_w0 = time.time()
-                    while time.time() - t_w0 < 1.0:
-                        ret_f0, f0 = grabber.read()
-                        if ret_f0 and f0 is not None:
-                            cached_frame = f0.copy()
-                            break
-                        time.sleep(0.01)
-                current_source = new_file
-                fname = new_fn
-                pipeline.reset_counters()
-                print(f"\n[OK] Beralih ke media: {fname}")
 
     pipeline.close()
     if grabber is not None:

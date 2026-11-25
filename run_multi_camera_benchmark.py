@@ -559,77 +559,17 @@ def select_dual_camera_setup_dialog(default_top, default_side, side_cam_id="CAM-
     return new_top, new_side
 
 
-def parse_time_to_seconds(time_str):
-    """Mengonversi string waktu ('MM:SS', 'HH:MM:SS', atau detik numerik) menjadi float detik."""
-    if time_str is None:
-        return None
-    raw = str(time_str).strip().lower().rstrip("s")
-    if not raw:
-        return None
-    try:
-        if ":" in raw:
-            parts = [float(p.strip()) for p in raw.split(":")]
-            if len(parts) == 2:
-                m, s = parts
-                return max(0.0, m * 60.0 + s)
-            if len(parts) == 3:
-                h, m, s = parts
-                return max(0.0, h * 3600.0 + m * 60.0 + s)
-            return None
-        return max(0.0, float(raw))
-    except Exception:
-        return None
-
-
-def format_seconds_mmss(sec):
-    """Memformat nilai detik menjadi string MM:SS atau HH:MM:SS yang ringkas."""
-    total_s = max(0, int(round(float(sec))))
-    h, rem = divmod(total_s, 3600)
-    m, s = divmod(rem, 60)
-    if h > 0:
-        return f"{h:d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
-
-
-def detect_conveyor_motion_score(prev_gray_roi, frame_bgr):
-    """
-    Menghitung skor energi gerak sabuk konveyor secara ringan (<0.2 ms) pada ROI tengah frame.
-    Mengembalikan (motion_score, gray_roi_sekarang).
-    """
-    if frame_bgr is None or getattr(frame_bgr, "size", 0) == 0:
-        return 0.0, prev_gray_roi
-    import cv2
-    import numpy as np
-    small = cv2.resize(frame_bgr, (240, 135), interpolation=cv2.INTER_AREA)
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    # Fokus pada koridor sabuk & rel dalam agar bayangan luar tidak memicu false motion
-    roi = gray[30:108, 42:198]
-    if prev_gray_roi is None or prev_gray_roi.shape != roi.shape:
-        return 0.0, roi
-    diff = cv2.absdiff(roi, prev_gray_roi)
-    return float(np.mean(diff)), roi
-
-
-def prompt_jump_time_dialog(default_time_str="00:00", total_time_str=""):
-    """Menampilkan dialog input waktu (MM:SS) di subprocess terisolasi agar aman dari konflik OpenCV/CUDA."""
-    prompt_lbl = "Masukkan target waktu video (contoh: 14:30 atau 870):"
-    if total_time_str:
-        prompt_lbl = f"Masukkan target waktu video (Durasi {total_time_str}, contoh 14:30):"
-    script = (
-        "import tkinter as tk; from tkinter import simpledialog; "
-        "r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True); "
-        f"val = simpledialog.askstring('Loncat ke Waktu Video', {prompt_lbl!r}, initialvalue={default_time_str!r}, parent=r); "
-        "r.destroy(); print('JUMP_VAL:' + (val or ''))"
-    )
-    try:
-        proc = subprocess.run([sys.executable, "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
-        for line in proc.stdout.splitlines():
-            if line.startswith("JUMP_VAL:"):
-                val = line.split(":", 1)[1].strip()
-                return val or None
-    except Exception:
-        pass
-    return None
+from video_nav_utils import (
+    SEEK_KEY_SPEC,
+    IdleConveyorSkipper,
+    compute_seek_target_from_key,
+    detect_conveyor_motion_score,
+    format_seconds_mmss,
+    format_speed_label,
+    next_speed_step,
+    parse_time_to_seconds,
+    prompt_jump_time_dialog,
+)
 
 
 def _handle_isolated_gui_dialog():
@@ -1782,10 +1722,7 @@ def _run_threaded_engine(args):
         fps_hist = []
         dataset_last_rib_no = 0
         dataset_previous = None
-        prev_motion_roi = None
-        idle_streak_sec = 0.0
-        motion_streak = 0
-        last_motion_sample_frame = -1
+        idle_skipper = IdleConveyorSkipper(enabled=bool(getattr(args, "skip_idle", False)))
 
         while not stop_event.is_set():
             try:
@@ -1802,15 +1739,13 @@ def _run_threaded_engine(args):
                     if do_step:
                         nav_state["step_once"] = False
                     speed_mult = nav_state["speed"]
-                    skip_idle_on = nav_state["skip_idle"]
+                    idle_skipper.enabled = bool(nav_state["skip_idle"])
 
                 force_render_seek = False
                 if req_seek is not None and not is_cam_top:
                     cap_top.set(cv2.CAP_PROP_POS_FRAMES, req_seek)
                     top_inspector.reset_active_tracking()
-                    prev_motion_roi = None
-                    idle_streak_sec = 0.0
-                    motion_streak = 0
+                    idle_skipper.reset_scan_state()
                     with nav_lock:
                         nav_state["is_scanning_idle"] = False
                     force_render_seek = True
@@ -1837,8 +1772,7 @@ def _run_threaded_engine(args):
                         dataset_previous = None
                         top_inspector.reset_counters()
                         cap_top.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        prev_motion_roi = None
-                        idle_streak_sec = 0.0
+                        idle_skipper.reset_scan_state()
                         ret, frame = cap_top.read()
                         if not ret or frame is None:
                             time.sleep(0.02)
@@ -1850,58 +1784,38 @@ def _run_threaded_engine(args):
                 cur_pos_f = int(cap_top.get(cv2.CAP_PROP_POS_FRAMES)) if not is_cam_top else top_state["frames"] + 1
 
                 # Smart Auto-Skip Conveyor Diam ([I] / --skip-idle)
-                if skip_idle_on and not is_cam_top and not is_paused and not force_render_seek:
-                    if last_motion_sample_frame < 0 or abs(cur_pos_f - last_motion_sample_frame) >= 2:
-                        m_score, prev_motion_roi = detect_conveyor_motion_score(prev_motion_roi, frame)
-                        last_motion_sample_frame = cur_pos_f
+                if idle_skipper.enabled and not is_cam_top and not is_paused and not force_render_seek:
+                    skip_action, skip_info = idle_skipper.evaluate(cur_pos_f, frame, top_video_fps, speed_mult)
+                    if skip_action == "SKIP_FORWARD":
                         with nav_lock:
-                            nav_state["motion_energy"] = m_score
-                            was_scanning = nav_state["is_scanning_idle"]
-                        step_dt = float(speed_mult) / max(1e-5, top_video_fps)
-                        if m_score < 2.2:
-                            idle_streak_sec += (0.35 if was_scanning else step_dt)
-                            motion_streak = 0
-                        else:
-                            idle_streak_sec = 0.0
-                            motion_streak += 1
-
-                        if (idle_streak_sec >= 1.2 or was_scanning) and motion_streak < 2:
-                            with nav_lock:
-                                nav_state["is_scanning_idle"] = True
-                            # Lompat cepat 0.35 detik video pakai grab() ringan dan kirim preview GUI tanpa YOLO berat
-                            skip_grabs = max(6, int(round(0.35 * top_video_fps)))
-                            for _ in range(skip_grabs):
-                                if not cap_top.grab():
-                                    break
-                            cur_pos_f = int(cap_top.get(cv2.CAP_PROP_POS_FRAMES))
-                            stub_res = {
-                                "status": "WAIT",
-                                "slat_res": {"display_status": "WAIT", "eval_mode": f"SKIP DIAM (E={m_score:.1f})"},
-                                "rib_res": {"status": "WAIT", "is_rib_present": False, "message": "Mencari segmen conveyor bergerak..."},
-                                "elapsed_ms": 0.0,
-                                "is_conveyor_moving": False,
-                            }
-                            with top_lock:
-                                top_state["pos_frame"] = cur_pos_f
-                                top_state["raw_frame"] = frame
-                                top_state["inspect_res"] = stub_res
-                                top_state["status"] = "SKIP"
-                                top_state["has_new"] = True
-                            with nav_lock:
-                                nav_state["cur_pos_frame"] = cur_pos_f
-                            continue
-                        elif was_scanning and motion_streak >= 2:
-                            # Conveyor mulai bergerak lagi -> mundur 1.5 detik agar start-up rib ikut terinspeksi penuh
-                            rewind_f = max(0, cur_pos_f - int(round(1.5 * top_video_fps)))
-                            cap_top.set(cv2.CAP_PROP_POS_FRAMES, rewind_f)
-                            top_inspector.reset_active_tracking()
-                            idle_streak_sec = 0.0
-                            motion_streak = 0
-                            with nav_lock:
-                                nav_state["is_scanning_idle"] = False
-                                nav_state["cur_pos_frame"] = rewind_f
-                            print(f"\n[*] [AUTO-SKIP] Gerakan conveyor terdeteksi! Kembali ke 1x di {format_seconds_mmss(rewind_f / top_video_fps)} (Frame {rewind_f}).\n")
-                            continue
+                            nav_state["motion_energy"] = skip_info["motion_energy"]
+                            nav_state["is_scanning_idle"] = True
+                        for _ in range(skip_info["skip_frames"]):
+                            if not cap_top.grab():
+                                break
+                        cur_pos_f = int(cap_top.get(cv2.CAP_PROP_POS_FRAMES))
+                        with top_lock:
+                            top_state["pos_frame"] = cur_pos_f
+                            top_state["raw_frame"] = frame
+                            top_state["inspect_res"] = skip_info["stub_result"]
+                            top_state["status"] = "SKIP"
+                            top_state["has_new"] = True
+                        with nav_lock:
+                            nav_state["cur_pos_frame"] = cur_pos_f
+                        continue
+                    elif skip_action == "REWIND_RESUME":
+                        rewind_f = skip_info["rewind_frame"]
+                        cap_top.set(cv2.CAP_PROP_POS_FRAMES, rewind_f)
+                        top_inspector.reset_active_tracking()
+                        with nav_lock:
+                            nav_state["motion_energy"] = skip_info["motion_energy"]
+                            nav_state["is_scanning_idle"] = False
+                            nav_state["cur_pos_frame"] = rewind_f
+                        print(f"\n[*] [AUTO-SKIP] Gerakan conveyor terdeteksi! Kembali ke 1x di {format_seconds_mmss(rewind_f / top_video_fps)} (Frame {rewind_f}).\n")
+                        continue
+                    elif "motion_energy" in skip_info:
+                        with nav_lock:
+                            nav_state["motion_energy"] = skip_info["motion_energy"]
 
                 t_infer_start = time.time()
                 if top_stream is not None:
@@ -2076,7 +1990,7 @@ def _run_threaded_engine(args):
         threads.append(th_side)
 
     # Windows GUI Setup
-    win_top = "CAM-01 TOP (SLAT & RIB) | [SPACE]: Pause | [[/]]: -/+10s | [-/=]: -/+60s | [X]: Speed | [I]: Skip-Diam | [Z]: Loncat | [Q]: Keluar"
+    win_top = "CAM-01 TOP (SLAT & RIB) | [SPACE]: Pause | [,/.]: +-10f | [;/']: +-60f | [[/]]: +-10s | [-/=]: +-60s | [X]: Speed | [I]: Skip-Diam | [Z]: Loncat | [Q]: Keluar"
     win_side = f"{args.side_cam_id} SIDE [{args.side_cam_id} {args.side_name}] | [2]/[O]: Video | [W]: Setup | [M]: Preset | [D]: DB | [Q]: Keluar"
     trackbar_name = "Seek (s)"
     trackbar_state = {"attached": False, "ignore": False}
@@ -2192,11 +2106,6 @@ def _run_threaded_engine(args):
                                     f"{format_seconds_mmss(f_pos_top / top_video_fps)}/"
                                     f"{format_seconds_mmss(total_f_top / top_video_fps)}"
                                 )
-                            spd_parts = [f"Speed: {nav_speed}x"]
-                            if nav_scanning:
-                                spd_parts.append("SKIP-DIAM [SCANNING]")
-                            elif nav_skip_idle:
-                                spd_parts.append("Skip-Diam: ON")
                             hud_top = top_inspector.render_combined_dashboard(
                                 frame=raw_top,
                                 inspect_result=res_top,
@@ -2205,7 +2114,7 @@ def _run_threaded_engine(args):
                                 frame_idx=f_pos_top if (not is_cam_top and total_f_top > 0) else top_state.get("frames", 0),
                                 total_frames=total_f_top,
                                 video_time_str=time_str,
-                                speed_label=" | ".join(spd_parts),
+                                speed_label=format_speed_label(nav_speed, nav_skip_idle, nav_scanning),
                             )
                             cv2.imshow(win_top, hud_top)
                             if getattr(top_inspector, "show_rib_unwarp_window", False):
@@ -2309,26 +2218,17 @@ def _run_threaded_engine(args):
                 with nav_lock:
                     nav_state["paused"] = True
                     nav_state["step_once"] = True
-            elif key in [ord("]"), ord("["), ord("="), ord("}"), ord("+"), ord("-"), ord("{"), ord("_")]:
+            elif key in SEEK_KEY_SPEC:
                 if not is_cam_top and total_f_top > 0:
-                    if key == ord("]"):
-                        delta_s = 10.0
-                    elif key == ord("["):
-                        delta_s = -10.0
-                    elif key in [ord("="), ord("}"), ord("+")]:
-                        delta_s = 60.0
-                    else:
-                        delta_s = -60.0
                     with nav_lock:
                         cur_f = nav_state["cur_pos_frame"]
-                    tgt_f = int(round(cur_f + delta_s * top_video_fps))
-                    _request_seek_frames(tgt_f, sync_side=True)
-                    print(f"\n[*] [SEEK {delta_s:+.0f}s] -> {format_seconds_mmss(max(0, min(total_f_top - 1, tgt_f)) / top_video_fps)}\n")
+                    tgt_f, lbl = compute_seek_target_from_key(key, cur_f, total_f_top, top_video_fps)
+                    if tgt_f is not None:
+                        _request_seek_frames(tgt_f, sync_side=True)
+                        print(f"\n[*] [SEEK {lbl}] -> Frame {tgt_f}/{total_f_top} ({format_seconds_mmss(tgt_f / top_video_fps)})\n")
             elif key in [ord("x"), ord("X"), ord(">")]:
-                speed_steps = [1, 2, 4, 8, 16]
                 with nav_lock:
-                    cur_sp = nav_state["speed"]
-                    next_sp = speed_steps[(speed_steps.index(cur_sp) + 1) % len(speed_steps)] if cur_sp in speed_steps else 1
+                    next_sp = next_speed_step(nav_state["speed"])
                     nav_state["speed"] = next_sp
                 print(f"\n[*] [SPEED] Kecepatan pemutaran diubah ke: {next_sp}x\n")
             elif key in [ord("i"), ord("I")]:
@@ -2611,6 +2511,8 @@ Shortcut Keyboard Saat Berjalan:
   [P]               : Beralih Profil Parameter (DEFAULT STABIL <-> HASIL KALIBRASI)
   [U] / [0]         : Pulihkan seketika ke Profil Default Stabil (Golden Baseline)
   [SPACE] / [N]     : Pause / Resume video, atau langkah +1 frame ([N])
+  [,] / [.]         : Loncat cepat -10 frame / +10 frame
+  [;] / [']         : Loncat cepat -60 frame / +60 frame
   [[] / []]         : Loncat waktu video -10 detik / +10 detik (juga Slider 'Seek (s)')
   [-] / [=]         : Loncat waktu video -60 detik / +60 detik
   [Z]               : Buka dialog Loncat ke Menit:Detik tertentu (MM:SS)

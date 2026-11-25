@@ -66,6 +66,10 @@ class InspectionDBBridge:
         env_enable_db = os.environ.get("ENABLE_DB_LOGGING", "").lower() in ("true", "1", "yes")
         self.enabled = bool(enabled or env_enable_db)
         self.cooldown_sec = float(cooldown_sec)
+        self.invalid_cooldown_sec = float(os.environ.get("INVALID_ALERT_COOLDOWN_SEC", "300.0"))
+        env_top_cam = os.environ.get("TOP_CAMERA_ID", "").strip().upper()
+        if camera_id == "CAM-01" and env_top_cam in ("CAM-01", "CAM-02", "CAM-03"):
+            camera_id = env_top_cam
         self.camera_id = camera_id
 
         # 4. Anti-spam tracker (Timestamp deteksi terakhir per komponen & Entity Cache)
@@ -74,7 +78,9 @@ class InspectionDBBridge:
             "RIB": 0.0,
             "BOLT": 0.0,
             "PIN": 0.0,
+            "INVALID": 0.0,
         }
+        self._last_invalid_by_code = {}
         self.logged_entity_keys = deque(maxlen=60)
 
         # 5. Non-blocking queue & background worker thread
@@ -211,7 +217,8 @@ class InspectionDBBridge:
     def reset_entity_cache(self):
         """Mereset riwayat deduplikasi entitas (misal saat video di-loop atau counter di-reset)."""
         self.logged_entity_keys.clear()
-        self._last_log_time = {"PLAT": 0.0, "RIB": 0.0, "BOLT": 0.0, "PIN": 0.0}
+        self._last_log_time = {"PLAT": 0.0, "RIB": 0.0, "BOLT": 0.0, "PIN": 0.0, "INVALID": 0.0}
+        self._last_invalid_by_code = {}
 
     def toggle(self):
         """Membalik status saklar pencatatan (ON <-> OFF)."""
@@ -390,6 +397,115 @@ class InspectionDBBridge:
             return True
         except queue.Full:
             print("[DB WARN] Antrean database penuh! Frame NG dilewati.")
+            return False
+
+    def emit_invalid_inspection(
+        self,
+        frame_raw,
+        frame_ann,
+        invalid_code: str,
+        invalid_reason: str,
+        slat_number=None,
+        force=False,
+    ) -> bool:
+        """
+        Mencatat kondisi INVALID (PRD §25.6: kamera/lingkungan tidak layak inspeksi)
+        secara non-blocking dengan anti-spam cooldown panjang (default 300 detik per kode).
+        """
+        if not self.enabled and not force:
+            return False
+
+        code_key = str(invalid_code or "ENVIRONMENT_INVALID").upper().strip()
+        now = time.time()
+        last_t = float(self._last_invalid_by_code.get(code_key, 0.0))
+        if not force and (now - last_t) < self.invalid_cooldown_sec:
+            return False
+        self._last_invalid_by_code[code_key] = now
+        self._last_log_time["INVALID"] = now
+
+        raw_copy = frame_raw.copy() if frame_raw is not None else None
+        ann_copy = frame_ann.copy() if frame_ann is not None else None
+
+        def _do_save_invalid():
+            dt = datetime.now()
+            raw_dir, ann_dir = self._get_today_capture_dirs()
+            ts_str = dt.strftime("%Y%m%d_%H%M%S_%f")[:19]
+            dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            today_date_str = dt.strftime("%Y%m%d")
+            raw_top_cam = str(self.camera_id).upper().strip()
+            top_cam_id = raw_top_cam if raw_top_cam in ("CAM-01", "CAM-02", "CAM-03") else "CAM-01"
+
+            raw_path = None
+            ann_path = None
+            if raw_copy is not None:
+                raw_path = os.path.join(raw_dir, f"{top_cam_id}_INVALID_{code_key}_{ts_str}_RAW.jpg")
+                cv2.imwrite(raw_path, raw_copy, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if ann_copy is not None:
+                ann_path = os.path.join(ann_dir, f"{top_cam_id}_INVALID_{code_key}_{ts_str}_ANN.jpg")
+                cv2.imwrite(ann_path, ann_copy, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            else:
+                ann_path = raw_path
+
+            conn = self._get_connection()
+            trace_code = None
+            try:
+                with conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT COUNT(1) FROM Inspections WHERE date(InspectionTime) = date('now', 'localtime')")
+                    daily_count = cursor.fetchone()[0] + 1
+                    trace_code = f"INV-{today_date_str}-{daily_count:05d}"
+                    while True:
+                        cursor.execute("SELECT 1 FROM Inspections WHERE TraceabilityCode = ?", (trace_code,))
+                        if cursor.fetchone():
+                            daily_count += 1
+                            trace_code = f"INV-{today_date_str}-{daily_count:05d}"
+                        else:
+                            break
+                    note_txt = f"[{code_key}] {invalid_reason}"[:240]
+                    cursor.execute(
+                        """
+                        INSERT INTO Inspections
+                        (TraceabilityCode, SlatNumber, InspectionTime, OverallResult, OverallSeverity, StatusLifecycle, MaintenanceNote, CreatedAt)
+                        VALUES (?, ?, ?, 'INVALID', 'MEDIUM', 'UNACKNOWLEDGED', ?, ?)
+                        """,
+                        (trace_code, slat_number, dt_str, note_txt, dt_str),
+                    )
+                    insp_id = cursor.lastrowid
+                    cursor.execute(
+                        """
+                        INSERT INTO Inspection_Detections
+                        (InspectionID, CameraID, TargetArea, ComponentType, Side, Result, StatusDetail, Confidence, PVFlatness, MaxDeviation, RawImagePath, AnnotatedPath, CreatedAt)
+                        VALUES (?, ?, 'PLAT_RIB', 'PLAT', 'NONE', 'INVALID', 'NORMAL', 0.0, 0.0, 0.0, ?, ?, ?)
+                        """,
+                        (insp_id, top_cam_id, raw_path, ann_path, dt_str),
+                    )
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+            if hasattr(self, "teams_notifier") and self.teams_notifier and self.teams_notifier.is_enabled():
+                try:
+                    self.teams_notifier.send_raw_payload(
+                        {
+                            "event_type": "INSPECTION_INVALID",
+                            "camera_id": top_cam_id,
+                            "inspection_id": trace_code,
+                            "overall_result": "INVALID",
+                            "invalid_code": code_key,
+                            "message": invalid_reason,
+                            "timestamp": dt_str,
+                        },
+                        dedup_key=f"INVALID_{code_key}_{today_date_str}_{dt.hour}",
+                    )
+                except Exception:
+                    pass
+
+        try:
+            self._queue.put_nowait(("dataset", _do_save_invalid))
+            return True
+        except queue.Full:
             return False
 
     def emit_side_inspection(

@@ -513,6 +513,12 @@ class HybridRibInspector:
         self._last_tracked_bw = None
         self._session_max_bw = 0.0
         self._active_mask_profile = None
+        self._retired_exit_corridors = []
+        self._rib_slots = []
+        self._next_rib_slot_id = 1
+        self._focused_slot_id = None
+        self._is_coasting_active = False
+        self._locked_ui_boxes = []
 
         # Parameter Temporal Voting & Multi-Frame Consensus Anti-Glitch
         self.min_transit_frames = 15
@@ -597,6 +603,8 @@ class HybridRibInspector:
         self.unwarp_Minv = None
         self.last_unwarped_frame = None
         self._last_unwarp_contour = None
+        self._last_unwarp_baseline = None
+        self._prev_unwarp_anchor_y = None
 
         self.tracker_engine = "LEGACY"
         self.pose_model = None
@@ -630,15 +638,48 @@ class HybridRibInspector:
         self._last_active_cy = None
         self._last_active_box = None
         self._conveyor_vy_ema = -2.5  # Kecepatan translasi vertikal konveyor (px/frame)
+        self._conveyor_direction = "UNKNOWN"
         self._kinematic_coasting_frames = 0
         self._max_kinematic_coasting = 4  # Toleransi bridge drop AI maksimal 4 frame (cegah ghost holding real-time)
+        self.prime_weight_samples = []
+        self._session_max_span_px = 0.0
+        self._last_frame_w = 1280
+
+    def sync_external_conveyor_velocity(self, vy_px: float, direction: str = "UNKNOWN") -> None:
+        """Sinkronkan kecepatan & arah konveyor dari GPU cuFFT Phase-Correlation (bebas asumsi statis -2.5)."""
+        if direction and direction != "UNKNOWN":
+            self._conveyor_direction = str(direction)
+        if abs(float(vy_px)) < 0.15:
+            return
+        if self.active_rib_frames == 0 or self._last_active_cy is None:
+            self._conveyor_vy_ema = float(vy_px)
+        else:
+            self._conveyor_vy_ema = 0.85 * float(self._conveyor_vy_ema) + 0.15 * float(vy_px)
+
+    @staticmethod
+    def _weighted_median(values, weights) -> float:
+        """Hitung median berbobot kualitas sampel agar frame bergetar/tepi tidak menggeser konsensus."""
+        arr = np.asarray(values, dtype=np.float64)
+        if len(arr) == 0:
+            return 0.0
+        if weights is None or len(weights) != len(arr):
+            return float(np.median(arr))
+        w = np.maximum(1e-4, np.asarray(weights, dtype=np.float64))
+        order = np.argsort(arr)
+        arr_s = arr[order]
+        w_s = w[order]
+        cum_w = np.cumsum(w_s)
+        cutoff = 0.5 * float(cum_w[-1])
+        idx = int(np.searchsorted(cum_w, cutoff))
+        return float(arr_s[min(len(arr_s) - 1, max(0, idx))])
 
     # ------------------------------------------------------------------
     # FASE 2: Adaptive Threshold dari Dataset Rib_Dataset (SQLite)
     # ------------------------------------------------------------------
     def load_adaptive_thresholds(self, db_path: str, sigma_factor: float = 2.5,
                                   min_ok_rows: int = 30,
-                                  camera_profile: str = None) -> bool:
+                                  camera_profile: str = None,
+                                  fallback_profile: str = None) -> bool:
         """
         Memuat threshold adaptif dari tabel Rib_Dataset di database SQLite,
         difilter per profil kamera agar dataset posisi berbeda tidak tercampur.
@@ -648,11 +689,13 @@ class HybridRibInspector:
 
         Parameter
         ----------
-        db_path        : Path absolut ke file database SQLite.
-        sigma_factor   : Pengali standar deviasi. Default 2.5 → menangkap ~99 % distribusi normal.
-        min_ok_rows    : Jumlah baris OK minimum agar adaptive threshold dianggap valid.
-        camera_profile : Nama profil kamera (dari profile_name di config JSON). Jika None,
-                         mengambil semua baris tanpa filter profil (backward-compatible).
+        db_path          : Path absolut ke file database SQLite.
+        sigma_factor     : Pengali standar deviasi. Default 2.5 → menangkap ~99 % distribusi normal.
+        min_ok_rows      : Jumlah baris OK minimum agar adaptive threshold dianggap valid.
+        camera_profile   : Nama profil kamera (dari profile_name di config JSON). Jika None,
+                           mengambil semua baris tanpa filter profil (backward-compatible).
+        fallback_profile : Profil cadangan terverifikasi (mis. 'DEFAULT_STABIL') bila profil kalibrasi
+                           masih < min_ok_rows baris di Rib_Dataset_Review.
 
         Return
         ------
@@ -679,17 +722,16 @@ class HybridRibInspector:
             rows = []
             used_review_table = False
 
-            if has_review_table:
-                if camera_profile:
+            def _fetch_reviewed_rows(prof_filter):
+                if prof_filter:
                     cur.execute(
                         "SELECT d.PVFlatness, d.Sagitta, d.InnerDev, d.TipDev, d.ProfileJson, d.RecordedAt "
                         "FROM Rib_Dataset d "
                         "JOIN Rib_Dataset_Review r ON r.DatasetID = d.DatasetID "
                         "WHERE r.ManualLabel='OK' AND d.PVFlatness > 0 AND d.ActiveFrames >= 15 "
                         "AND d.CameraProfile = ?",
-                        (camera_profile,),
+                        (prof_filter,),
                     )
-                    profile_desc = f"profil='{camera_profile}'"
                 else:
                     cur.execute(
                         "SELECT d.PVFlatness, d.Sagitta, d.InnerDev, d.TipDev, d.ProfileJson, d.RecordedAt "
@@ -697,8 +739,16 @@ class HybridRibInspector:
                         "JOIN Rib_Dataset_Review r ON r.DatasetID = d.DatasetID "
                         "WHERE r.ManualLabel='OK' AND d.PVFlatness > 0 AND d.ActiveFrames >= 15"
                     )
-                    profile_desc = "semua profil"
-                rev_rows = cur.fetchall()
+                return cur.fetchall()
+
+            profile_desc = f"profil='{camera_profile}'" if camera_profile else "semua profil"
+            if has_review_table:
+                rev_rows = _fetch_reviewed_rows(camera_profile)
+                if len(rev_rows) < min_ok_rows and fallback_profile and fallback_profile != camera_profile:
+                    fb_rows = _fetch_reviewed_rows(fallback_profile)
+                    if len(fb_rows) >= min_ok_rows:
+                        rev_rows = fb_rows
+                        profile_desc = f"profil='{camera_profile}'->waris '{fallback_profile}'"
                 if len(rev_rows) >= min_ok_rows:
                     used_review_table = True
                     for r_pv, r_sag, r_dev, r_tip, r_pjson, r_rec in rev_rows:
@@ -1003,7 +1053,9 @@ class HybridRibInspector:
         if self.current_rib_status in ("OK", "NG") and not self._session_committed:
             self._session_committed = True
             self._last_commit_frame_idx = getattr(self, "_frame_count", 0)
-            self._last_commit_y = getattr(self, "_last_active_cy", None)
+            active_cy = getattr(self, "_last_active_cy", None)
+            if active_cy is not None:
+                self._last_commit_y = float(active_cy)
             if self.current_rib_status == "NG":
                 self.ng_count += 1
             else:
@@ -1092,8 +1144,29 @@ class HybridRibInspector:
         eval_sag = float(np.median(self.prime_sagitta_samples))
         eval_idev = float(np.median(self.prime_inner_dev_samples))
         eval_tdev = float(np.median(self.prime_tip_dev_samples))
-        ng_prob = float(np.median(self.prime_ng_prob_samples)) if len(self.prime_ng_prob_samples) >= 3 else None
-        mahal_dist = float(np.median(self.prime_mahal_samples)) if len(self.prime_mahal_samples) >= 3 else None
+
+        # Guard Horizon Terpotong (Fase 4): Jika seluruh lintasan singkat memiliki bentang terpotong (<74% lebar penuh),
+        # blokir override logit 1D-CNN agar artefak tepi atas frame tidak memicu False NG (evaluasi murni geometri).
+        nominal_full_span = 800.0 * (float(getattr(self, "_last_frame_w", 1280)) / 1280.0)
+        ref_expected_span = max(
+            nominal_full_span,
+            float(self._observed_rib_w_ema)
+            if (getattr(self, "_observed_rib_w_ema", None) is not None and float(self._observed_rib_w_ema) > 200.0)
+            else 0.0,
+        )
+        max_span_obs = float(getattr(self, "_session_max_span_px", 0.0))
+        is_truncated_horizon_exit = bool(max_span_obs > 0.0 and max_span_obs < (0.74 * ref_expected_span))
+
+        ng_prob = (
+            float(np.median(self.prime_ng_prob_samples))
+            if (not is_truncated_horizon_exit and len(self.prime_ng_prob_samples) >= 3)
+            else None
+        )
+        mahal_dist = (
+            float(np.median(self.prime_mahal_samples))
+            if (not is_truncated_horizon_exit and len(self.prime_mahal_samples) >= 3)
+            else None
+        )
 
         transit_is_ok, _ = self._evaluate_rib_verdict_from_metrics(
             eval_pv, eval_sag, eval_idev, eval_tdev, ng_prob=ng_prob, mahal_dist=mahal_dist
@@ -1105,8 +1178,16 @@ class HybridRibInspector:
                 return False
             ng_votes = 0
             for idx_s in range(n_prime):
-                sp_prob = self.prime_ng_prob_samples[idx_s] if idx_s < len(self.prime_ng_prob_samples) else None
-                sp_mahal = self.prime_mahal_samples[idx_s] if idx_s < len(self.prime_mahal_samples) else None
+                sp_prob = (
+                    self.prime_ng_prob_samples[idx_s]
+                    if (not is_truncated_horizon_exit and idx_s < len(self.prime_ng_prob_samples))
+                    else None
+                )
+                sp_mahal = (
+                    self.prime_mahal_samples[idx_s]
+                    if (not is_truncated_horizon_exit and idx_s < len(self.prime_mahal_samples))
+                    else None
+                )
                 ok_i, _ = self._evaluate_rib_verdict_from_metrics(
                     self.prime_pv_samples[idx_s],
                     self.prime_sagitta_samples[idx_s],
@@ -1202,10 +1283,79 @@ class HybridRibInspector:
                 best_conf = yb.get("conf", default_conf) if isinstance(yb, dict) else default_conf
         return best_box, best_conf
 
+    def _register_retired_exit_corridor(self, cy, box=None, vy_ema=None, rib_id=None, status=None, ttl=75):
+        """Catat lintasan keluar eks-sirip untuk memblokir re-lock/re-judgment pasca-commit."""
+        if cy is None:
+            return
+        if not hasattr(self, "_retired_exit_corridors") or self._retired_exit_corridors is None:
+            self._retired_exit_corridors = []
+        vy_val = float(vy_ema if vy_ema is not None else getattr(self, "_conveyor_vy_ema", -2.0))
+        bw_val = float(box[2] - box[0]) if (box is not None and len(box) >= 4) else float(getattr(self, "_last_tracked_bw", None) or 650.0)
+        self._retired_exit_corridors.append({
+            "pred_cy": float(cy),
+            "bw": max(120.0, bw_val),
+            "vy": vy_val,
+            "ttl": int(ttl),
+            "rib_id": rib_id,
+            "status": status,
+        })
+        if len(self._retired_exit_corridors) > 8:
+            self._retired_exit_corridors = self._retired_exit_corridors[-8:]
+
+    def _advance_retired_exit_corridors(self, eff_zy1, eff_zy2, scale_y):
+        """Majukan proyeksi posisi koridor keluar mengikuti laju konveyor saat konveyor bergerak."""
+        corridors = getattr(self, "_retired_exit_corridors", None)
+        if not corridors:
+            return
+        live_vy = float(getattr(self, "_conveyor_vy_ema", -2.0))
+        is_halted = abs(live_vy) < 0.15
+        margin = max(28.0, 42.0 * float(scale_y))
+        kept = []
+        for c in corridors:
+            if not is_halted:
+                c["pred_cy"] += float(c["vy"])
+                c["ttl"] -= 1
+            if c["ttl"] <= 0:
+                continue
+            if c["vy"] <= 0.15 and c["pred_cy"] < (float(eff_zy1) - margin):
+                continue
+            if c["vy"] > 0.35 and c["pred_cy"] > (float(eff_zy2) + margin):
+                continue
+            kept.append(c)
+        self._retired_exit_corridors = kept
+
+    def _is_blocked_by_exit_lockout(self, cy_cand, bw_cand, zy1, upper_band_cy, scale_y, zy2=None):
+        """Tolak kotak kandidat Cold Start jika menimpa jalur sirip COMMITTED atau koridor keluar."""
+        cy_f = float(cy_cand)
+        bw_f = float(bw_cand)
+        vy = float(getattr(self, "_conveyor_vy_ema", -2.5))
+        band_tol = max(28.0, 42.0 * float(scale_y))
+
+        for s in getattr(self, "_rib_slots", ()):
+            if not s.get("committed", False):
+                continue
+            s_cy = float(s.get("cy", 0.0))
+            if abs(cy_f - s_cy) <= band_tol:
+                return True
+            if vy <= 0.15 and cy_f <= (s_cy + band_tol) and s_cy <= (float(upper_band_cy) + 18.0 * float(scale_y)):
+                return True
+            if vy > 0.35 and zy2 is not None and cy_f >= (s_cy - band_tol) and s_cy >= (float(zy2) - 45.0 * float(scale_y)):
+                return True
+
+        for c in getattr(self, "_retired_exit_corridors", ()):
+            pred_cy = float(c["pred_cy"])
+            bw_c = float(c["bw"])
+            if abs(cy_f - pred_cy) <= band_tol:
+                if bw_f <= max(bw_c * 1.22, bw_c + 65.0) or cy_f < float(upper_band_cy):
+                    return True
+            if c["vy"] <= 0.15 and pred_cy < (float(upper_band_cy) + 12.0 * float(scale_y)) and cy_f <= (pred_cy + 18.0 * float(scale_y)) and cy_f < float(upper_band_cy):
+                return True
+        return False
+
     def _select_cold_start_box(self, all_yolo_boxes, zy1, exit_cy_cut, eff_prime_min_y, eff_prime_max_y, h_f, w_f, scale_y, fallback_box, default_conf):
         """
         Memilih kandidat rib baru saat Cold Start dengan memblokir re-lock pada sisa rib di
-        tepi keluar horizon jauh maupun cooldown pasca-komit di zona atas.
+        tepi keluar horizon jauh maupun koridor pasca-komit di zona atas.
         """
         if not all_yolo_boxes:
             return fallback_box, default_conf
@@ -1213,7 +1363,7 @@ class HybridRibInspector:
         horizon_floor_cy = exit_cy_cut + max(18, int(0.06 * h_f))
         upper_band_cy = zy1 + int(0.16 * h_f)
         in_post_commit_cooldown = (
-            (getattr(self, "_frame_count", 0) - getattr(self, "_last_commit_frame_idx", -100)) < 20
+            (getattr(self, "_frame_count", 0) - getattr(self, "_last_commit_frame_idx", -100)) < 35
             and getattr(self, "_last_commit_y", None) is not None
             and float(self._last_commit_y) < float(upper_band_cy)
         )
@@ -1226,9 +1376,12 @@ class HybridRibInspector:
             if b is None:
                 continue
             cy_cand = (b[1] + b[3]) // 2
+            bw_cand = float(b[2] - b[0])
             if cy_cand < horizon_floor_cy:
                 continue
             if in_post_commit_cooldown and cy_cand < upper_band_cy:
+                continue
+            if self._is_blocked_by_exit_lockout(cy_cand, bw_cand, zy1, upper_band_cy, scale_y):
                 continue
             dist_p = abs(cy_cand - prime_mid_y)
             if dist_p < min_dist:
@@ -1238,10 +1391,15 @@ class HybridRibInspector:
 
         if best_box is not None:
             return best_box, best_conf
-        # Jangan fallback ke yolo_box bila berada di zona terlarang horizon atas
+        # Jangan fallback ke yolo_box bila berada di zona terlarang horizon atas / koridor keluar
         if fallback_box is not None:
             fb_cy = (fallback_box[1] + fallback_box[3]) // 2
-            if fb_cy < horizon_floor_cy or (in_post_commit_cooldown and fb_cy < upper_band_cy):
+            fb_bw = float(fallback_box[2] - fallback_box[0])
+            if (
+                fb_cy < horizon_floor_cy
+                or (in_post_commit_cooldown and fb_cy < upper_band_cy)
+                or self._is_blocked_by_exit_lockout(fb_cy, fb_bw, zy1, upper_band_cy, scale_y)
+            ):
                 return None, default_conf
         return fallback_box, default_conf
 
@@ -1359,19 +1517,40 @@ class HybridRibInspector:
         return self._committed_rib_statuses.get(rib_no)
 
     def finalize_pending_session(self):
-        """Mengunci sesi aktif yang tertunda (misalnya saat video/aplikasi ditutup)."""
+        """Mengunci sesi aktif maupun slot tak-commit yang tertunda (misalnya saat video ditutup)."""
+        slots = list(getattr(self, "_rib_slots", []))
+        if not slots:
+            self._commit_rib_session()
+            return self._last_finalized_status
+
+        focus_id = getattr(self, "_focused_slot_id", None)
+        if focus_id is not None:
+            for slot in slots:
+                if slot.get("slot_id") == focus_id and not slot.get("committed", False):
+                    slot["state"] = self._snapshot_session_state()
+                    break
+
+        for slot in slots:
+            if not slot.get("committed", False) and slot["state"].get("current_rib_status") in ("OK", "NG"):
+                self._finalize_slot(slot, exited_gate=False)
+
         self._commit_rib_session()
         return self._last_finalized_status
 
-    def _record_prime_sample(self, pv, sagitta, inner_dev, tip_dev, ng_prob=None, mahal_dist=None, profile_85=None):
+    def _record_prime_sample(
+        self, pv, sagitta, inner_dev, tip_dev, ng_prob=None, mahal_dist=None, profile_85=None, sample_weight=1.0
+    ):
         """Menyimpan sampel metrologi ke buffer Prime Zone setelah melewati warm-up masuk ROI."""
         self._prime_warmup_frames += 1
         if self._prime_warmup_frames <= 2:
             return
+        if not hasattr(self, "prime_weight_samples"):
+            self.prime_weight_samples = []
         self.prime_pv_samples.append(pv)
         self.prime_sagitta_samples.append(sagitta)
         self.prime_inner_dev_samples.append(inner_dev)
         self.prime_tip_dev_samples.append(tip_dev)
+        self.prime_weight_samples.append(float(sample_weight))
         if profile_85 is not None and len(profile_85) == 85:
             self.prime_profile_samples.append(np.asarray(profile_85, dtype=np.float32))
             if len(self.prime_profile_samples) > 25:
@@ -1385,23 +1564,25 @@ class HybridRibInspector:
             self.prime_sagitta_samples = self.prime_sagitta_samples[-25:]
             self.prime_inner_dev_samples = self.prime_inner_dev_samples[-25:]
             self.prime_tip_dev_samples = self.prime_tip_dev_samples[-25:]
+            self.prime_weight_samples = self.prime_weight_samples[-25:]
         if len(self.prime_ng_prob_samples) > 25:
             self.prime_ng_prob_samples = self.prime_ng_prob_samples[-25:]
         if len(self.prime_mahal_samples) > 25:
             self.prime_mahal_samples = self.prime_mahal_samples[-25:]
 
-    def _reset_rib_session(self, exited_gate=False):
-        """Mengunci vonis akhir sesi saat ini lalu mereset buffer untuk sirip baru."""
-        if exited_gate:
-            self._maybe_finalize_short_transit_session()
-        self._commit_rib_session()
+    def _clear_session_fields_only(self):
+        """Membersihkan seluruh buffer sesi pelacakan aktif pada objek inspector tanpa memicu commit."""
         self.last_presence = False
         self._session_committed = False
         self._prime_warmup_frames = 0
         self._session_valid_span_frames = 0
         self._session_max_yolo_conf = 0.0
         self._session_max_bw = 0.0
+        self._session_max_span_px = 0.0
         self._active_mask_profile = None
+        self._last_active_cy = None
+        self._last_active_box = None
+        self._last_tracked_bw = None
         if hasattr(self, "_session_fullspan_samples"):
             self._session_fullspan_samples.clear()
         self._dp_ratio_ema = 0.0
@@ -1420,6 +1601,8 @@ class HybridRibInspector:
         self.prime_sagitta_samples.clear()
         self.prime_inner_dev_samples.clear()
         self.prime_tip_dev_samples.clear()
+        if hasattr(self, "prime_weight_samples"):
+            self.prime_weight_samples.clear()
         self.prime_profile_samples.clear()
         self.prime_ng_prob_samples.clear()
         self.prime_mahal_samples.clear()
@@ -1442,6 +1625,535 @@ class HybridRibInspector:
         self.tier4_profile_history.clear()
         self.tier4_fused_dev = None
         self._kinematic_coasting_frames = 0
+
+    def _snapshot_session_state(self):
+        """Ambil salinan independen state metrologi sesi aktif untuk disimpan di RibTrackSlot."""
+        return {
+            "last_presence": bool(self.last_presence),
+            "_session_committed": bool(self._session_committed),
+            "_prime_warmup_frames": int(self._prime_warmup_frames),
+            "_session_valid_span_frames": int(getattr(self, "_session_valid_span_frames", 0)),
+            "_session_max_yolo_conf": float(getattr(self, "_session_max_yolo_conf", 0.0)),
+            "_session_max_bw": float(getattr(self, "_session_max_bw", 0.0)),
+            "_session_max_span_px": float(getattr(self, "_session_max_span_px", 0.0)),
+            "_active_mask_profile": self._active_mask_profile,
+            "_last_active_cy": self._last_active_cy,
+            "_last_active_box": list(self._last_active_box) if self._last_active_box is not None else None,
+            "_last_tracked_bw": self._last_tracked_bw,
+            "_session_fullspan_samples": list(getattr(self, "_session_fullspan_samples", [])),
+            "_dp_ratio_ema": float(self._dp_ratio_ema),
+            "_last_unwarp_contour": getattr(self, "_last_unwarp_contour", None),
+            "_last_unwarp_baseline": getattr(self, "_last_unwarp_baseline", None),
+            "_prev_unwarp_anchor_y": getattr(self, "_prev_unwarp_anchor_y", None),
+            "active_rib_frames": int(self.active_rib_frames),
+            "active_rib_ok_frames": int(self.active_rib_ok_frames),
+            "active_rib_ng_frames": int(self.active_rib_ng_frames),
+            "active_consec_ng": int(self.active_consec_ng),
+            "active_max_consec_ng": int(self.active_max_consec_ng),
+            "active_consec_ok": int(self.active_consec_ok),
+            "active_pv_history": list(self.active_pv_history),
+            "active_sagitta_history": list(self.active_sagitta_history),
+            "prime_pv_samples": list(self.prime_pv_samples),
+            "prime_sagitta_samples": list(self.prime_sagitta_samples),
+            "prime_inner_dev_samples": list(self.prime_inner_dev_samples),
+            "prime_tip_dev_samples": list(self.prime_tip_dev_samples),
+            "prime_weight_samples": list(getattr(self, "prime_weight_samples", [])),
+            "prime_profile_samples": list(self.prime_profile_samples),
+            "prime_ng_prob_samples": list(self.prime_ng_prob_samples),
+            "prime_mahal_samples": list(self.prime_mahal_samples),
+            "current_rib_status": self.current_rib_status,
+            "last_ng_reason": self.last_ng_reason,
+            "_seg_stride_counter": int(self._seg_stride_counter),
+            "_last_seg_xs": self._last_seg_xs,
+            "_last_seg_ys": self._last_seg_ys,
+            "_last_seg_cy": self._last_seg_cy,
+            "_prev_tier3_cam_xs": self._prev_tier3_cam_xs,
+            "_prev_tier3_cam_ys": self._prev_tier3_cam_ys,
+            "_prev_tier3_unw_xs": self._prev_tier3_unw_xs,
+            "_prev_tier3_unw_ys": self._prev_tier3_unw_ys,
+            "tier3_profile_history": list(getattr(self, "tier3_profile_history", [])),
+            "_last_hough_diag": self._last_hough_diag,
+            "_last_hough_patch": self._last_hough_patch,
+            "_prev_hough_pguide": self._prev_hough_pguide,
+            "_prev_hough_contour_ys": self._prev_hough_contour_ys,
+            "tier4_profile_history": list(self.tier4_profile_history),
+            "tier4_fused_dev": self.tier4_fused_dev,
+            "_kinematic_coasting_frames": int(self._kinematic_coasting_frames),
+            "absence_frames": int(self.absence_frames),
+        }
+
+    def _restore_session_state(self, st):
+        """Muat kembali state metrologi RibTrackSlot tertentu ke atribut sesi aktif inspector."""
+        self.last_presence = bool(st["last_presence"])
+        self._session_committed = bool(st["_session_committed"])
+        self._prime_warmup_frames = int(st["_prime_warmup_frames"])
+        self._session_valid_span_frames = int(st["_session_valid_span_frames"])
+        self._session_max_yolo_conf = float(st["_session_max_yolo_conf"])
+        self._session_max_bw = float(st["_session_max_bw"])
+        self._session_max_span_px = float(st["_session_max_span_px"])
+        self._active_mask_profile = st["_active_mask_profile"]
+        self._last_active_cy = st["_last_active_cy"]
+        self._last_active_box = list(st["_last_active_box"]) if st["_last_active_box"] is not None else None
+        self._last_tracked_bw = st["_last_tracked_bw"]
+        self._session_fullspan_samples = list(st["_session_fullspan_samples"])
+        self._dp_ratio_ema = float(st["_dp_ratio_ema"])
+        self._last_unwarp_contour = st["_last_unwarp_contour"]
+        self._last_unwarp_baseline = st["_last_unwarp_baseline"]
+        self._prev_unwarp_anchor_y = st["_prev_unwarp_anchor_y"]
+        self.active_rib_frames = int(st["active_rib_frames"])
+        self.active_rib_ok_frames = int(st["active_rib_ok_frames"])
+        self.active_rib_ng_frames = int(st["active_rib_ng_frames"])
+        self.active_consec_ng = int(st["active_consec_ng"])
+        self.active_max_consec_ng = int(st["active_max_consec_ng"])
+        self.active_consec_ok = int(st["active_consec_ok"])
+        self.active_pv_history = list(st["active_pv_history"])
+        self.active_sagitta_history = list(st["active_sagitta_history"])
+        self.prime_pv_samples = list(st["prime_pv_samples"])
+        self.prime_sagitta_samples = list(st["prime_sagitta_samples"])
+        self.prime_inner_dev_samples = list(st["prime_inner_dev_samples"])
+        self.prime_tip_dev_samples = list(st["prime_tip_dev_samples"])
+        self.prime_weight_samples = list(st["prime_weight_samples"])
+        self.prime_profile_samples = list(st["prime_profile_samples"])
+        self.prime_ng_prob_samples = list(st["prime_ng_prob_samples"])
+        self.prime_mahal_samples = list(st["prime_mahal_samples"])
+        self.current_rib_status = st["current_rib_status"]
+        self.last_ng_reason = st["last_ng_reason"]
+        self._seg_stride_counter = int(st["_seg_stride_counter"])
+        self._last_seg_xs = st["_last_seg_xs"]
+        self._last_seg_ys = st["_last_seg_ys"]
+        self._last_seg_cy = st["_last_seg_cy"]
+        self._prev_tier3_cam_xs = st["_prev_tier3_cam_xs"]
+        self._prev_tier3_cam_ys = st["_prev_tier3_cam_ys"]
+        self._prev_tier3_unw_xs = st["_prev_tier3_unw_xs"]
+        self._prev_tier3_unw_ys = st["_prev_tier3_unw_ys"]
+        self.tier3_profile_history = list(st["tier3_profile_history"])
+        self._last_hough_diag = st["_last_hough_diag"]
+        self._last_hough_patch = st["_last_hough_patch"]
+        self._prev_hough_pguide = st["_prev_hough_pguide"]
+        self._prev_hough_contour_ys = st["_prev_hough_contour_ys"]
+        self.tier4_profile_history = list(st["tier4_profile_history"])
+        self.tier4_fused_dev = st["tier4_fused_dev"]
+        self._kinematic_coasting_frames = int(st["_kinematic_coasting_frames"])
+        self.absence_frames = int(st["absence_frames"])
+
+    def _new_rib_slot(self, box, conf, mask_profile=None, vy_ema=None, state=None):
+        """Membuat RibTrackSlot persisten baru untuk melacak 1 sirip fisik secara independen."""
+        slot_id = int(getattr(self, "_next_rib_slot_id", 1))
+        self._next_rib_slot_id = slot_id + 1
+        b = [int(v) for v in box[:4]]
+        cy_v = 0.5 * float(b[1] + b[3])
+        bw_v = max(1.0, float(b[2] - b[0]))
+        vy_v = float(vy_ema if vy_ema is not None else getattr(self, "_conveyor_vy_ema", -2.0))
+        if state is None:
+            saved_focus = self._snapshot_session_state()
+            self._clear_session_fields_only()
+            self._last_active_box = b
+            self._last_active_cy = int(round(cy_v))
+            self._last_tracked_bw = bw_v
+            self._active_mask_profile = mask_profile
+            state = self._snapshot_session_state()
+            self._restore_session_state(saved_focus)
+        return {
+            "slot_id": slot_id,
+            "box": b,
+            "cy": cy_v,
+            "bw": bw_v,
+            "conf": float(conf or 0.0),
+            "mask_profile": mask_profile,
+            "vy_ema": vy_v,
+            "phase": "ENTERING",
+            "absent_frames": 0,
+            "coast_frames": 0,
+            "is_coasting": False,
+            "saw_exit_boundary": False,
+            "committed": False,
+            "committed_rib_id": 0,
+            "committed_status": None,
+            "state": state,
+        }
+
+    def _finalize_slot(self, slot, exited_gate=True):
+        """Finalisasi & kunci vonis satu RibTrackSlot tepat 1x (tanpa menghapus identitas slot)."""
+        if slot is None or slot.get("committed", False):
+            return False
+        was_focused = (slot["slot_id"] == getattr(self, "_focused_slot_id", None))
+        prev_focus_id = getattr(self, "_focused_slot_id", None)
+        saved_other = None if was_focused else self._snapshot_session_state()
+
+        self._restore_session_state(slot["state"])
+        self._last_active_cy = int(round(slot["cy"]))
+        self._last_active_box = list(slot["box"])
+        self._last_tracked_bw = float(slot["bw"])
+        if exited_gate:
+            self._maybe_finalize_short_transit_session()
+        self._commit_rib_session()
+
+        did_commit = bool(self._session_committed and self.current_rib_status in ("OK", "NG"))
+        slot["committed"] = True
+        slot["phase"] = "COMMITTED"
+        if did_commit:
+            slot["committed_rib_id"] = int(self._last_finalized_rib_id)
+            slot["committed_status"] = self._last_finalized_status
+        slot["state"] = self._snapshot_session_state()
+        self._register_retired_exit_corridor(
+            slot["cy"],
+            slot["box"],
+            slot.get("vy_ema"),
+            rib_id=slot["committed_rib_id"] if did_commit else None,
+            status=slot["committed_status"],
+        )
+
+        if was_focused:
+            self._clear_session_fields_only()
+            self._focused_slot_id = None
+        elif saved_other is not None:
+            self._restore_session_state(saved_other)
+            self._focused_slot_id = prev_focus_id
+        return did_commit
+
+    def _update_multi_rib_slots(
+        self, all_yolo_boxes, yolo_box, yolo_conf, zy1, zy2, exit_y1_cut, exit_cy_cut,
+        eff_prime_min_y, eff_prime_max_y, h_f, w_f, scale_y
+    ):
+        """
+        Mengelola pool slot pelacakan multi-sirip persisten (maks 4 slot) secara paralel
+        agar Plat A [COMMITTED/LOCKED] tidak pernah dire-deteksi ulang saat Plat B & C masuk ROI.
+        Mengembalikan tuple (primary_slot, hysteresis_slot).
+        """
+        if not hasattr(self, "_rib_slots") or self._rib_slots is None:
+            self._rib_slots = []
+
+        # Lazy seed untuk unit test yang mengisi langsung atribut internal tanpa Cold Start
+        if (
+            not self._rib_slots
+            and getattr(self, "_last_active_cy", None) is not None
+            and getattr(self, "_last_active_box", None) is not None
+        ):
+            seed_slot = self._new_rib_slot(
+                self._last_active_box,
+                getattr(self, "_session_max_yolo_conf", 0.0) or yolo_conf,
+                mask_profile=getattr(self, "_active_mask_profile", None),
+                vy_ema=getattr(self, "_conveyor_vy_ema", -2.0),
+                state=self._snapshot_session_state(),
+            )
+            seed_slot["phase"] = "PRIME" if self.prime_pv_samples else "ENTERING"
+            self._rib_slots.append(seed_slot)
+            self._focused_slot_id = seed_slot["slot_id"]
+
+        # Sinkronkan mutasi eksternal pada fokus aktif sebelum asosiasi frame baru
+        focused_id = getattr(self, "_focused_slot_id", None)
+        if focused_id is not None:
+            for s in self._rib_slots:
+                if s["slot_id"] == focused_id and not s.get("committed", False):
+                    s["state"] = self._snapshot_session_state()
+                    s["coast_frames"] = int(getattr(self, "_kinematic_coasting_frames", 0))
+                    s["absent_frames"] = int(getattr(self, "absence_frames", 0))
+                    break
+
+        # Susun daftar deteksi YOLO kandidat frame ini
+        dets = []
+        raw_list = list(all_yolo_boxes) if all_yolo_boxes else []
+        if not raw_list and yolo_box is not None:
+            raw_list = [{"box": yolo_box, "conf": yolo_conf, "mask_profile": None}]
+        for yb in raw_list:
+            b = yb.get("box") if isinstance(yb, dict) else yb
+            if b is None or len(b) < 4:
+                continue
+            b_xy = [int(v) for v in b[:4]]
+            cy_d = 0.5 * float(b_xy[1] + b_xy[3])
+            bw_d = max(1.0, float(b_xy[2] - b_xy[0]))
+            c_d = float(yb.get("conf", yolo_conf) if isinstance(yb, dict) else yolo_conf)
+            mp_d = yb.get("mask_profile") if isinstance(yb, dict) else None
+            out_gate = bool(b_xy[1] < exit_y1_cut or cy_d < exit_cy_cut or cy_d > zy2)
+            dets.append({
+                "box": b_xy, "cy": cy_d, "bw": bw_d, "conf": c_d,
+                "mask_profile": mp_d, "out_gate": out_gate, "matched": False,
+            })
+
+        # Asosiasi jarak terdekat (Bipartite Greedy) antara RibTrackSlot eksisting dan deteksi YOLO
+        pairs = []
+        for s_idx, s in enumerate(self._rib_slots):
+            s["matched_this_frame"] = False
+            s["saw_exit_boundary"] = False
+            expected_cy = float(s["cy"]) + float(s["vy_ema"])
+            max_jump = max(14.0, (18.0 + 4.0 * int(s.get("coast_frames", 0))) * float(scale_y))
+            prev_bw = float(s["bw"])
+            prev_cy = float(s["cy"])
+            vy_s = float(s["vy_ema"])
+            for d_idx, d in enumerate(dets):
+                if abs(d["bw"] - prev_bw) / max(1.0, prev_bw) > 0.25:
+                    continue
+                if vy_s <= -0.35 and d["cy"] > (prev_cy + 8.0 * float(scale_y)):
+                    continue
+                if vy_s >= 0.35 and d["cy"] < (prev_cy - 8.0 * float(scale_y)):
+                    continue
+                dist = abs(d["cy"] - expected_cy)
+                if dist <= max_jump:
+                    pairs.append((dist, s_idx, d_idx))
+
+        pairs.sort(key=lambda item: item[0])
+        matched_slots = set()
+        matched_dets = set()
+        for _, s_idx, d_idx in pairs:
+            if s_idx in matched_slots or d_idx in matched_dets:
+                continue
+            matched_slots.add(s_idx)
+            matched_dets.add(d_idx)
+            s = self._rib_slots[s_idx]
+            d = dets[d_idx]
+            d["matched"] = True
+            if d["out_gate"]:
+                s["saw_exit_boundary"] = True
+                continue
+            inst_vy = float(d["cy"] - s["cy"])
+            if abs(inst_vy) <= max(10.0, 15.0 * float(scale_y)):
+                s["vy_ema"] = 0.80 * float(s["vy_ema"]) + 0.20 * inst_vy
+            s["box"] = list(d["box"])
+            s["cy"] = float(d["cy"])
+            s["bw"] = float(d["bw"])
+            s["conf"] = float(d["conf"])
+            s["mask_profile"] = d["mask_profile"]
+            s["absent_frames"] = 0
+            s["coast_frames"] = 0
+            s["is_coasting"] = False
+            s["matched_this_frame"] = True
+            if not s["committed"]:
+                st = s["state"]
+                st["_last_active_box"] = list(d["box"])
+                st["_last_active_cy"] = int(round(d["cy"]))
+                st["_last_tracked_bw"] = float(d["bw"])
+                st["_kinematic_coasting_frames"] = 0
+                st["absence_frames"] = 0
+                st["_active_mask_profile"] = d["mask_profile"]
+                if s["phase"] == "ENTERING" and eff_prime_min_y <= d["cy"] <= eff_prime_max_y:
+                    s["phase"] = "PRIME"
+                elif (
+                    s["vy_ema"] <= 0.15
+                    and d["cy"] < eff_prime_min_y
+                    and (st["current_rib_status"] is not None or len(st["prime_pv_samples"]) > 0)
+                ):
+                    s["phase"] = "EVALUATED_LOCKED"
+
+        # Tangani slot yang tidak ter-match frame ini (coasting, absence hysteresis, atau exit/retire)
+        surviving = []
+        live_vy = float(getattr(self, "_conveyor_vy_ema", -2.0))
+        is_halted = abs(live_vy) < 0.15
+        for s in self._rib_slots:
+            if s.get("matched_this_frame", False):
+                surviving.append(s)
+                continue
+            is_past_exit = bool(
+                s.get("saw_exit_boundary", False)
+                or (s["box"][1] + min(0.0, s["vy_ema"])) < exit_y1_cut
+                or (s["cy"] <= (zy1 + int(round(35 * scale_y))) and s["vy_ema"] <= 0.5)
+                or s["cy"] >= (zy2 - max(8, int(round(10 * scale_y))))
+            )
+            if s["committed"]:
+                if not is_halted:
+                    s["absent_frames"] += 1
+                    s["cy"] += float(s["vy_ema"])
+                    s["box"] = [
+                        s["box"][0], int(round(s["box"][1] + s["vy_ema"])),
+                        s["box"][2], int(round(s["box"][3] + s["vy_ema"])),
+                    ]
+                s["is_coasting"] = False
+                if (
+                    is_past_exit
+                    or s["absent_frames"] >= 12
+                    or s["box"][1] < (eff_prime_min_y - max(60, int(0.14 * h_f)))
+                ):
+                    self._register_retired_exit_corridor(
+                        s["cy"], s["box"], s["vy_ema"],
+                        rib_id=s["committed_rib_id"], status=s["committed_status"],
+                    )
+                    continue
+                surviving.append(s)
+                continue
+
+            if is_past_exit:
+                self._finalize_slot(s, exited_gate=True)
+                continue
+
+            st = s["state"]
+            if st["active_rib_frames"] >= 2 and s["coast_frames"] < self._max_kinematic_coasting:
+                s["coast_frames"] += 1
+                vy_c = float(s["vy_ema"])
+                proj_b = [
+                    s["box"][0], int(round(s["box"][1] + vy_c)),
+                    s["box"][2], int(round(s["box"][3] + vy_c)),
+                ]
+                proj_cy = 0.5 * float(proj_b[1] + proj_b[3])
+                if proj_b[1] < exit_y1_cut or proj_cy < exit_cy_cut or proj_cy > zy2:
+                    self._finalize_slot(s, exited_gate=True)
+                    continue
+                s["box"] = proj_b
+                s["cy"] = proj_cy
+                s["is_coasting"] = True
+                s["conf"] = max(0.35, float(yolo_conf or 0.0) * 0.96)
+                s["mask_profile"] = None
+                st["_last_active_box"] = list(proj_b)
+                st["_last_active_cy"] = int(round(proj_cy))
+                st["_kinematic_coasting_frames"] = s["coast_frames"]
+                st["_active_mask_profile"] = None
+                surviving.append(s)
+                continue
+
+            s["is_coasting"] = False
+            if st["active_rib_frames"] > 0:
+                s["absent_frames"] += 1
+                st["absence_frames"] = s["absent_frames"]
+                if s["absent_frames"] < self.max_absence_tolerance:
+                    surviving.append(s)
+                    continue
+            did_exit = bool(st["_session_valid_span_frames"] >= 5)
+            self._finalize_slot(s, exited_gate=did_exit)
+
+        self._rib_slots = surviving
+
+        # Akusisi slot baru untuk kotak tak berpasangan yang sah di zona foreground/prime
+        horizon_floor_cy = exit_cy_cut + max(18, int(0.06 * h_f))
+        upper_band_cy = zy1 + int(0.16 * h_f)
+        in_post_commit_cooldown = (
+            (getattr(self, "_frame_count", 0) - getattr(self, "_last_commit_frame_idx", -100)) < 35
+            and getattr(self, "_last_commit_y", None) is not None
+            and float(self._last_commit_y) < float(upper_band_cy)
+        )
+        prime_mid_y = 0.5 * float(eff_prime_min_y + eff_prime_max_y)
+        unmatched_dets = [d for d in dets if not d["matched"] and not d["out_gate"]]
+        unmatched_dets.sort(key=lambda d: abs(d["cy"] - prime_mid_y))
+        had_existing_slots = len(self._rib_slots) > 0
+        for d in unmatched_dets:
+            if len(self._rib_slots) >= 4:
+                break
+            if d["cy"] < horizon_floor_cy:
+                continue
+            if in_post_commit_cooldown and d["cy"] < upper_band_cy:
+                continue
+            if self._is_blocked_by_exit_lockout(d["cy"], d["bw"], zy1, upper_band_cy, scale_y, zy2=zy2):
+                continue
+            if any(abs(d["cy"] - s["cy"]) <= max(24.0, 34.0 * float(scale_y)) for s in self._rib_slots):
+                continue
+            if had_existing_slots:
+                in_fg_entry = d["box"][1] >= (eff_prime_min_y - max(6, int(0.01 * h_f)))
+                min_new_conf = (
+                    max(self.conf_thresh * 0.72, 0.38)
+                    if in_fg_entry
+                    else max(min(self.conf_thresh, 0.48), 0.42)
+                )
+                if d["conf"] < min_new_conf:
+                    continue
+            new_s = self._new_rib_slot(d["box"], d["conf"], mask_profile=d["mask_profile"])
+            new_s["matched_this_frame"] = True
+            if eff_prime_min_y <= d["cy"] <= eff_prime_max_y:
+                new_s["phase"] = "PRIME"
+            self._rib_slots.append(new_s)
+
+        # Evaluasi handoff dini ke sirip foreground saat sirip atas sudah punya bukti kuat
+        cur_focus = next(
+            (s for s in self._rib_slots if s["slot_id"] == getattr(self, "_focused_slot_id", None) and not s["committed"]),
+            None,
+        )
+        if cur_focus is not None:
+            st_cur = cur_focus["state"]
+            has_evidence = (
+                st_cur["current_rib_status"] is not None
+                or len(st_cur["prime_pv_samples"]) >= 3
+                or st_cur["_session_valid_span_frames"] >= 4
+            )
+            if has_evidence and cur_focus["box"][1] <= int(0.36 * h_f):
+                min_dy = max(42.0, 60.0 * float(scale_y))
+                min_y1 = int(0.35 * h_f)
+                max_cy = int(0.56 * h_f)
+                min_bw_fg = max(float(cur_focus["bw"]) * 1.06, 0.48 * float(w_f))
+                has_fg_ready = any(
+                    (not fg["committed"])
+                    and fg["slot_id"] != cur_focus["slot_id"]
+                    and (fg.get("matched_this_frame", False) or fg.get("is_coasting", False))
+                    and fg["conf"] >= 0.50
+                    and fg["cy"] > (cur_focus["cy"] + min_dy)
+                    and fg["box"][1] >= min_y1
+                    and fg["cy"] <= max_cy
+                    and fg["bw"] >= min_bw_fg
+                    for fg in self._rib_slots
+                )
+                if has_fg_ready:
+                    # Kunci status Plat A di dalam slot-nya tanpa menghapus slot dari pool!
+                    self._finalize_slot(cur_focus, exited_gate=True)
+
+        # Pilih tepat 1 fokus aktif (primary_slot) & opsi 1 kotak pasif LOCKED (Plat A) untuk UI
+        active_candidates = [
+            s for s in self._rib_slots
+            if (not s["committed"]) and (s.get("matched_this_frame", False) or s.get("is_coasting", False))
+        ]
+        locked_slots = [s for s in self._rib_slots if s["committed"]]
+        locked_slots.sort(key=lambda s: s["cy"])
+        self._locked_ui_boxes = [list(s["box"]) for s in locked_slots[:1]]
+
+        primary_slot = None
+        if active_candidates:
+            def _focus_priority(s):
+                st_s = s["state"]
+                has_ev = (st_s["current_rib_status"] is not None or len(st_s["prime_pv_samples"]) > 0)
+                if has_ev:
+                    tier = 0
+                elif s["cy"] <= eff_prime_max_y:
+                    tier = 1
+                else:
+                    tier = 2
+                return (tier, abs(s["cy"] - prime_mid_y), s["cy"])
+
+            primary_slot = min(active_candidates, key=_focus_priority)
+            if primary_slot["slot_id"] != getattr(self, "_focused_slot_id", None):
+                self._restore_session_state(primary_slot["state"])
+                self._focused_slot_id = primary_slot["slot_id"]
+            self._last_active_box = list(primary_slot["box"])
+            self._last_active_cy = int(round(primary_slot["cy"]))
+            self._last_tracked_bw = float(primary_slot["bw"])
+            self._kinematic_coasting_frames = int(primary_slot.get("coast_frames", 0))
+            self._is_coasting_active = bool(primary_slot.get("is_coasting", False))
+            self._active_mask_profile = primary_slot.get("mask_profile")
+            return primary_slot, None
+
+        # Tidak ada sirip yang aktif/coasting frame ini -> cek slot dalam absence buffer
+        hyst_candidates = [
+            s for s in self._rib_slots
+            if (not s["committed"])
+            and s["state"]["active_rib_frames"] > 0
+            and s["absent_frames"] < self.max_absence_tolerance
+        ]
+        if hyst_candidates:
+            h_slot = min(hyst_candidates, key=lambda s: abs(s["cy"] - prime_mid_y))
+            if h_slot["slot_id"] != getattr(self, "_focused_slot_id", None):
+                self._restore_session_state(h_slot["state"])
+                self._focused_slot_id = h_slot["slot_id"]
+            self.absence_frames = int(h_slot["absent_frames"])
+            self._last_active_box = list(h_slot["box"])
+            self._last_active_cy = int(round(h_slot["cy"]))
+            self._kinematic_coasting_frames = int(h_slot.get("coast_frames", 0))
+            self._is_coasting_active = False
+            return None, h_slot
+
+        self._focused_slot_id = None
+        self._is_coasting_active = False
+        return None, None
+
+    def _reset_rib_session(self, exited_gate=False):
+        """Mengunci vonis akhir sesi saat ini lalu mereset buffer untuk sirip baru."""
+        pre_cy = getattr(self, "_last_active_cy", None)
+        pre_box = getattr(self, "_last_active_box", None)
+        pre_vy = getattr(self, "_conveyor_vy_ema", -2.5)
+        if exited_gate:
+            self._maybe_finalize_short_transit_session()
+        self._commit_rib_session()
+        if pre_cy is not None and (exited_gate or self._session_committed):
+            self._register_retired_exit_corridor(
+                pre_cy,
+                pre_box,
+                pre_vy,
+                rib_id=self._last_finalized_rib_id,
+                status=self._last_finalized_status,
+            )
+        self._clear_session_fields_only()
 
     @staticmethod
     def _fit_robust_guide_poly(anchor_xs, anchor_ys, default_y, max_abs_slope=0.035):
@@ -1609,14 +2321,18 @@ class HybridRibInspector:
         return self.pv_thresh, self.sagitta_thresh, self.dev_thresh, self.tip_thresh
 
     def _compute_prime_consensus_metrics(self, pv, sagitta, inner_dev, tip_dev, min_samples_required=8):
-        """Compute Prime Zone metrics using trimmed median for TIER1_VITERBI, plain median otherwise."""
+        """Compute Prime Zone metrics using trimmed median for TIER1_VITERBI, quality-weighted median otherwise."""
         if len(self.prime_pv_samples) < min_samples_required:
             return pv, sagitta, inner_dev, tip_dev
+
+        weights = getattr(self, "prime_weight_samples", None)
 
         def _agg(samples):
             if self.tracker_engine == "TIER1_VITERBI" and len(samples) >= 8:
                 ordered = sorted(samples)
                 return float(np.median(ordered[1:-1]))
+            if weights is not None and len(weights) == len(samples):
+                return self._weighted_median(samples, weights)
             return float(np.median(samples))
 
         return (
@@ -1676,6 +2392,8 @@ class HybridRibInspector:
         self._observed_rib_w_ema = None
         self._upward_pitch_detected = False
         self._upward_pitch_streak = 0
+        self._retired_exit_corridors = []
+        self._next_rib_slot_id = 1
         self.reset_active_tracking()
 
     def reset_active_tracking(self):
@@ -1690,6 +2408,11 @@ class HybridRibInspector:
         self._active_mask_profile = None
         self._last_yolo_det = (False, None, 0.0, [])
         self._last_pre_gate_rib_boxes = []
+        self._rib_slots = []
+        self._focused_slot_id = None
+        self._is_coasting_active = False
+        self._locked_ui_boxes = []
+        self._retired_exit_corridors = []
         self._reset_rib_session(exited_gate=False)
 
     def set_mode(self, new_mode):
@@ -2352,12 +3075,13 @@ class HybridRibInspector:
             # - Level 1 Cold Start (discovery): max(min(conf_thresh, 0.48), 0.42) → tolak noise kamera live awal
             # - Level 2 Early Active (<5 frame): max(conf_thresh * 0.72, 0.36) → tahan drop transisi awal
             # - Level 3 Stable Active (≥5 frame): max(conf_thresh * 0.64, 0.34) → cegah flicker tanpa over-sensitif
-            if self.active_rib_frames == 0:
+            has_live_slots = len(getattr(self, "_rib_slots", ())) > 0
+            if self.active_rib_frames == 0 and not has_live_slots:
                 eval_conf = max(min(self.conf_thresh, 0.48), 0.42)   # Level 1: Discovery ketat
-            elif self.active_rib_frames < 5:
+            elif self.active_rib_frames < 5 and not has_live_slots:
                 eval_conf = max(self.conf_thresh * 0.72, 0.36)       # Level 2: Early Active
             else:
-                eval_conf = max(self.conf_thresh * 0.64, 0.34)       # Level 3: Stable Active
+                eval_conf = max(self.conf_thresh * 0.64, 0.34)       # Level 3: Stable Active / Multi-Slot
             infer_conf = min(eval_conf, 0.28)
             mask_profiles_raw = []
             if getattr(self, "_gpu_onnx_runner", None) is not None:
@@ -3888,12 +4612,17 @@ class HybridRibInspector:
 
         # Stride inferensi YOLO: cerdas menghemat komputasi dan melipatgandakan throughput FPS
         self._frame_count += 1
+        self._advance_retired_exit_corridors(zy1, zy2, scale_y)
         yolo_stride = self.yolo_stride
         exit_y1_cut = zy1 - max(12, int(0.017 * h_f))  # ~zy1 - 18 px pada 1080p (tepat saat bibir atas menyentuh batas atas gerbang)
         exit_cy_cut = zy1 + max(10, int(0.014 * h_f))  # ~zy1 + 15 px pada 1080p
         near_top_exit = (
             getattr(self, "_last_active_box", None) is not None
             and self._last_active_box[1] <= (exit_y1_cut + 24)
+        ) or any(
+            s["box"][1] <= (exit_y1_cut + 24)
+            for s in getattr(self, "_rib_slots", ())
+            if s.get("box") is not None
         )
         run_yolo = (yolo_stride <= 1) or (self._frame_count % yolo_stride == 0) or near_top_exit
 
@@ -3954,95 +4683,77 @@ class HybridRibInspector:
             else:
                 dual_det, dual_box, dual_h, dual_ratio, _ = self._last_dual_det
 
-        # 2. Gating Keputusan Awal & Pemilihan Box Kontinu (Anti-Jump & Kinematic Tracking)
+        # 2. Gating Keputusan Awal & Manajemen Pool Slot Multi-Rib (Anti-Jump & Anti-Redeteksi)
         reason = ""
+        focused_slot = None
         if self.mode in ["HYBRID", "YOLO_ONLY"]:
-            if getattr(self, "_last_active_cy", None) is not None and getattr(self, "_last_active_box", None) is not None:
-                # KONDISI A: Sedang dalam sesi pelacakan aktif suatu bilah sirip (Identity Locked)
-                expected_cy = self._last_active_cy + self._conveyor_vy_ema
-                best_tracked_box, yolo_conf = self._select_continuous_tracked_box(
-                    all_yolo_boxes, expected_cy, h_f, scale_y, yolo_conf
-                )
-
-                if best_tracked_box is not None:
-                    cy_trk = (best_tracked_box[1] + best_tracked_box[3]) // 2
-                    if best_tracked_box[1] < exit_y1_cut or cy_trk < exit_cy_cut:
-                        best_tracked_box = None
-
-                if best_tracked_box is not None:
-                    # Cek priority handoff ke rib baru di Sweet-Spot foreground saat rib aktif masuk lorong atas
-                    fg_handoff_box, fg_handoff_conf = self._select_foreground_handoff_box(
-                        all_yolo_boxes, best_tracked_box, h_f, w_f, scale_y
+            focused_slot, hyst_slot = self._update_multi_rib_slots(
+                all_yolo_boxes, yolo_box, yolo_conf, zy1, zy2, exit_y1_cut, exit_cy_cut,
+                eff_prime_min_y, eff_prime_max_y, h_f, w_f, scale_y
+            )
+            if focused_slot is not None:
+                active_box = list(focused_slot["box"])
+                yolo_conf = float(focused_slot["conf"])
+                yolo_det = True
+                self.absence_frames = 0
+                if focused_slot.get("is_coasting", False):
+                    vy = float(focused_slot.get("vy_ema", self._conveyor_vy_ema))
+                    reason = (
+                        f"HYBRID: Kinematic Coast (Y={(active_box[1] + active_box[3]) // 2}, "
+                        f"vy={vy:.1f}px/f, coast={focused_slot['coast_frames']}/{self._max_kinematic_coasting})"
                     )
-                    if fg_handoff_box is not None:
-                        active_box = fg_handoff_box
-                        yolo_conf = fg_handoff_conf
-                        yolo_det = True
-                        self._kinematic_coasting_frames = 0
-                        self._last_tracked_bw = None
-                        self._last_active_cy = None
-                        self._last_active_box = None
-                        self._reset_rib_session(exited_gate=True)
-                    else:
-                        # Deteksi AI solid terkonfirmasi
-                        active_box = best_tracked_box
-                        yolo_det = True
-                        self._kinematic_coasting_frames = 0
-                        self._last_tracked_bw = float(best_tracked_box[2] - best_tracked_box[0])
-                        inst_cy = (best_tracked_box[1] + best_tracked_box[3]) // 2
-                        inst_vy = float(inst_cy - self._last_active_cy)
-                        if abs(inst_vy) <= max(10.0, 15.0 * scale_y):
-                            self._conveyor_vy_ema = 0.80 * self._conveyor_vy_ema + 0.20 * inst_vy
                 else:
-                    # AI drop sesaat (akibat pantulan cahaya, bayangan oli, atau flicker)
-                    # Cek apakah bilah sirip aktif sudah keluar dari gerbang inspeksi atas
-                    prev_cy = self._last_active_cy
-                    prev_box = self._last_active_box
-                    vy = self._conveyor_vy_ema
-                    is_past_exit = (
-                        (prev_box[1] + min(0.0, vy)) < exit_y1_cut
-                        or (prev_cy <= (zy1 + int(round(35 * scale_y))) and vy <= 0.5)
-                    )
-                    if is_past_exit:
-                        # Bilah lama telah tuntas keluar! Beralih ke bilah baru di zona masuk yang sah
-                        best_new_box, best_new_conf = self._select_cold_start_box(
-                            all_yolo_boxes, zy1, exit_cy_cut, eff_prime_min_y, eff_prime_max_y,
-                            h_f, w_f, scale_y, None, yolo_conf
-                        )
-                        if best_new_box is not None:
-                            active_box = best_new_box
-                            yolo_conf = best_new_conf
-                            yolo_det = True
-                            self._last_tracked_bw = None
-                            self._reset_rib_session(exited_gate=True)
-                        else:
-                            active_box = None
-                            yolo_det = False
-                    elif self.active_rib_frames >= 2 and self._kinematic_coasting_frames < self._max_kinematic_coasting:
-                        # Bilah sudah terkonfirmasi (≥2 frame) & masih di zona kerja: jalankan Kinematic Extrapolation
-                        self._kinematic_coasting_frames += 1
-                        old_b = self._last_active_box
-                        proj_y1 = int(round(old_b[1] + vy))
-                        proj_y2 = int(round(old_b[3] + vy))
-                        active_box = [old_b[0], proj_y1, old_b[2], proj_y2]
-                        yolo_det = True
-                        yolo_conf = max(0.35, yolo_conf * 0.96)
-                        reason = f"HYBRID: Kinematic Coast (Y={(proj_y1+proj_y2)//2}, vy={vy:.1f}px/f, coast={self._kinematic_coasting_frames}/{self._max_kinematic_coasting})"
-                    else:
-                        active_box = None
-                        yolo_det = False
+                    inst_vy = float(focused_slot.get("vy_ema", self._conveyor_vy_ema))
+                    if abs(inst_vy) <= max(10.0, 15.0 * scale_y):
+                        self._conveyor_vy_ema = inst_vy
+                    reason = f"HYBRID: YOLO({yolo_conf:.2f})" if self.mode == "HYBRID" else f"YOLO ONLY: Conf={yolo_conf:.2f}"
             else:
-                # KONDISI B: Cold Start (Mencari bilah pertama di zona akuisisi aman, tolak tepi horizon jauh)
-                active_box, yolo_conf = self._select_cold_start_box(
-                    all_yolo_boxes, zy1, exit_cy_cut, eff_prime_min_y, eff_prime_max_y,
-                    h_f, w_f, scale_y, yolo_box, yolo_conf
-                )
-                yolo_det = (active_box is not None)
+                active_box = None
+                yolo_det = False
+                if hyst_slot is not None:
+                    self._is_coasting_active = False
+                    _buf_pv = float(np.median(self.prime_pv_samples)) if self.prime_pv_samples else 0.0
+                    _buf_sag = float(np.median(self.prime_sagitta_samples)) if self.prime_sagitta_samples else 0.0
+                    _buf_idev = float(np.median(self.prime_inner_dev_samples)) if self.prime_inner_dev_samples else 0.0
+                    _buf_tdev = float(np.median(self.prime_tip_dev_samples)) if self.prime_tip_dev_samples else 0.0
+                    _buf_sev = self.compute_ng_severity(
+                        _buf_pv, _buf_sag, _buf_idev, _buf_tdev,
+                        is_ng=(self.current_rib_status == "NG")
+                    ) if self.current_rib_status == "NG" else "OK"
+                    return {
+                        "status": self.current_rib_status if self.current_rib_status else "WAIT",
+                        "object_type": "RIB_SIRIP",
+                        "is_rib_present": True,
+                        "is_ok": (self.current_rib_status == "OK"),
+                        "is_ng": (self.current_rib_status == "NG"),
+                        "ng_severity": _buf_sev,
+                        "is_coasting": False,
+                        "rib_count": self.rib_count,
+                        "ok_count": self.ok_count,
+                        "ng_count": self.ng_count,
+                        "mode": self.mode,
+                        "tracker_engine": self.tracker_engine,
+                        "message": f"Sirip dalam transit (Buffer {self.absence_frames}/{self.max_absence_tolerance})",
+                        "detection_reason": "Transit Hysteresis",
+                        "confidence": float(yolo_conf if yolo_conf > 0 else 0.0),
+                        "pv_flatness": _buf_pv,
+                        "sagitta": _buf_sag,
+                        "max_deviation": 0.0,
+                        "inner_dev": _buf_idev,
+                        "tip_dev": _buf_tdev,
+                        "coverage": 1.0,
+                        "active_box": self._last_active_box,
+                        "locked_boxes": [list(b) for b in getattr(self, "_locked_ui_boxes", [])],
+                        "zone_rect": zone_rect,
+                        "yolo_boxes": all_yolo_boxes,
+                        "pre_gate_rib_boxes": list(getattr(self, "_last_pre_gate_rib_boxes", [])),
+                        "elapsed_ms": (time.time() - t0) * 1000
+                    }
 
             is_candidate = yolo_det
-            if not reason:
-                reason = f"HYBRID: YOLO({yolo_conf:.2f})" if self.mode == "HYBRID" else f"YOLO ONLY: Conf={yolo_conf:.2f}"
         else:  # DUAL_POLARITY_ONLY
+            self._is_coasting_active = False
+            self._locked_ui_boxes = []
             is_candidate = dual_det
             reason = f"DUAL-POLARITY ONLY: Ratio={dual_ratio*100:.0f}%, H={dual_h:.0f}px"
             active_box = dual_box
@@ -4055,21 +4766,22 @@ class HybridRibInspector:
                 is_candidate = False
                 active_box = None
 
-        # Deteksi Transisi Bilah Fisik Baru (Spatial Centroid Continuity)
+        # Deteksi Transisi Bilah Fisik Baru & Pembaruan Lebar Foreground
         if active_box is not None:
             curr_cy = (active_box[1] + active_box[3]) // 2
-            if getattr(self, "_last_active_cy", None) is not None:
+            if self.mode == "DUAL_POLARITY_ONLY" and getattr(self, "_last_active_cy", None) is not None:
                 delta_y = abs(curr_cy - self._last_active_cy)
-                # Ambang transisi bilah baru diskalakan ke resolusi aktual frame (~52px @1080p, ~35px @720p)
                 if delta_y > max(32.0, 52.0 * scale_y):
-                    self._last_tracked_bw = None
                     self._reset_rib_session(exited_gate=True)
-            self._session_max_yolo_conf = max(
-                float(getattr(self, "_session_max_yolo_conf", 0.0)),
-                float(yolo_conf or 0.0),
-            )
+            if not getattr(self, "_is_coasting_active", False):
+                self._session_max_yolo_conf = max(
+                    float(getattr(self, "_session_max_yolo_conf", 0.0)),
+                    float(yolo_conf or 0.0),
+                )
             _obs_bw = float(active_box[2] - active_box[0])
-            if _obs_bw >= (0.24 * w_f):
+            _fg_y_floor = max(zy1 + int(round(12 * scale_y)), eff_prime_min_y - int(round(16 * scale_y)))
+            _in_fg_width_zone = (active_box[1] >= _fg_y_floor) and (curr_cy >= int(round(0.42 * (zy1 + zy2))))
+            if _obs_bw >= (0.24 * w_f) and _in_fg_width_zone and not getattr(self, "_is_coasting_active", False):
                 if self.active_rib_frames >= 3 or (yolo_conf or 0.0) >= 0.72:
                     if self._observed_rib_w_ema is None:
                         self._observed_rib_w_ema = _obs_bw
@@ -4099,58 +4811,60 @@ class HybridRibInspector:
                 ):
                     exited_gate = True
 
-            if self.active_rib_frames > 0 and not exited_gate:
-                self.absence_frames += 1
-                if self.absence_frames < self.max_absence_tolerance:
-                    # Hysteresis buffer: Tahan sesi transit aktif (mencegah fragmentasi akibat flicker 1-5 frame)
-                    _buf_pv = float(np.median(self.prime_pv_samples)) if self.prime_pv_samples else 0.0
-                    _buf_sag = float(np.median(self.prime_sagitta_samples)) if self.prime_sagitta_samples else 0.0
-                    _buf_idev = float(np.median(self.prime_inner_dev_samples)) if self.prime_inner_dev_samples else 0.0
-                    _buf_tdev = float(np.median(self.prime_tip_dev_samples)) if self.prime_tip_dev_samples else 0.0
-                    _buf_sev = self.compute_ng_severity(
-                        _buf_pv, _buf_sag, _buf_idev, _buf_tdev,
-                        is_ng=(self.current_rib_status == "NG")
-                    ) if self.current_rib_status == "NG" else "OK"
-                    return {
-                        "status": self.current_rib_status if self.current_rib_status else "WAIT",
-                        "object_type": "RIB_SIRIP",
-                        "is_rib_present": True,
-                        "is_ok": (self.current_rib_status == "OK"),
-                        "is_ng": (self.current_rib_status == "NG"),
-                        "ng_severity": _buf_sev,
-                        "rib_count": self.rib_count,
-                        "ok_count": self.ok_count,
-                        "ng_count": self.ng_count,
-                        "mode": self.mode,
-                        "tracker_engine": self.tracker_engine,
-                        "message": f"Sirip dalam transit (Buffer {self.absence_frames}/{self.max_absence_tolerance})",
-                        "detection_reason": "Transit Hysteresis",
-                        "confidence": float(yolo_conf if yolo_conf > 0 else (dual_ratio if self.mode == "DUAL_POLARITY_ONLY" else 0.0)),
-                        "pv_flatness": _buf_pv,
-                        "sagitta": _buf_sag,
-                        "max_deviation": 0.0,
-                        "inner_dev": _buf_idev,
-                        "tip_dev": _buf_tdev,
-                        "coverage": 1.0,
-                        "active_box": self._last_active_box if self._last_active_box is not None else active_box,
-                        "zone_rect": zone_rect,
-                        "yolo_boxes": all_yolo_boxes,
-                        "pre_gate_rib_boxes": list(getattr(self, "_last_pre_gate_rib_boxes", [])),
-                        "elapsed_ms": (time.time() - t0) * 1000
-                    }
+            if self.mode == "DUAL_POLARITY_ONLY":
+                if self.active_rib_frames > 0 and not exited_gate:
+                    self.absence_frames += 1
+                    if self.absence_frames < self.max_absence_tolerance:
+                        _buf_pv = float(np.median(self.prime_pv_samples)) if self.prime_pv_samples else 0.0
+                        _buf_sag = float(np.median(self.prime_sagitta_samples)) if self.prime_sagitta_samples else 0.0
+                        _buf_idev = float(np.median(self.prime_inner_dev_samples)) if self.prime_inner_dev_samples else 0.0
+                        _buf_tdev = float(np.median(self.prime_tip_dev_samples)) if self.prime_tip_dev_samples else 0.0
+                        _buf_sev = self.compute_ng_severity(
+                            _buf_pv, _buf_sag, _buf_idev, _buf_tdev,
+                            is_ng=(self.current_rib_status == "NG")
+                        ) if self.current_rib_status == "NG" else "OK"
+                        return {
+                            "status": self.current_rib_status if self.current_rib_status else "WAIT",
+                            "object_type": "RIB_SIRIP",
+                            "is_rib_present": True,
+                            "is_ok": (self.current_rib_status == "OK"),
+                            "is_ng": (self.current_rib_status == "NG"),
+                            "ng_severity": _buf_sev,
+                            "is_coasting": False,
+                            "rib_count": self.rib_count,
+                            "ok_count": self.ok_count,
+                            "ng_count": self.ng_count,
+                            "mode": self.mode,
+                            "tracker_engine": self.tracker_engine,
+                            "message": f"Sirip dalam transit (Buffer {self.absence_frames}/{self.max_absence_tolerance})",
+                            "detection_reason": "Transit Hysteresis",
+                            "confidence": float(dual_ratio if dual_ratio > 0 else 0.0),
+                            "pv_flatness": _buf_pv,
+                            "sagitta": _buf_sag,
+                            "max_deviation": 0.0,
+                            "inner_dev": _buf_idev,
+                            "tip_dev": _buf_tdev,
+                            "coverage": 1.0,
+                            "active_box": self._last_active_box if self._last_active_box is not None else active_box,
+                            "locked_boxes": [],
+                            "zone_rect": zone_rect,
+                            "yolo_boxes": all_yolo_boxes,
+                            "pre_gate_rib_boxes": list(getattr(self, "_last_pre_gate_rib_boxes", [])),
+                            "elapsed_ms": (time.time() - t0) * 1000
+                        }
+                did_exit = bool(exited_gate or getattr(self, "_session_valid_span_frames", 0) >= 5)
+                self._reset_rib_session(exited_gate=did_exit)
+            elif getattr(self, "_focused_slot_id", None) is None and (self.active_rib_frames > 0 or self._last_active_cy is not None):
+                did_exit = bool(exited_gate or getattr(self, "_session_valid_span_frames", 0) >= 5)
+                self._reset_rib_session(exited_gate=did_exit)
 
-            # Sesi transit benar-benar berakhir (> 8 frame kosong antar bilah)
-            did_exit = bool(exited_gate or getattr(self, "_session_valid_span_frames", 0) >= 5)
-            self._last_active_cy = None
-            self._last_active_box = None
-            self._last_tracked_bw = None
-            self._reset_rib_session(exited_gate=did_exit)
             return {
                 "status": "WAIT",
                 "object_type": "PLAT_DATAR",
                 "is_rib_present": False,
                 "is_ok": False,
                 "is_ng": False,
+                "is_coasting": False,
                 "rib_count": self.rib_count,
                 "ok_count": self.ok_count,
                 "ng_count": self.ng_count,
@@ -4166,6 +4880,7 @@ class HybridRibInspector:
                 "tip_dev": 0.0,
                 "coverage": 0.0,
                 "active_box": None,
+                "locked_boxes": [list(b) for b in getattr(self, "_locked_ui_boxes", [])],
                 "zone_rect": zone_rect,
                 "yolo_boxes": all_yolo_boxes,
                 "pre_gate_rib_boxes": list(getattr(self, "_last_pre_gate_rib_boxes", [])),
@@ -4542,8 +5257,9 @@ class HybridRibInspector:
                         "yolo_boxes": all_yolo_boxes,
                         "elapsed_ms": (time.time() - t0) * 1000
                     }
-            self._last_active_cy = None
-            self._last_active_box = None
+            if getattr(self, "_focused_slot_id", None) is not None and getattr(self, "_rib_slots", None):
+                self._rib_slots = [s for s in self._rib_slots if s["slot_id"] != self._focused_slot_id]
+                self._focused_slot_id = None
             self._reset_rib_session()
             return {
                 "status": "WAIT",
@@ -4551,6 +5267,7 @@ class HybridRibInspector:
                 "is_rib_present": False,
                 "is_ok": False,
                 "is_ng": False,
+                "is_coasting": False,
                 "rib_count": self.rib_count,
                 "mode": self.mode,
                 "tracker_engine": self.tracker_engine,
@@ -4563,6 +5280,7 @@ class HybridRibInspector:
                 "tip_dev": 0.0,
                 "coverage": coverage,
                 "active_box": None,
+                "locked_boxes": [list(b) for b in getattr(self, "_locked_ui_boxes", [])],
                 "zone_rect": zone_rect,
                 "yolo_boxes": all_yolo_boxes,
                 "elapsed_ms": (time.time() - t0) * 1000
@@ -4922,9 +5640,18 @@ class HybridRibInspector:
                     and float(w_span) < 0.88 * float(self._session_max_bw)
                 )
                 _sample_quality_ok = (not _is_coasting) and (not _is_low_conf_sample) and (not _is_truncated_span)
+                self._last_frame_w = int(w_f)
+                if w_span > 0:
+                    self._session_max_span_px = max(float(getattr(self, "_session_max_span_px", 0.0)), float(w_span))
                 if is_in_prime and not lock_upper_tunnel_samples and _sample_quality_ok:
                     _prof_85 = self._detrend_profile_85(smooth_ys) if self._prime_warmup_frames >= 2 else None
-                    self._record_prime_sample(pv, sagitta, inner_dev, tip_dev, profile_85=_prof_85)
+                    _ref_w = max(240.0, float(getattr(self, "_session_max_bw", 0.0) or (0.64 * w_f)))
+                    _span_comp = float(np.clip(float(w_span) / _ref_w, 0.45, 1.0))
+                    _conf_w = float(yolo_conf if (yolo_conf and yolo_conf > 0) else 0.75)
+                    _sample_w = float(np.clip(_conf_w * _span_comp, 0.25, 1.0))
+                    self._record_prime_sample(
+                        pv, sagitta, inner_dev, tip_dev, profile_85=_prof_85, sample_weight=_sample_w
+                    )
 
         # KONSENSUS METROLOGI PRIME ZONE
         res_scale = float(np.clip(1080.0 / float(max(240, h_f)), 0.75, 1.80))
@@ -5058,9 +5785,10 @@ class HybridRibInspector:
             transit_is_ok = not (curv_defect or dev_defect or tip_defect or flat_defect)
 
         # Pembaruan suara konsensus & transisi status hanya diizinkan saat bilah berada di dalam
-        # Prime Zone dengan span utuh dan belum masuk lorong jauh, sehingga distorsi saat keluar tidak membalik vonis.
+        # Prime Zone dengan span utuh, bukan saat coasting, dan belum masuk lorong jauh.
+        is_coasting_now = bool(getattr(self, "_is_coasting_active", False) or getattr(self, "_kinematic_coasting_frames", 0) > 0)
         can_update_vote = self._update_prime_consensus_vote(
-            (is_in_prime and not lock_upper_tunnel_samples),
+            (is_in_prime and not lock_upper_tunnel_samples and not is_coasting_now),
             full_span_valid,
             sample_count,
             min_samples_required,
@@ -5160,6 +5888,24 @@ class HybridRibInspector:
         # Perbarui active_box vertikal agar mengunci tepat di badan bilah sirip (bukan celah slat)
         refined_box = [search_x1, max(0, med_top_y - _pad_top), search_x2, min(h_f - 1, med_top_y + _disp_h)]
 
+        # Sinkronkan kembali state fokus aktif ke RibTrackSlot persisten
+        f_id_sync = getattr(self, "_focused_slot_id", None)
+        if f_id_sync is not None and getattr(self, "_rib_slots", None):
+            for _sl in self._rib_slots:
+                if _sl["slot_id"] == f_id_sync:
+                    _sl["state"] = self._snapshot_session_state()
+                    if self.current_rib_status in ("OK", "NG"):
+                        _sl["assigned_rib_no"] = self.rib_count
+                        if lock_upper_tunnel_samples or (
+                            _sl.get("vy_ema", -2.0) <= 0.15 and active_box is not None and active_box[1] < eff_prime_min_y
+                        ):
+                            _sl["phase"] = "EVALUATED_LOCKED"
+                        elif is_in_prime:
+                            _sl["phase"] = "PRIME"
+                    elif is_in_prime and _sl["phase"] == "ENTERING":
+                        _sl["phase"] = "PRIME"
+                    break
+
         return {
             "status": status,
             "object_type": "RIB_SIRIP",
@@ -5167,6 +5913,7 @@ class HybridRibInspector:
             "is_ok": (status == "OK"),
             "is_ng": (status == "NG"),
             "ng_severity": ng_severity,          # 'OK' | 'LOW' | 'MEDIUM' | 'HIGH'
+            "is_coasting": bool(is_coasting_now),
             "final_consensus_ready": bool(sample_count >= min_samples_required and self.current_rib_status is not None),
             "is_final_verdict": bool(self._session_committed),
             "committed_rib_id": self._last_finalized_rib_id,
@@ -5181,7 +5928,7 @@ class HybridRibInspector:
             "confidence": float(yolo_conf if yolo_conf > 0 else (dual_ratio if self.mode == "DUAL_POLARITY_ONLY" else 0.0)),
             "pv_flatness": eval_pv,
             "sagitta": eval_sag,
-            "max_deviation": max_dev,
+            "max_deviation": 0.0 if is_coasting_now else max_dev,
             "inner_dev": eval_idev,
             "tip_dev": eval_tdev,
             "ng_prob": ng_prob,
@@ -5195,6 +5942,7 @@ class HybridRibInspector:
             "active_rib_frames": self.active_rib_frames,
             "rib_height": 110,
             "active_box": refined_box,
+            "locked_boxes": [list(b) for b in getattr(self, "_locked_ui_boxes", [])],
             "zone_rect": zone_rect,
             "xs_contour": r_xs,
             "ys_contour": smooth_ys,
@@ -5239,6 +5987,14 @@ class HybridRibInspector:
         cv2.polylines(vis, [quad_pts], isClosed=True, color=(255, 180, 0), thickness=2, lineType=cv2.LINE_AA)
         cv2.putText(vis, f"ZONA PERSPECTIVE TRANSFORM (TILT: {self.unwarp_tilt:.1f}x | Y: {self.unwarp_y_top*100:.0f}%-{self.unwarp_y_bot*100:.0f}%)", (int(x_tl) + 6, int(y_top) - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 200, 0), 1, cv2.LINE_AA)
+
+        # 1c. Gambar indikator pasif tipis khusus Plat A yang sudah [LOCKED] saat keluar ROI (~0.02 ms)
+        for lb in (res.get("locked_boxes") or [])[:1]:
+            if lb and len(lb) >= 4:
+                lx1, ly1, lx2, ly2 = [int(v) for v in lb[:4]]
+                cv2.rectangle(vis, (lx1, ly1), (lx2, ly2), (160, 175, 190), 1, cv2.LINE_AA)
+                cv2.putText(vis, "LOCKED", (lx1, max(18, ly1 - 5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 175, 190), 1, cv2.LINE_AA)
 
         # 2. Jika Status WAIT (Plat Datar Sedang Melintas)
         if status == "WAIT" or not res.get("is_rib_present", False):
