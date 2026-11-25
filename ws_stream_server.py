@@ -13,7 +13,7 @@ import socket
 import struct
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -78,6 +78,22 @@ class CameraFrameHub:
                 "fps": float(fps),
                 "inspector_meta": inspector_meta or {},
                 "legacy_frame": legacy_frame,
+                "preencoded_packet": None,
+            }
+
+    def publish_encoded(self, cam_id: str, meta: dict[str, Any], jpeg_bytes: bytes) -> None:
+        """Store an already-encoded binary packet for `cam_id` (used by hybrid multiprocess workers)."""
+        packet = encode_ws_binary_packet(meta, jpeg_bytes)
+        with self._lock:
+            prev_seq = self._slots.get(cam_id, {}).get("seq", 0)
+            self._slots[cam_id] = {
+                "seq": prev_seq + 1,
+                "raw_frame": None,
+                "result": {},
+                "fps": float(meta.get("fps", 0.0) or 0.0),
+                "inspector_meta": {},
+                "legacy_frame": None,
+                "preencoded_packet": packet,
             }
 
     def snapshot_if_newer(self, cam_id: str, last_seq: int) -> tuple[int, dict[str, Any] | None]:
@@ -205,7 +221,7 @@ def render_clean_side_360p(
     return canvas
 
 
-def _build_stream_metadata(cam_id: str, slot: dict[str, Any]) -> dict[str, Any]:
+def build_stream_metadata(cam_id: str, slot: dict[str, Any]) -> dict[str, Any]:
     """Build compact JSON telemetry header for a camera frame."""
     res = slot.get("result") or {}
     ins_meta = slot.get("inspector_meta") or {}
@@ -272,6 +288,8 @@ class WebSocketStreamServer:
         max_fps: float = 0.0,
         hud_mode: str = "clean",
         jpeg_quality: int = 65,
+        on_client_count_change: Callable[[int], None] | None = None,
+        on_overlay_change: Callable[[bool], None] | None = None,
     ) -> None:
         self.hub = hub
         self.host = host
@@ -280,6 +298,8 @@ class WebSocketStreamServer:
         self.max_fps = max(0.0, float(max_fps))
         self.hud_mode = "legacy" if str(hud_mode).lower() == "legacy" else "clean"
         self.jpeg_quality = int(max(30, min(95, int(jpeg_quality))))
+        self._on_client_count_change = on_client_count_change
+        self._on_overlay_change = on_overlay_change
 
         self._overlay_lock = threading.Lock()
         self._show_overlay = True
@@ -314,6 +334,12 @@ class WebSocketStreamServer:
     def show_overlay(self, value: bool) -> None:
         with self._overlay_lock:
             self._show_overlay = bool(value)
+            val = self._show_overlay
+        if self._on_overlay_change is not None:
+            try:
+                self._on_overlay_change(val)
+            except Exception:
+                pass
 
     def start(self) -> bool:
         """Start the WebSocket server thread. Returns False without raising on error."""
@@ -374,6 +400,11 @@ class WebSocketStreamServer:
 
     async def _handle_client(self, websocket: Any) -> None:
         self._clients.add(websocket)
+        if self._on_client_count_change is not None:
+            try:
+                self._on_client_count_change(len(self._clients))
+            except Exception:
+                pass
         try:
             sock = websocket.transport.get_extra_info("socket") if websocket.transport else None
             if sock is not None:
@@ -393,8 +424,18 @@ class WebSocketStreamServer:
             pass
         finally:
             self._clients.discard(websocket)
+            if self._on_client_count_change is not None:
+                try:
+                    self._on_client_count_change(len(self._clients))
+                except Exception:
+                    pass
 
     def _encode_slot(self, cam_id: str, slot: dict[str, Any]) -> bytes | None:
+        preencoded = slot.get("preencoded_packet")
+        if preencoded is not None:
+            self._encoded_frame_count += 1
+            return preencoded
+
         raw_frame = slot.get("raw_frame")
         if raw_frame is None:
             return None
@@ -426,7 +467,7 @@ class WebSocketStreamServer:
         if not ok:
             return None
         self._encoded_frame_count += 1
-        meta = _build_stream_metadata(cam_id, slot)
+        meta = build_stream_metadata(cam_id, slot)
         return encode_ws_binary_packet(meta, jb.tobytes())
 
     async def _send_safe(self, ws: Any, packet: bytes) -> None:

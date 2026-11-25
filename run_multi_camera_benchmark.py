@@ -859,7 +859,13 @@ def _run_top_worker(
     frames_val,
     latency_val,
     status_buf,
-    gui_fps=22.0
+    gui_fps=22.0,
+    start_time=None,
+    ws_top_queue=None,
+    ws_clients_val=None,
+    ws_overlay_val=None,
+    ws_hud_mode="clean",
+    ws_fps=0.0,
 ):
     """Worker proses terisolasi untuk CAM-01 Top Inspection (Plat & Rib)."""
     # Bersihkan cache VRAM PyTorch sebelum proses inferensi dimulai
@@ -932,6 +938,18 @@ def _run_top_worker(
     dataset_previous = None
     total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
 
+    if start_time and (not is_cam) and total_frames_top > 0:
+        s_sec = parse_time_to_seconds(start_time)
+        if s_sec is not None:
+            v_fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+            if v_fps <= 5.0 or v_fps > 120.0:
+                v_fps = 30.0
+            init_f = int(np.clip(round(s_sec * v_fps), 0, total_frames_top - 1))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, init_f)
+
+    last_ws_push = 0.0
+    ws_interval = (1.0 / ws_fps) if (ws_fps and ws_fps > 0) else 0.0
+
     _torch = None
     try:
         import torch as _torch_mod
@@ -992,6 +1010,48 @@ def _run_top_worker(
             latency_val.value = latency_ms
             curr_stat = inspect_res.get("status", "WAIT")
             status_buf.value = curr_stat.encode("utf-8")[:63]
+
+            # Push encoded frame ke WebSocket relay HANYA jika ada client browser aktif (Zero-Client Sleep)
+            if ws_top_queue is not None and ws_clients_val is not None and ws_clients_val.value > 0:
+                t_ws_now = time.perf_counter()
+                if ws_interval <= 0.0 or (t_ws_now - last_ws_push) >= ws_interval:
+                    last_ws_push = t_ws_now
+                    try:
+                        from ws_stream_server import build_stream_metadata, render_clean_top_360p
+
+                        show_ov = bool(ws_overlay_val.value if ws_overlay_val is not None else 1)
+                        if str(ws_hud_mode).lower() == "legacy":
+                            leg_h = inspector.render_combined_dashboard(
+                                frame=frame,
+                                inspect_result=inspect_res,
+                                fps=avg_fps,
+                                frame_idx=frame_count,
+                                total_frames=total_frames_top,
+                            )
+                            ws_img = cv2.resize(leg_h, (640, 524), interpolation=cv2.INTER_AREA)
+                        else:
+                            ws_img = render_clean_top_360p(frame, inspect_res, show_overlay=show_ov)
+                        ok_j, jb = cv2.imencode(".jpg", ws_img, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                        if ok_j:
+                            meta_t = build_stream_metadata(
+                                "CAM-01",
+                                {
+                                    "result": inspect_res,
+                                    "fps": avg_fps,
+                                    "inspector_meta": {
+                                        "slat_no": getattr(inspector.slat_inspector, "slat_count", None),
+                                        "rib_no": getattr(inspector.rib_inspector, "rib_count", None),
+                                    },
+                                },
+                            )
+                            if ws_top_queue.full():
+                                try:
+                                    ws_top_queue.get_nowait()
+                                except Exception:
+                                    pass
+                            ws_top_queue.put_nowait((meta_t, jb.tobytes()))
+                    except Exception:
+                        pass
 
             hud_cache = {}
             dataset_last_rib_no, dataset_previous = record_rib_dataset_step(
@@ -1531,7 +1591,7 @@ def _run_threaded_engine(args):
     is_cam_top = False
     top_source_path = args.top_source
 
-    if args.mode in ["dual", "headless", "top-only"]:
+    if args.mode in ["dual", "headless", "web", "top-only"]:
         print("[*] Menginisialisasi Top Inspector (CAM-01 Slat & Rib)...")
         try:
             top_inspector = CombinedTopInspector(
@@ -1568,7 +1628,7 @@ def _run_threaded_engine(args):
     is_cam_side = False
     side_source_path = args.side_source
 
-    if args.mode in ["dual", "headless", "side-only"]:
+    if args.mode in ["dual", "headless", "web", "side-only"]:
         print(f"[*] Menginisialisasi Side Inspector ({args.side_cam_id} {args.side_name})...")
         try:
             side_inspector = SideConveyorInspector(
@@ -1638,7 +1698,7 @@ def _run_threaded_engine(args):
     side_left_cam_id = "CAM-03" if str(args.side_cam_id).upper() != "CAM-03" else "CAM-02"
     side_left_side_name = "LEFT" if side_left_cam_id == "CAM-03" else "RIGHT"
 
-    if args.mode in ["dual", "headless"] and (getattr(args, "ws_stream", False) or side_left_source_path):
+    if args.mode in ["dual", "headless", "web"] and (getattr(args, "ws_stream", False) or side_left_source_path):
         print(f"[*] Menginisialisasi Side Inspector ke-2 ({side_left_cam_id} {side_left_side_name})...")
         try:
             side_left_inspector = SideConveyorInspector(
@@ -2023,7 +2083,7 @@ def _run_threaded_engine(args):
                     ws_server is not None and ws_server.hud_mode == "legacy" and ws_server.client_count > 0
                 )
                 need_side_render = (
-                    (args.mode != "headless" and (t_infer_start - last_render_side) >= gui_interval)
+                    (args.mode not in ("headless", "web") and (t_infer_start - last_render_side) >= gui_interval)
                     or (side_db_bridge is not None and side_db_bridge.is_enabled())
                     or ws_needs_legacy
                 )
@@ -2187,7 +2247,7 @@ def _run_threaded_engine(args):
         _request_seek_frames(int(round(float(sec_val) * top_video_fps)), sync_side=True)
 
     def _sync_top_trackbar_setup():
-        if args.mode == "headless" or top_inspector is None:
+        if args.mode in ("headless", "web") or top_inspector is None:
             return
         if (not is_cam_top) and total_f_top > 0:
             max_sec = max(1, int(total_f_top / max(1e-5, top_video_fps)))
@@ -2210,7 +2270,7 @@ def _run_threaded_engine(args):
             nav_state["is_scanning_idle"] = False
         _sync_top_trackbar_setup()
 
-    if args.mode != "headless":
+    if args.mode not in ("headless", "web"):
         if top_inspector is not None:
             cv2.namedWindow(win_top, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(win_top, 920, 518)
@@ -2258,7 +2318,7 @@ def _run_threaded_engine(args):
 
             # Render GUI OpenCV di Main Thread (Decoupled GUI Rendering Sejati - Bebas GIL dari Thread AI)
             key = -1
-            if args.mode != "headless":
+            if args.mode not in ("headless", "web"):
                 if (now - last_gui_render) >= gui_interval:
                     last_gui_render = now
                     if top_inspector is not None:
@@ -2605,7 +2665,7 @@ def _run_threaded_engine(args):
             side_db_bridge.close()
         if side_left_db_bridge is not None:
             side_left_db_bridge.close()
-        if args.mode != "headless":
+        if args.mode not in ("headless", "web"):
             cv2.destroyAllWindows()
         if csv_file is not None:
             csv_file.close()
@@ -2621,9 +2681,9 @@ def _run_threaded_engine(args):
     print("📊 LAPORAN AKHIR HASIL BENCHMARK MULTI-KAMERA")
     print("=" * 86)
     print(f"  • Total Waktu Pengujian     : {total_elapsed:.1f} detik")
-    if args.mode in ["dual", "headless", "top-only"]:
+    if args.mode in ["dual", "headless", "web", "top-only"]:
         print(f"  • CAM-01 Top (Slat & Rib)   : {f_top} frames ({avg_top_fps:.1f} rata-rata FPS)")
-    if args.mode in ["dual", "headless", "side-only"]:
+    if args.mode in ["dual", "headless", "web", "side-only"]:
         print(f"  • {args.side_cam_id} Side (Bolt & Pin)  : {f_side} frames ({avg_side_fps:.1f} rata-rata FPS)")
     if side_inspector is not None:
         s_ok = getattr(side_inspector, 'slat_ok_count', getattr(side_inspector, 'stats', {}).get('ok_count', 0))
@@ -2653,6 +2713,401 @@ def _run_threaded_engine(args):
 # ======================================================================================
 # MASTER ORCHESTRATOR & BENCHMARK SUPERVISOR
 # ======================================================================================
+# ======================================================================================
+# HYBRID 2-PROCESS ENGINE (CAM-01 BEBAS GIL DI PROSES 1 + CAM-02/03 & WS DI PROSES 2)
+# ======================================================================================
+def _run_hybrid_engine(args):
+    """
+    Runner Hybrid 2-Proses:
+    - Proses 1 (Terisolasi): Menjalankan CAM-01 Top Inspection bebas dari Python GIL agar FPS tetap ~20+.
+    - Proses 2 (Koordinator): Menjalankan CAM-02 RH + CAM-03 LH (berbagi VRAM/GIL ringan) dan
+      melayani WebSocket Stream Server (:8765) ke Frontend Web.
+    """
+    import cv2
+    import numpy as np
+    import queue as _queue
+    import threading
+
+    if SIDE_SRC_DIR not in sys.path:
+        sys.path.insert(0, SIDE_SRC_DIR)
+    _ensure_db_bridge_on_path()
+
+    from side_inspector_pipeline import SideConveyorInspector
+    try:
+        from db_bridge import InspectionDBBridge
+    except ImportError:
+        InspectionDBBridge = None
+
+    configure_windows_process_performance()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.set_per_process_memory_fraction(0.45, device=0)
+            except Exception:
+                pass
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    stop_event = mp.Event()
+    fps_top = mp.Value("d", 0.0)
+    frames_top = mp.Value("i", 0)
+    lat_top = mp.Value("d", 0.0)
+    stat_top = mp.Array("c", 64)
+    stat_top.value = b"STARTING"
+
+    ws_clients_val = mp.Value("i", 0)
+    ws_overlay_val = mp.Value("i", 1)
+    ws_top_queue = mp.Queue(maxsize=2) if getattr(args, "ws_stream", False) else None
+
+    ws_hub = None
+    ws_server = None
+    if getattr(args, "ws_stream", False):
+        try:
+            from ws_stream_server import CameraFrameHub, WebSocketStreamServer
+
+            ws_hub = CameraFrameHub()
+
+            def _on_clients(cnt):
+                ws_clients_val.value = int(cnt)
+
+            def _on_overlay(val):
+                ws_overlay_val.value = 1 if val else 0
+
+            ws_server = WebSocketStreamServer(
+                ws_hub,
+                port=int(getattr(args, "ws_port", 8765) or 8765),
+                max_fps=float(getattr(args, "ws_fps", 0.0) or 0.0),
+                hud_mode=str(getattr(args, "ws_hud_mode", "clean") or "clean"),
+                on_client_count_change=_on_clients,
+                on_overlay_change=_on_overlay,
+            )
+            if not ws_server.start():
+                ws_server = None
+        except Exception as e_ws:
+            print(f"[WARN WS-STREAM] Gagal menginisialisasi WebSocket server (hybrid): {e_ws}")
+            ws_hub = None
+            ws_server = None
+
+    p_top = None
+    if args.mode in ["dual", "headless", "web", "top-only"]:
+        p_top = mp.Process(
+            target=_run_top_worker,
+            args=(
+                args.top_source,
+                "dual" if args.mode == "dual" else "headless",
+                args.rib_mode,
+                args.device,
+                args.enable_db,
+                stop_event,
+                fps_top,
+                frames_top,
+                lat_top,
+                stat_top,
+                args.gui_fps,
+            ),
+            kwargs={
+                "start_time": getattr(args, "start_time", None),
+                "ws_top_queue": ws_top_queue,
+                "ws_clients_val": ws_clients_val,
+                "ws_overlay_val": ws_overlay_val,
+                "ws_hud_mode": getattr(args, "ws_hud_mode", "clean"),
+                "ws_fps": float(getattr(args, "ws_fps", 0.0) or 0.0),
+            },
+            name="Worker-TopInspector-Hybrid",
+        )
+        p_top.start()
+        print(f"[*] Sub-proses [TOP CAM-01] terisolasi di-spawn | PID: {p_top.pid}")
+
+    # Inisialisasi CAM-02 & CAM-03 di proses Koordinator
+    side_workers = []
+    side_lock = threading.Lock()
+    side_state = {"fps": 0.0, "latency": 0.0, "status": "STARTING", "frames": 0, "display": None, "has_new": False}
+
+    def _init_side(cam_id, side_name, raw_src):
+        ins = SideConveyorInspector(camera_id=cam_id, side=side_name, device=args.device)
+        dbb = InspectionDBBridge(enabled=args.enable_db, camera_id=cam_id) if InspectionDBBridge else None
+        cand = raw_src or args.side_source or DEFAULT_SIDE_VIDEO
+        if cand and not is_usable_source(cand):
+            cand = resolve_source_path(cand) or DEFAULT_SIDE_VIDEO
+        cap, is_cam, resolved = create_capture(cand)
+        if (not cap.isOpened()) and DEFAULT_SIDE_VIDEO and os.path.exists(DEFAULT_SIDE_VIDEO):
+            cap, is_cam, resolved = create_capture(DEFAULT_SIDE_VIDEO)
+        if getattr(ins, "auto_preset_mode", True) and resolved:
+            ins.set_preset(ins.resolve_preset_from_source(resolved), verbose=True)
+        seek_frame = 0
+        if getattr(args, "start_time", None) and (not is_cam) and cap.isOpened():
+            s_sec = parse_time_to_seconds(args.start_time)
+            tot_f = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            v_fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+            if s_sec is not None and tot_f > 0:
+                seek_frame = int(np.clip(round(s_sec * (v_fps if 5 <= v_fps <= 120 else 30.0)), 0, tot_f - 1))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, seek_frame)
+        if cap.isOpened():
+            ok_w, fw = cap.read()
+            if ok_w and fw is not None:
+                ins.process_frame(fw, render_display=False)
+                if not is_cam:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, seek_frame)
+        return {"cam_id": cam_id, "ins": ins, "dbb": dbb, "cap": cap, "is_cam": is_cam}
+
+    if args.mode in ["dual", "headless", "web", "side-only"]:
+        print(f"[*] Menginisialisasi Side Inspector ({args.side_cam_id} {args.side_name})...")
+        side_workers.append(_init_side(args.side_cam_id, args.side_name, args.side_source))
+        side_left_src = getattr(args, "side_left_source", None)
+        if args.mode in ["dual", "headless", "web"] and (getattr(args, "ws_stream", False) or side_left_src):
+            cam3_id = "CAM-03" if str(args.side_cam_id).upper() != "CAM-03" else "CAM-02"
+            cam3_side = "LEFT" if cam3_id == "CAM-03" else "RIGHT"
+            print(f"[*] Menginisialisasi Side Inspector ke-2 ({cam3_id} {cam3_side})...")
+            side_workers.append(_init_side(cam3_id, cam3_side, side_left_src or args.side_source))
+
+    cuda_streams = []
+    try:
+        import torch
+        if torch.cuda.is_available() and args.device != "cpu":
+            torch.backends.cudnn.benchmark = True
+            cuda_streams = [torch.cuda.Stream() for _ in side_workers]
+    except Exception:
+        cuda_streams = [None for _ in side_workers]
+
+    gui_interval = (1.0 / args.gui_fps) if (args.gui_fps and args.gui_fps > 0) else 0.0
+
+    def _side_thread(idx, w):
+        cap = w["cap"]
+        ins = w["ins"]
+        dbb = w["dbb"]
+        is_cam = w["is_cam"]
+        cam_id = w["cam_id"]
+        cstream = cuda_streams[idx] if idx < len(cuda_streams) else None
+        is_primary = (idx == 0)
+        t_prev = time.time()
+        fps_hist = []
+        last_disp = 0.0
+
+        while not stop_event.is_set():
+            try:
+                if cap is None or not cap.isOpened():
+                    time.sleep(0.02)
+                    continue
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    if not is_cam:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ins.reset_session()
+                        ret, frame = cap.read()
+                        if not ret or frame is None:
+                            time.sleep(0.02)
+                            continue
+                    else:
+                        time.sleep(0.01)
+                        continue
+
+                t_inf0 = time.time()
+                ws_legacy = bool(ws_server is not None and ws_server.hud_mode == "legacy" and ws_server.client_count > 0)
+                need_render = (
+                    (is_primary and args.mode == "dual" and (t_inf0 - last_disp) >= gui_interval)
+                    or (dbb is not None and dbb.is_enabled())
+                    or ws_legacy
+                )
+                if cstream is not None:
+                    import torch
+                    with torch.cuda.stream(cstream), torch.inference_mode():
+                        disp, payload = ins.process_frame(frame, render_display=need_render)
+                else:
+                    disp, payload = ins.process_frame(frame, render_display=need_render)
+                if need_render:
+                    last_disp = t_inf0
+                t_end = time.time()
+                lat_ms = (t_end - t_inf0) * 1000.0
+                dt = t_end - t_prev
+                t_prev = t_end
+                fps_hist.append(1.0 / dt if dt > 0 else 30.0)
+                if len(fps_hist) > 30:
+                    fps_hist.pop(0)
+                avg_f = sum(fps_hist) / len(fps_hist)
+
+                if dbb is not None and dbb.is_enabled() and payload.get("should_emit", False) and payload.get("overall_result") == "NG":
+                    dbb.emit_side_inspection(
+                        frame_raw=payload.get("emit_raw_frame", frame),
+                        frame_ann=payload.get("emit_ann_frame", disp),
+                        side_payload=payload,
+                    )
+
+                if is_primary:
+                    with side_lock:
+                        side_state["frames"] += 1
+                        side_state["fps"] = avg_f
+                        side_state["latency"] = lat_ms
+                        side_state["status"] = payload.get("overall_result", "WAIT")
+                        if args.mode == "dual" and need_render:
+                            side_state["display"] = disp
+                            side_state["has_new"] = True
+
+                if ws_hub is not None:
+                    ws_hub.publish(
+                        cam_id,
+                        frame,
+                        payload,
+                        avg_f,
+                        inspector_meta={
+                            "master_roi": getattr(ins, "master_roi", None),
+                            "polygon_pts": getattr(ins, "polygon_pts", None),
+                        },
+                        legacy_frame=disp if ws_legacy else None,
+                    )
+            except Exception as e_sw:
+                print(f"[WARN Hybrid-{cam_id}] {e_sw}")
+                time.sleep(0.01)
+
+    def _top_ws_relay():
+        while not stop_event.is_set():
+            if ws_top_queue is None or ws_hub is None:
+                time.sleep(0.05)
+                continue
+            try:
+                meta_t, jpg_b = ws_top_queue.get(timeout=0.1)
+                ws_hub.publish_encoded("CAM-01", meta_t, jpg_b)
+            except _queue.Empty:
+                continue
+            except Exception:
+                time.sleep(0.01)
+
+    threads = []
+    if ws_top_queue is not None:
+        th_rel = threading.Thread(target=_top_ws_relay, daemon=True, name="Thread-TopWSRelay")
+        th_rel.start()
+        threads.append(th_rel)
+    for idx, w in enumerate(side_workers):
+        th_s = threading.Thread(target=_side_thread, args=(idx, w), daemon=True, name=f"Thread-Hybrid-{w['cam_id']}")
+        th_s.start()
+        threads.append(th_s)
+
+    win_side = f"{args.side_cam_id} SIDE [HYBRID] | [Q]: Keluar"
+    if args.mode == "dual" and side_workers:
+        cv2.namedWindow(win_side, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win_side, 920, 518)
+        cv2.moveWindow(win_side, 960, 40)
+
+    print("-" * 86)
+    print(f"{'WAKTU':^8} | {'CAM-01 TOP (FPS)':^18} | {f'{args.side_cam_id} SIDE (FPS)':^18} | {'COMBINED FPS':^14} | {'STATUS':^16}")
+    print("-" * 86)
+
+    csv_file = None
+    if args.record_csv:
+        try:
+            csv_file = open(args.record_csv, "w", encoding="utf-8")
+            csv_file.write("Timestamp,Elapsed_Sec,Top_FPS,Top_Latency_ms,Top_Frames,Side_FPS,Side_Latency_ms,Side_Frames,Combined_Throughput_FPS\n")
+        except Exception:
+            csv_file = None
+
+    t0 = None
+    last_print = 0.0
+    t_spawn = time.time()
+
+    try:
+        while not stop_event.is_set():
+            now = time.time()
+            if t0 is None:
+                if frames_top.value > 0 or side_state["frames"] > 0:
+                    t0 = now
+                else:
+                    if p_top is not None and not p_top.is_alive():
+                        stop_event.set()
+                        break
+                    time.sleep(0.05)
+                    continue
+
+            elapsed = now - t0
+            if args.duration > 0 and elapsed >= args.duration:
+                print(f"\n[*] Durasi benchmark {args.duration}s tercapai. Menghentikan...")
+                stop_event.set()
+                break
+
+            if p_top is not None and not p_top.is_alive() and not stop_event.is_set():
+                stop_event.set()
+                break
+
+            if args.mode == "dual" and side_workers:
+                with side_lock:
+                    has_new = side_state["has_new"]
+                    disp_s = side_state["display"]
+                    side_state["has_new"] = False
+                if has_new and disp_s is not None:
+                    cv2.imshow(win_side, disp_s)
+                if (cv2.waitKey(1) & 0xFF) in [ord("q"), ord("Q"), 27]:
+                    stop_event.set()
+                    break
+            else:
+                time.sleep(0.05)
+
+            if now - last_print >= 1.0:
+                last_print = now
+                v_top_fps = fps_top.value
+                v_top_lat = lat_top.value
+                f_top_cnt = frames_top.value
+                s_top = stat_top.value.decode("utf-8", errors="replace")
+                with side_lock:
+                    v_side_fps = side_state["fps"]
+                    v_side_lat = side_state["latency"]
+                    f_side_cnt = side_state["frames"]
+                    s_side = side_state["status"]
+                v_comb = v_top_fps + v_side_fps
+                print(
+                    f"{f'{int(elapsed):03d}s':^8} | "
+                    f"{v_top_fps:5.1f} FPS ({v_top_lat:4.1f}ms) | "
+                    f"{v_side_fps:5.1f} FPS ({v_side_lat:4.1f}ms) | "
+                    f"{v_comb:6.1f} FPS   | "
+                    f"{f'T:{s_top}|S:{s_side}':^16}"
+                )
+                if csv_file:
+                    ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    csv_file.write(
+                        f"{ts_now},{elapsed:.1f},{v_top_fps:.2f},{v_top_lat:.1f},{f_top_cnt},"
+                        f"{v_side_fps:.2f},{v_side_lat:.1f},{f_side_cnt},{v_comb:.2f}\n"
+                    )
+                    csv_file.flush()
+    except KeyboardInterrupt:
+        stop_event.set()
+    finally:
+        stop_event.set()
+        for th in threads:
+            th.join(timeout=2.0)
+        if p_top is not None:
+            p_top.join(timeout=3.0)
+            if p_top.is_alive():
+                p_top.terminate()
+        if ws_server is not None:
+            ws_server.stop()
+        for w in side_workers:
+            if w["cap"] is not None:
+                w["cap"].release()
+            if w["dbb"] is not None:
+                w["dbb"].close()
+        if args.mode == "dual":
+            cv2.destroyAllWindows()
+        if csv_file is not None:
+            csv_file.close()
+
+    total_elapsed = (time.time() - t0) if t0 is not None else (time.time() - t_spawn)
+    f_top = frames_top.value
+    f_side = side_state["frames"]
+    avg_top_fps = f_top / total_elapsed if total_elapsed > 0 else 0.0
+    avg_side_fps = f_side / total_elapsed if total_elapsed > 0 else 0.0
+
+    print("\n" + "=" * 86)
+    print("📊 LAPORAN AKHIR HASIL BENCHMARK MULTI-KAMERA (HYBRID 2-PROSES)")
+    print("=" * 86)
+    print(f"  • Total Waktu Pengujian     : {total_elapsed:.1f} detik")
+    if args.mode in ["dual", "headless", "web", "top-only"]:
+        print(f"  • CAM-01 Top (Slat & Rib)   : {f_top} frames ({avg_top_fps:.1f} rata-rata FPS)")
+    if args.mode in ["dual", "headless", "web", "side-only"]:
+        print(f"  • {args.side_cam_id} Side (Bolt & Pin)  : {f_side} frames ({avg_side_fps:.1f} rata-rata FPS)")
+    print(f"  • Throughput Gabungan       : {(avg_top_fps + avg_side_fps):.1f} frames/detik")
+    print("=" * 86)
+    print("[*] Selesai.\n")
+
+
 def build_arg_parser():
     """Membangun ArgumentParser CLI runner (diekstrak agar dapat diuji unit test)."""
     parser = argparse.ArgumentParser(
@@ -2726,9 +3181,9 @@ Shortcut Keyboard Saat Berjalan:
 
     parser.add_argument(
         "--mode",
-        choices=["dual", "headless", "top-only", "side-only"],
+        choices=["dual", "headless", "web", "top-only", "side-only"],
         default=env_mode,
-        help="Mode eksekusi: 'dual' (2 jendela OpenCV berdampingan), 'headless' (tanpa display, murni komputasi AI), atau pengujian kamera tunggal."
+        help="Mode eksekusi: 'dual' (2 jendela OpenCV), 'headless' (tanpa display), 'web' (khusus Web Dashboard 3-kam + WebSocket hybrid), atau kamera tunggal."
     )
     parser.add_argument(
         "--browse",
@@ -2800,9 +3255,9 @@ Shortcut Keyboard Saat Berjalan:
     )
     parser.add_argument(
         "--engine",
-        choices=["threads", "process"],
+        choices=["threads", "process", "hybrid"],
         default=env_engine,
-        help="Arsitektur runner: 'threads' (hemat RAM/VRAM laptop & zero IPC crash), atau 'process' (multiprocessing multi-core untuk Jetson Orin)."
+        help="Arsitektur runner: 'threads' (1 proses), 'hybrid' (CAM-01 bebas GIL di proses terpisah + CAM-02/03 & WS), atau 'process' (multiprocessing penuh)."
     )
     try:
         env_bolt_conf = float(os.environ.get("BOLT_CONF_THRESHOLD", "0.55"))
@@ -2869,6 +3324,21 @@ Shortcut Keyboard Saat Berjalan:
     return parser
 
 
+def resolve_mode_defaults(args, argv=None):
+    """
+    Menyesuaikan default otomatis untuk mode khusus (seperti --mode web):
+    - Mode 'web' otomatis mengaktifkan ws_stream=True dan memilih engine 'hybrid'
+      (CAM-01 terisolasi bebas GIL) kecuali user secara eksplisit menentukan --engine di CLI.
+    """
+    raw_argv = list(argv) if argv is not None else []
+    explicit_engine = any(a == "--engine" or a.startswith("--engine=") for a in raw_argv)
+    if str(getattr(args, "mode", "")).lower() == "web":
+        args.ws_stream = True
+        if not explicit_engine:
+            args.engine = "hybrid"
+    return args
+
+
 def main():
     if "--gui-dialog" in sys.argv:
         _handle_isolated_gui_dialog()
@@ -2887,7 +3357,7 @@ def main():
 
     parser = build_arg_parser()
 
-    args = parser.parse_args()
+    args = resolve_mode_defaults(parser.parse_args(), sys.argv[1:])
 
     # Sinkronkan threshold baut ke os.environ agar sub-worker otomatis menggunakannya
     if args.bolt_conf is not None:
@@ -2930,8 +3400,8 @@ def main():
         else:
             print("[!] Peringatan: Tidak ditemukan webcam fisik yang aktif. Tetap menggunakan input default.")
 
-    top_is_active = args.mode in ["dual", "headless", "top-only"]
-    side_is_active = args.mode in ["dual", "headless", "side-only"]
+    top_is_active = args.mode in ["dual", "headless", "web", "top-only"]
+    side_is_active = args.mode in ["dual", "headless", "web", "side-only"]
     missing_top_source = top_is_active and not is_usable_source(args.top_source)
     missing_side_source = side_is_active and not is_usable_source(args.side_source)
 
@@ -2983,9 +3453,14 @@ def main():
     print("=" * 86)
     print("🚀 MULTI-CAMERA INSPECTION BENCHMARK RUNNER")
     print("=" * 86)
-    print(f"[*] Engine Arsitektur  : {'THREADS (Hemat RAM 8GB, Berbagi VRAM Bersama)' if args.engine == 'threads' else 'PROCESS (Multiprocessing Terisolasi)'}")
+    engine_lbl = {
+        "threads": "THREADS (Hemat RAM 8GB, Berbagi VRAM Bersama)",
+        "hybrid": "HYBRID 2-PROSES (CAM-01 Bebas GIL + CAM-02/03 & WebSocket)",
+        "process": "PROCESS (Multiprocessing Terisolasi)",
+    }.get(args.engine, args.engine.upper())
+    print(f"[*] Engine Arsitektur  : {engine_lbl}")
     print(f"[*] Mode Operasional   : {args.mode.upper()}")
-    if args.mode != "headless":
+    if args.mode not in ("headless", "web"):
         print(f"[*] GUI Render Mode    : DECOUPLED ({args.gui_fps:.1f} FPS GUI Display Pacing, AI Full Speed 35+ FPS)")
     print(f"[*] CAM-01 Top Source  : {os.path.basename(str(args.top_source)) if os.path.exists(str(args.top_source)) else args.top_source}")
     print(f"[*] {args.side_cam_id} Side Source : {os.path.basename(str(args.side_source)) if os.path.exists(str(args.side_source)) else args.side_source} ({args.side_name})")
@@ -2998,9 +3473,12 @@ def main():
     # 1. Terapkan konfigurasi Anti-Throttling & Prioritas Windows
     configure_windows_process_performance()
 
-    # 2. Jika mode engine THREADS (default & rekomendasi laptop), eksekusi Single-Process
+    # 2. Jika mode engine THREADS atau HYBRID, jalankan masing-masing orkestrator
     if args.engine == "threads":
         _run_threaded_engine(args)
+        return
+    if args.engine == "hybrid":
+        _run_hybrid_engine(args)
         return
 
     # Inisialisasi Shared Memory untuk Telemetri Antar-Proses
@@ -3020,12 +3498,12 @@ def main():
     processes = []
 
     # 1. Spawn Worker Top
-    if args.mode in ["dual", "headless", "top-only"]:
+    if args.mode in ["dual", "headless", "web", "top-only"]:
         p_top = mp.Process(
             target=_run_top_worker,
             args=(
                 args.top_source,
-                "headless" if args.mode == "headless" else "dual",
+                "headless" if args.mode in ("headless", "web") else "dual",
                 args.rib_mode,
                 args.device,
                 args.enable_db,
@@ -3041,12 +3519,12 @@ def main():
         processes.append(("TOP", p_top))
 
     # 2. Spawn Worker Side
-    if args.mode in ["dual", "headless", "side-only"]:
+    if args.mode in ["dual", "headless", "web", "side-only"]:
         p_side = mp.Process(
             target=_run_side_worker,
             args=(
                 args.side_source,
-                "headless" if args.mode == "headless" else "dual",
+                "headless" if args.mode in ("headless", "web") else "dual",
                 args.side_name,
                 args.side_cam_id,
                 args.device,
@@ -3182,9 +3660,9 @@ def main():
     print("📊 LAPORAN AKHIR HASIL BENCHMARK MULTI-KAMERA")
     print("=" * 86)
     print(f"  • Total Waktu Pengujian     : {total_elapsed:.1f} detik")
-    if args.mode in ["dual", "headless", "top-only"]:
+    if args.mode in ["dual", "headless", "web", "top-only"]:
         print(f"  • CAM-01 Top (Slat & Rib)   : {f_top} frames ({avg_top_fps:.1f} rata-rata FPS)")
-    if args.mode in ["dual", "headless", "side-only"]:
+    if args.mode in ["dual", "headless", "web", "side-only"]:
         print(f"  • {args.side_cam_id} Side (Bolt & Pin)  : {f_side} frames ({avg_side_fps:.1f} rata-rata FPS)")
     print(f"  • Throughput Gabungan       : {(avg_top_fps + avg_side_fps):.1f} frames/detik")
 
