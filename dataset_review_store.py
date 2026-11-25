@@ -7,9 +7,19 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+import cv2
+
 
 MANUAL_LABELS = {"OK", "NG", "INVALID"}
 MODEL_LABELS = {"OK", "NG"}
+
+
+def canonical_res_scale_from_height(frame_height: int | float | None) -> float:
+    """Compute canonical 750 mm scale factor normalizing any frame height to 1080p."""
+    if frame_height is None or float(frame_height) <= 0.0:
+        return 1.0
+    ratio = 1080.0 / float(max(240.0, float(frame_height)))
+    return float(min(1.80, max(0.75, ratio)))
 
 
 class DatasetReviewStore:
@@ -54,7 +64,11 @@ class DatasetReviewStore:
                     ActiveFrames INTEGER,
                     Confidence REAL,
                     ProfileJson TEXT,
-                    CameraProfile TEXT
+                    CameraProfile TEXT,
+                    FrameHeight INTEGER,
+                    SpanPx REAL,
+                    ResScale REAL,
+                    MetricsScaled INTEGER DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS Rib_Dataset_Evidence (
                     EvidenceID INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,15 +95,33 @@ class DatasetReviewStore:
                     ON Rib_Dataset_Review (DatasetID);
                 """
             )
+            existing_cols = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(Rib_Dataset)").fetchall()
+            }
+            migrations = (
+                ("FrameHeight", "ALTER TABLE Rib_Dataset ADD COLUMN FrameHeight INTEGER"),
+                ("SpanPx", "ALTER TABLE Rib_Dataset ADD COLUMN SpanPx REAL"),
+                ("ResScale", "ALTER TABLE Rib_Dataset ADD COLUMN ResScale REAL"),
+                ("MetricsScaled", "ALTER TABLE Rib_Dataset ADD COLUMN MetricsScaled INTEGER DEFAULT 0"),
+            )
+            for col_name, ddl in migrations:
+                if col_name not in existing_cols:
+                    conn.execute(ddl)
 
     def insert_sample(self, sample: Mapping[str, Any]) -> int:
         label = str(sample["label"]).upper()
         if label not in MODEL_LABELS:
             raise ValueError("model label must be OK or NG")
         self.ensure_schema()
+        frame_h = sample.get("frame_height")
+        res_scale = sample.get("res_scale")
+        if res_scale is None and frame_h is not None:
+            res_scale = canonical_res_scale_from_height(frame_h)
         columns = (
             "RibNumber, SlatNumber, Label, TrackerEngine, PVFlatness, Sagitta, "
-            "InnerDev, TipDev, Coverage, ActiveFrames, Confidence, ProfileJson, CameraProfile"
+            "InnerDev, TipDev, Coverage, ActiveFrames, Confidence, ProfileJson, CameraProfile, "
+            "FrameHeight, SpanPx, ResScale, MetricsScaled"
         )
         values = (
             sample.get("rib_number"), sample.get("slat_number"), label,
@@ -97,6 +129,10 @@ class DatasetReviewStore:
             sample.get("inner_dev"), sample.get("tip_dev"), sample.get("coverage"),
             sample.get("active_frames"), sample.get("confidence"), sample.get("profile_json"),
             sample.get("camera_profile"),
+            int(frame_h) if frame_h is not None else None,
+            float(sample["span_px"]) if sample.get("span_px") is not None else None,
+            float(res_scale) if res_scale is not None else None,
+            int(bool(sample.get("metrics_scaled", 0))),
         )
         with self._connection() as conn:
             cursor = conn.execute(
@@ -104,6 +140,65 @@ class DatasetReviewStore:
                 values,
             )
             return int(cursor.lastrowid)
+
+    def backfill_scale_metadata(self) -> dict[str, int]:
+        """Populate FrameHeight & ResScale on legacy rows missing resolution metadata."""
+        self.ensure_schema()
+        updated_720 = 0
+        updated_1080 = 0
+        updated_other = 0
+        dim_cache: dict[str, int | None] = {}
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT d.DatasetID, d.RecordedAt, d.FrameHeight, d.ResScale, e.RawImagePath
+                FROM Rib_Dataset AS d
+                LEFT JOIN Rib_Dataset_Evidence AS e ON e.DatasetID = d.DatasetID
+                WHERE d.FrameHeight IS NULL OR d.ResScale IS NULL
+                ORDER BY d.DatasetID ASC
+                """
+            ).fetchall()
+            updates: list[tuple[int, float, int]] = []
+            for did, recorded_at, existing_h, _existing_rs, raw_path in rows:
+                inferred_h: int | None = int(existing_h) if existing_h is not None else None
+                if inferred_h is None and raw_path:
+                    raw_key = str(raw_path)
+                    if raw_key not in dim_cache:
+                        h_img: int | None = None
+                        p_obj = Path(raw_key)
+                        if p_obj.is_file():
+                            try:
+                                img = cv2.imread(str(p_obj), cv2.IMREAD_UNCHANGED)
+                                if img is not None and img.ndim >= 2 and img.shape[0] > 0:
+                                    h_img = int(img.shape[0])
+                            except Exception:
+                                h_img = None
+                        dim_cache[raw_key] = h_img
+                    inferred_h = dim_cache[raw_key]
+                if inferred_h is None:
+                    # Deterministic fallback when image evidence file is unavailable or non-image:
+                    # field captures on/after 2026-11-20 are 720p; older/synthetic fallback stays 1080p (1.0x).
+                    rec_str = str(recorded_at or "")
+                    inferred_h = 720 if rec_str.startswith("2026-11-2") and rec_str[:10] >= "2026-11-20" else 1080
+                res_scale = canonical_res_scale_from_height(inferred_h)
+                updates.append((inferred_h, round(res_scale, 4), int(did)))
+                if inferred_h == 720:
+                    updated_720 += 1
+                elif inferred_h == 1080:
+                    updated_1080 += 1
+                else:
+                    updated_other += 1
+            if updates:
+                conn.executemany(
+                    "UPDATE Rib_Dataset SET FrameHeight = COALESCE(FrameHeight, ?), ResScale = COALESCE(ResScale, ?), MetricsScaled = COALESCE(MetricsScaled, 0) WHERE DatasetID = ?",
+                    updates,
+                )
+        return {
+            "updated_total": len(updates),
+            "updated_720p": updated_720,
+            "updated_1080p": updated_1080,
+            "updated_other": updated_other,
+        }
 
     def attach_evidence(self, dataset_id: int, evidence: Mapping[str, Any]) -> None:
         self.ensure_schema()
@@ -309,3 +404,8 @@ class DatasetReviewStore:
                     (dataset_id, label, reviewer.strip(), note.strip()),
                 )
             return cursor.rowcount >= 1
+
+
+def backfill_dataset_scale_metadata(db_path: str | Path) -> dict[str, int]:
+    """Idempotently backfill FrameHeight & ResScale on legacy rows in a SQLite DB."""
+    return DatasetReviewStore(db_path).backfill_scale_metadata()

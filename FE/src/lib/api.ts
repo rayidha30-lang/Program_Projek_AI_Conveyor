@@ -21,6 +21,8 @@ export type AbnormalComponentSummary = {
   shortLabel: string;
   camera: string;
   count: number;
+  activeCount?: number;
+  resolvedCount?: number;
   dotColor: string;
 };
 
@@ -39,6 +41,10 @@ export type RecordRow = {
   severity: Severity;
   status: string;
   statusLifecycle: string;
+  overallResult?: string;
+  detectionResult?: string;
+  resolvedAt?: string | null;
+  resolvedAtDisplay?: string | null;
   picName?: string;
   maintenanceNote?: string;
   pvFlatness?: number | null;
@@ -138,6 +144,10 @@ export type EvidenceItem = {
   area: string;
   confidence: string;
   statusLifecycle?: string;
+  overallResult?: string;
+  detectionResult?: string;
+  resolvedAt?: string | null;
+  resolvedAtDisplay?: string | null;
   picName?: string;
   maintenanceNote?: string;
   pvFlatness?: number | null;
@@ -207,10 +217,29 @@ export function extractEvidenceDate(e: EvidenceItem): {
   };
 }
 
+export type MaintenanceLogItem = {
+  logId: number;
+  inspectionId: number;
+  action: "ACKNOWLEDGED" | "RESOLVED" | string;
+  picName: string;
+  notes: string;
+  isFalseAlarm?: boolean;
+  isReopen?: boolean;
+  loggedAt: string;
+  loggedAtDisplay: string;
+};
+
 export type AnalyticsData = {
   weekly: { d: string; n: number }[];
   pareto: { label: string; n: number; p: string; barCls: string }[];
   totalIncidents: number;
+  resolutionSummary?: {
+    openCount: number;
+    resolvedCount: number;
+    invalidCount: number;
+    resolutionRatePct: number;
+    avgMttrMinutes: number | null;
+  };
 };
 
 /**
@@ -246,6 +275,9 @@ export async function fetchStats(): Promise<{
   overview: {
     totalInspections: number;
     totalNG: number;
+    activeNG?: number;
+    resolvedNG?: number;
+    invalidCount?: number;
     totalOK: number;
     accuracy: string;
   };
@@ -289,14 +321,23 @@ export async function fetchEvidence(): Promise<EvidenceItem[]> {
 }
 
 /**
- * Mengirim aksi teknisi / PIC (Acknowledge atau Mark Resolved).
+ * Mengirim aksi teknisi / PIC (Acknowledge, Mark Resolved, False Alarm, atau Reopen).
  */
 export async function submitInspectionAction(
   inspectionId: number,
-  action: "ACKNOWLEDGED" | "RESOLVED" | "UNACKNOWLEDGED",
+  action: "ACKNOWLEDGED" | "RESOLVED" | "FALSE_ALARM" | "UNACKNOWLEDGED",
   picName: string,
   maintenanceNote: string
-): Promise<{ success: boolean; inspectionId: number; statusLifecycle: string }> {
+): Promise<{
+  success: boolean;
+  inspectionId: number;
+  statusLifecycle: string;
+  overallResult?: string;
+  resolvedAt?: string | null;
+  resolvedAtDisplay?: string | null;
+  picName?: string;
+  maintenanceNote?: string;
+}> {
   const res = await fetch(`${API_BASE_URL}/inspections/${inspectionId}/action`, {
     method: "POST",
     headers: {
@@ -309,7 +350,25 @@ export async function submitInspectionAction(
     }),
   });
 
-  if (!res.ok) throw new Error("Gagal memperbarui status inspeksi");
+  if (!res.ok) {
+    let errMsg = `Gagal memperbarui status inspeksi (${res.status})`;
+    try {
+      const errBody = await res.json();
+      if (errBody?.error) errMsg = errBody.error;
+    } catch {
+      // ignore json parse failure
+    }
+    throw new Error(errMsg);
+  }
+  return await res.json();
+}
+
+/**
+ * Mengambil riwayat audit log tindakan PIC untuk suatu inspeksi.
+ */
+export async function fetchInspectionLogs(inspectionId: number): Promise<MaintenanceLogItem[]> {
+  const res = await fetch(`${API_BASE_URL}/inspections/${inspectionId}/logs`);
+  if (!res.ok) return [];
   return await res.json();
 }
 

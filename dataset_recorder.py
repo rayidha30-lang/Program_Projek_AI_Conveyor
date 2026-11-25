@@ -141,7 +141,9 @@ class RibDatasetRecorder:
         resolved_slat = candidate["slat_number"] if candidate.get("slat_number") is not None else slat_number
 
         payload = {
-            "sample_values": self._sample_values(final_result, rib_number, resolved_slat),
+            "sample_values": self._sample_values(
+                final_result, rib_number, resolved_slat, raw_frame=candidate["raw_frame"]
+            ),
             "raw_frame": candidate["raw_frame"],
             "annotated_frame": candidate["annotated_frame"],
             "session_id": self.session_id,
@@ -210,7 +212,13 @@ class RibDatasetRecorder:
         if self._worker_thread is not None and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=5.0)
 
-    def _sample_values(self, result: Mapping[str, Any], rib_number: int | None, slat_number: int | None) -> dict[str, Any]:
+    def _sample_values(
+        self,
+        result: Mapping[str, Any],
+        rib_number: int | None,
+        slat_number: int | None,
+        raw_frame: Any = None,
+    ) -> dict[str, Any]:
         contour = result.get("ys_contour")
         profile_json = None
         if contour is not None:
@@ -218,6 +226,14 @@ class RibDatasetRecorder:
                 profile_json = json.dumps([round(float(value), 2) for value in list(contour)[::4]])
             except (TypeError, ValueError):
                 profile_json = None
+        frame_h = result.get("frame_height")
+        if frame_h is None and raw_frame is not None and hasattr(raw_frame, "shape") and len(raw_frame.shape) >= 2:
+            frame_h = int(raw_frame.shape[0])
+        res_scale = result.get("res_scale")
+        if res_scale is None and frame_h is not None and float(frame_h) > 0:
+            res_scale = float(min(1.80, max(0.75, 1080.0 / float(max(240, int(frame_h))))))
+        span_px = result.get("raw_span_px")
+        metrics_scaled = 1 if ("res_scale" in result or "raw_span_px" in result) else 0
         return {
             "rib_number": rib_number,
             "slat_number": slat_number,
@@ -232,4 +248,8 @@ class RibDatasetRecorder:
             "confidence": result.get("confidence", 0.0),
             "profile_json": profile_json,
             "camera_profile": self.camera_profile,
+            "frame_height": int(frame_h) if frame_h is not None else None,
+            "span_px": float(span_px) if span_px is not None else None,
+            "res_scale": float(res_scale) if res_scale is not None else None,
+            "metrics_scaled": metrics_scaled,
         }

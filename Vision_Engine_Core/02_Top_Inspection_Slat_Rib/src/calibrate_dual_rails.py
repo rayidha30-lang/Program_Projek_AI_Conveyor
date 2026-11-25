@@ -92,6 +92,8 @@ class DualRailCalibrator:
         self.is_saved = False
         self.save_feedback_timer = 0
         self.last_matrix = None
+        self.calib_frame_w = 1920
+        self.calib_frame_h = 1080
         self.metrology = {}
 
     def load_golden_reference(self):
@@ -208,11 +210,11 @@ class DualRailCalibrator:
                 best_xb = xb_cand
         return best_xb
 
-    def auto_snap_rails(self, frame_bgr):
+    def auto_snap_rails(self, frame_bgr, rib_boxes=None):
         """
-        Mendeteksi posisi bibir rel dalam kiri & kanan secara otomatis menggunakan
-        Sobel-X multi-strip dengan batasan perspektif trapesium agar kebal terhadap
-        tekstur baut/sirip di dalam sabuk konveyor.
+        Mendeteksi posisi rel kiri & kanan konveyor secara vektorisasi berbasis pencarian garis miring
+        trapesium perspektif, menolak pilar dinding vertikal latar (dx ~ 0) dan distraktor di atas sabuk,
+        serta memanfaatkan jangkar ujung kotak rib YOLO bila tersedia.
         """
         if frame_bgr is None:
             return
@@ -221,49 +223,81 @@ class DualRailCalibrator:
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
         sobx = np.abs(cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3))
-        prof_top = np.mean(sobx[int(0.15 * h_f):int(0.35 * h_f), :], axis=0)
+        sobx_s = cv2.boxFilter(sobx, -1, (7, 15), normalize=True)
 
-        # Tahap 1: Cari puncak bibir rel dalam di band atas (Y: 15% - 35%)
-        lt_x = self._find_top_rail_x(
-            prof_top,
-            primary_bounds=(int(0.12 * w_f), int(0.24 * w_f)),
-            fallback_bounds=(int(0.05 * w_f), int(0.30 * w_f)),
-        )
-        rt_x = self._find_top_rail_x(
-            prof_top,
-            primary_bounds=(int(0.80 * w_f), int(0.87 * w_f)),
-            fallback_bounds=(int(0.70 * w_f), int(0.96 * w_f)),
-        )
+        # Deteksi kontinuitas vertikal murni (pilar dinding / tiang rangka stasioner pada Y=16%..46%)
+        strip_hi = np.mean(sobx_s[int(0.16 * h_f):max(int(0.16 * h_f) + 1, int(0.28 * h_f)), :], axis=0)
+        strip_mid = np.mean(sobx_s[int(0.32 * h_f):max(int(0.32 * h_f) + 1, int(0.46 * h_f)), :], axis=0)
+        vert_continuity = np.minimum(strip_hi, strip_mid)
 
-        # Tahap 2: Multi-strip outward perspective line tracking (Y: 30% - 82%)
         self.y_top = 0.20 * h_f
         self.y_bot = 0.80 * h_f
+        span_y = max(1.0, self.y_bot - self.y_top)
+        sample_ys = np.linspace(0.20 * h_f, 0.78 * h_f, 13)
+        alphas = ((sample_ys - self.y_top) / span_y)[:, None, None]
+        sy_idx = np.clip(np.round(sample_ys).astype(np.int32), 0, h_f - 1)[:, None, None]
+
         sx = float(w_f) / 1920.0
-        w_top = max(600.0 * sx, float(rt_x - lt_x))
-        ref_w_top = max(100.0, (self.ref_top_right_rail - self.ref_top_left_rail) * sx)
-        scale_w = w_top / ref_w_top
+        min_abs_dx = max(12, int(round(0.055 * w_f)))
+        max_abs_dx = max(min_abs_dx + 20, int(round(0.22 * w_f)))
+        step_x = max(2, int(round(w_f / 480.0)))
+        nom_abs_dx = 0.091 * w_f
 
-        ref_dx_l = (self.ref_bot_left_rail - self.ref_top_left_rail) * sx
-        ref_dx_r = (self.ref_bot_right_rail - self.ref_top_right_rail) * sx
-        min_abs_dx = int(0.03 * w_f)
-        margin_dx = int(0.012 * w_f)
-        x_min_b = int(0.015 * w_f)
-        x_max_b = int(0.985 * w_f)
+        # Ekstrak referensi rib opsional untuk validasi jarak rel kiri/kanan terhadap ujung bilah
+        rib_anchors = []
+        if rib_boxes:
+            for rb in rib_boxes:
+                box = rb.get("box") if isinstance(rb, dict) else rb
+                if box is not None and len(box) >= 4:
+                    bx1, by1, bx2, by2 = [float(v) for v in box[:4]]
+                    if (bx2 - bx1) >= 0.24 * w_f:
+                        rib_anchors.append((bx1, bx2, 0.5 * (by1 + by2)))
 
-        nom_dx_l = int(np.clip(int(round(ref_dx_l * scale_w)), x_min_b - lt_x, -(min_abs_dx + 1)))
-        nom_dx_r = int(np.clip(int(round(ref_dx_r * scale_w)), min_abs_dx + 1, x_max_b - rt_x))
-        sample_ys = np.linspace(0.30 * h_f, 0.82 * h_f, 9)
+        def _search_slanted_rail(is_left):
+            if is_left:
+                xts = np.arange(int(0.09 * w_f), int(0.34 * w_f) + 1, step_x, dtype=np.float32)
+                dxs = np.arange(-max_abs_dx, -min_abs_dx + 1, step_x, dtype=np.float32)
+            else:
+                xts = np.arange(int(0.66 * w_f), int(0.91 * w_f) + 1, step_x, dtype=np.float32)
+                dxs = np.arange(min_abs_dx, max_abs_dx + 1, step_x, dtype=np.float32)
 
-        lb_x = self._track_bottom_rail_x(
-            sobx, lt_x, self.y_top, self.y_bot, sample_ys,
-            nom_dx_l, nom_dx_l - margin_dx, nom_dx_l + margin_dx,
-            x_min_b, w_f - 20, outward_sign=-1, min_abs_dx=min_abs_dx,
-        )
-        rb_x = self._track_bottom_rail_x(
-            sobx, rt_x, self.y_top, self.y_bot, sample_ys,
-            nom_dx_r, nom_dx_r - margin_dx, nom_dx_r + margin_dx,
-            20, x_max_b, outward_sign=+1, min_abs_dx=min_abs_dx,
-        )
+            xt_grid = xts[None, :, None]
+            dx_grid = dxs[None, None, :]
+            xb_grid = xt_grid + dx_grid
+            valid = (xb_grid >= 0.015 * w_f) & (xb_grid <= 0.985 * w_f)
+
+            if rib_anchors:
+                min_gap = 0.015 * w_f
+                max_gap = 0.145 * w_f
+                for r_x1, r_x2, r_cy in rib_anchors:
+                    a_r = (r_cy - self.y_top) / span_y
+                    x_at_r = xt_grid + a_r * dx_grid
+                    gap = (r_x1 - x_at_r) if is_left else (x_at_r - r_x2)
+                    # Hanya aktifkan filter bila setidaknya ada kandidat valid dalam envelope rel fisik
+                    anchor_ok = (gap >= min_gap) & (gap <= max_gap)
+                    if np.any(valid & anchor_ok):
+                        valid = valid & anchor_ok
+
+            cx = np.round(xt_grid + alphas * dx_grid).astype(np.int32)
+            cx_c = np.clip(cx, 0, w_f - 1)
+            vals = sobx_s[sy_idx, cx_c]
+
+            med = np.median(vals, axis=0)
+            p25 = np.percentile(vals, 25, axis=0)
+            p75 = np.percentile(vals, 75, axis=0)
+            slope_pen = 0.08 * np.abs(np.abs(dx_grid[0]) - nom_abs_dx) / max(1.0, float(step_x))
+            xt_idx = np.clip(np.round(xts).astype(np.int32), 0, w_f - 1)
+            pillar_pen = 0.35 * vert_continuity[xt_idx][:, None]
+            score = 0.50 * med + 0.30 * p25 + 0.25 * p75 - slope_pen - pillar_pen
+            score = np.where(valid[0], score, -1e9)
+            flat_idx = int(np.argmax(score))
+            ix, id_ = divmod(flat_idx, len(dxs))
+            xt_b = float(xts[ix])
+            xb_b = float(xt_b + dxs[id_])
+            return int(round(xt_b)), int(round(xb_b))
+
+        lt_x, lb_x = _search_slanted_rail(True)
+        rt_x, rb_x = _search_slanted_rail(False)
 
         self.pts[0] = np.array([float(lt_x), self.y_top])
         self.pts[1] = np.array([float(lb_x), self.y_bot])
@@ -300,8 +334,28 @@ class DualRailCalibrator:
 
         scale_x = ref_width_mid / cur_width
         delta_x = ref_cx_mid - cur_cx
+        cur_top_w = max(10.0, float(p_rt[0] - p_lt[0]))
+        ref_top_w = max(
+            10.0,
+            self.get_golden_rail_x("right", p_rt[1], w_f, h_f)
+            - self.get_golden_rail_x("left", p_lt[1], w_f, h_f),
+        )
+        top_width_ratio = cur_top_w / ref_top_w
+        pitch_width_ratio = min(cur_width / ref_width_mid, top_width_ratio)
+        if pitch_width_ratio < 0.90:
+            rec_rib_y_top_frac = round(max(0.18, min(0.28, 0.28 * pitch_width_ratio)), 3)
+            rec_prime_min_y = int(round(max(225, rec_rib_y_top_frac * 1080.0 + 18)))
+            rec_min_span_px = float(round(max(440.0, min(680.0, 0.56 * cur_top_w)), 1))
+        else:
+            rec_rib_y_top_frac = 0.28
+            rec_prime_min_y = 315
+            rec_min_span_px = 680.0
 
+        self.calib_frame_w = int(w_f)
+        self.calib_frame_h = int(h_f)
         self.metrology = {
+            "calib_frame_w": int(w_f),
+            "calib_frame_h": int(h_f),
             "theta_l": theta_l,
             "theta_r": theta_r,
             "measured_tilt_deg": theta_mean,
@@ -314,6 +368,19 @@ class DualRailCalibrator:
             "ref_center_x": ref_cx_mid,
             "ref_left_px": ref_left_mid,
             "ref_right_px": ref_right_mid,
+            "top_width_ratio": round(top_width_ratio, 3),
+            "pitch_width_ratio": round(pitch_width_ratio, 3),
+            "recommended_rib_y_top_frac": rec_rib_y_top_frac,
+            "recommended_prime_min_y": rec_prime_min_y,
+            "recommended_min_span_px": rec_min_span_px,
+            "inner_rail_trapezoid": {
+                "y_top": float(p_lt[1]),
+                "y_bot": float(p_lb[1]),
+                "lt_x": float(p_lt[0]),
+                "lb_x": float(p_lb[0]),
+                "rt_x": float(p_rt[0]),
+                "rb_x": float(p_rb[0]),
+            },
         }
 
         src_pts = np.array([p_lt, p_rt, p_rb, p_lb], dtype=np.float32)
@@ -389,6 +456,8 @@ class DualRailCalibrator:
         cfg_data["calibration_profile"].update({
             "calibrated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "calibration_method": f"INTERACTIVE_DUAL_RAILS_{self.mode}",
+            "calib_frame_w": int(self.metrology.get("calib_frame_w", getattr(self, "calib_frame_w", 1920))),
+            "calib_frame_h": int(self.metrology.get("calib_frame_h", getattr(self, "calib_frame_h", 1080))),
             "golden_reference": {
                 "source_video": "Kamera posisi 3 dimmer 2 - Reverse.mp4",
                 "source_image": "WIN_20261005_09_01_08_Pro.jpg",
@@ -411,9 +480,28 @@ class DualRailCalibrator:
             "lateral_offset_px": round(self.metrology.get("lateral_offset_px", 0.0), 1),
             "measured_width_px": round(self.metrology.get("cur_width_px", 1571.0), 1),
             "scale_x": round(self.metrology.get("scale_x", 1.0), 3),
+            "pitch_width_ratio": self.metrology.get("pitch_width_ratio", 1.0),
+            "recommended_rib_y_top_frac": self.metrology.get("recommended_rib_y_top_frac", 0.28),
+            "recommended_prime_min_y": self.metrology.get("recommended_prime_min_y", 315),
+            "recommended_min_span_px": self.metrology.get("recommended_min_span_px", 680.0),
             "left_rail_pts": [self.pts[0].tolist(), self.pts[1].tolist()],
             "right_rail_pts": [self.pts[2].tolist(), self.pts[3].tolist()]
         })
+
+        # Sesuaikan batas atas zona rib saat rel menyempit (kamera agak mendongak ke atas)
+        rec_top_y = float(self.metrology.get("recommended_rib_y_top_frac", 0.28))
+        rec_prime_min = int(self.metrology.get("recommended_prime_min_y", 315))
+        if rec_top_y < 0.28 and isinstance(cfg_data.get("rib_polygon"), list) and len(cfg_data["rib_polygon"]) >= 4:
+            updated_poly = [list(pt) for pt in cfg_data["rib_polygon"]]
+            updated_poly[0][1] = min(float(updated_poly[0][1]), rec_top_y)
+            updated_poly[1][1] = min(float(updated_poly[1][1]), rec_top_y)
+            cfg_data["rib_polygon"] = updated_poly
+            if "rib_prime_min_y" in cfg_data["thresholds"]:
+                cfg_data["thresholds"]["rib_prime_min_y"] = min(
+                    int(cfg_data["thresholds"]["rib_prime_min_y"]), rec_prime_min
+                )
+            else:
+                cfg_data["thresholds"]["rib_prime_min_y"] = rec_prime_min
 
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:

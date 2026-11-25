@@ -81,3 +81,10 @@ Database/
 
 # File Test Lokal / Untracked
 tests/
+
+# Script Training / Dataset Offline & Checkpoint Last (Disimpan Lokal, Tidak Dipush)
+scripts/prepare_yolo_seg_dataset.py
+scripts/train_yolo_seg_v3.py
+scripts/train_rib_tip_classifier.py
+Dataset_YOLO_Seg_v3/
+**/models/last_*.pt

@@ -9,6 +9,7 @@ Deskripsi:
 """
 
 import os
+import sys
 import cv2
 import numpy as np
 
@@ -19,6 +20,16 @@ except ImportError:
     HAS_TORCH = False
 
 from ultralytics import YOLO
+
+try:
+    _PROG_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+    if _PROG_ROOT not in sys.path:
+        sys.path.insert(0, _PROG_ROOT)
+    from gpu_vision_ops import create_gpu_yolo_runner
+    HAS_GPU_ONNX_OPS = True
+except Exception:
+    create_gpu_yolo_runner = None
+    HAS_GPU_ONNX_OPS = False
 
 
 class BoltPinDetector:
@@ -85,8 +96,20 @@ class BoltPinDetector:
                 actual_model_to_load = onnx_candidate
                 print(f"[BoltPinDetector] ⚡ Akselerasi ONNX Runtime CUDA aktif: {os.path.basename(onnx_candidate)}")
 
+        self._gpu_onnx_runner = None
+
         def _load_yolo_weights(weights_path):
             is_trt_or_onnx = str(weights_path).endswith((".engine", ".onnx"))
+            if is_trt_or_onnx and self.device != "cpu" and HAS_GPU_ONNX_OPS and create_gpu_yolo_runner is not None:
+                try:
+                    dev_idx = self.device if isinstance(self.device, int) else 0
+                    runner = create_gpu_yolo_runner(weights_path, device_id=dev_idx)
+                    if runner is not None:
+                        self._gpu_onnx_runner = runner
+                        self.use_half = True if str(weights_path).endswith(".engine") else runner.is_fp16
+                        return None
+                except Exception:
+                    self._gpu_onnx_runner = None
             if str(weights_path).endswith(".onnx"):
                 try:
                     import onnxruntime as _ort
@@ -113,7 +136,10 @@ class BoltPinDetector:
         self.max_pin_distance = max_pin_distance
         self.agnostic_nms = agnostic_nms
         self.crop_before_infer = crop_before_infer
-        self.class_names = self.model.names if hasattr(self.model, 'names') else {}
+        if self._gpu_onnx_runner is not None:
+            self.class_names = self._gpu_onnx_runner.class_names or {}
+        else:
+            self.class_names = self.model.names if hasattr(self.model, 'names') else {}
         is_bolt_model = any("bolt" in str(v).lower() or "pin" in str(v).lower() for v in self.class_names.values())
         if not is_bolt_model:
             print(f"[BoltPinDetector] ⚠️ PERINGATAN: Model '{os.path.basename(actual_model_to_load)}' memiliki kelas {self.class_names} dan BUKAN model deteksi Baut/Pin!")
@@ -128,16 +154,25 @@ class BoltPinDetector:
             for bc in bolt_cands:
                 if os.path.exists(bc):
                     try:
+                        self._gpu_onnx_runner = None
                         self.model = _load_yolo_weights(bc)
                         actual_model_to_load = bc
                         self.actual_model_to_load = bc
-                        self.class_names = self.model.names if hasattr(self.model, 'names') else {}
+                        if self._gpu_onnx_runner is not None:
+                            self.class_names = self._gpu_onnx_runner.class_names or {}
+                        else:
+                            self.class_names = self.model.names if hasattr(self.model, 'names') else {}
                         print(f"[BoltPinDetector] ✅ Berhasil beralih ke Model Baut/Pin: {os.path.basename(bc)} (Kelas: {self.class_names})")
                         break
                     except Exception as fb_e:
                         print(f"[BoltPinDetector] Gagal memuat fallback: {fb_e}")
 
-        print(f"[BoltPinDetector] Model dimuat: {os.path.basename(actual_model_to_load)} (Device: {self.device_info})")
+        if self._gpu_onnx_runner is not None:
+            rt_tag = "TensorRT FP16 GPU" if str(actual_model_to_load).endswith(".engine") else "ORT CUDA IO-Bind"
+            mode_lbl = f"{self.device_info} [{rt_tag}]"
+        else:
+            mode_lbl = self.device_info
+        print(f"[BoltPinDetector] Model dimuat: {os.path.basename(actual_model_to_load)} (Device: {mode_lbl})")
 
     def detect(self, frame, roi=None):
         """
@@ -172,99 +207,114 @@ class BoltPinDetector:
                     infer_img = frame[ry1:ry2, rx1:rx2]
                     offset_x, offset_y = rx1, ry1
 
-        # Jalankan Inferensi YOLO dengan Agnostic NMS untuk mencegah bounding box ganda
-        try:
-            call_kwargs = {
-                "source": infer_img,
-                "conf": self.conf_threshold,
-                "iou": self.iou_threshold,
-                "device": self.device,
-                "agnostic_nms": self.agnostic_nms,
-                "verbose": False
-            }
-            is_trt_or_onnx = hasattr(self, "actual_model_to_load") and (str(self.actual_model_to_load).endswith((".engine", ".onnx")))
-            if not is_trt_or_onnx:
-                call_kwargs["imgsz"] = 640
-                if self.use_half and self.device != "cpu":
-                    call_kwargs["half"] = True
-            results = self.model(**call_kwargs)
-        except (RuntimeError, Exception) as e_cuda:
-            err_str = str(e_cuda).lower()
-            if ("out of memory" in err_str or "cuda" in err_str or "allocation" in err_str) and self.device != "cpu":
-                print(f"\n[WARN BOLT-PIN DETECTOR] CUDA Memory Error terdeteksi ({e_cuda}). Beralih otomatis ke komputasi CPU...")
-                try:
-                    import torch
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                self.device = "cpu"
-                self.device_info = "CPU (Fallback)"
-                self.use_half = False
-                try:
-                    if hasattr(self.model, "model") and self.model.model is not None:
-                        self.model.model.float()
-                        self.model.to("cpu")
-                except Exception:
-                    pass
-                fb_kwargs = {
-                    "source": infer_img,
-                    "conf": self.conf_threshold,
-                    "iou": self.iou_threshold,
-                    "device": "cpu",
-                    "agnostic_nms": self.agnostic_nms,
-                    "verbose": False
-                }
-                if not is_trt_or_onnx:
-                    fb_kwargs["imgsz"] = 480
-                results = self.model(**fb_kwargs)
-            else:
-                raise e_cuda
-
         detected_bolts = []
         detected_pins = []
 
-        if len(results) > 0 and results[0].boxes is not None:
-            boxes = results[0].boxes
-            for i in range(len(boxes)):
-                xyxy = boxes.xyxy[i].cpu().numpy()
-                conf = float(boxes.conf[i].cpu().numpy())
-                cls_id = int(boxes.cls[i].cpu().numpy())
-                cls_name = self.class_names.get(cls_id, str(cls_id)).lower()
-
-                # Konversi koordinat relatif ke global frame
-                gx1 = int(xyxy[0] + offset_x)
-                gy1 = int(xyxy[1] + offset_y)
-                gx2 = int(xyxy[2] + offset_x)
-                gy2 = int(xyxy[3] + offset_y)
-                cx = int((gx1 + gx2) / 2)
-                cy = int((gy1 + gy2) / 2)
-                bw = abs(gx2 - gx1)
-                bh = abs(gy2 - gy1)
-
-                # Filter spasial ROI (jika mode full frame aktif dan ROI ditentukan)
-                if roi_bounds is not None and not self.crop_before_infer:
-                    bx1, by1, bx2, by2 = roi_bounds
-                    if cx < bx1 or cx > bx2 or cy < by1 or cy > by2:
-                        continue
-
-                # Filter noise bentuk abnormal (kepala baut & pin tidak berbentuk garis gepeng ekstrem)
-                if bh > 0 and bw > 0:
-                    aspect_ratio = bw / float(bh)
-                    if aspect_ratio > 3.2 or aspect_ratio < 0.28:
-                        continue
-
-                item_data = {
-                    "box": [gx1, gy1, gx2, gy2],
-                    "centroid": (cx, cy),
-                    "confidence": conf,
-                    "class_name": cls_name,
-                    "is_ng": "ng" in cls_name
+        # Jalankan Inferensi YOLO dengan Agnostic NMS untuk mencegah bounding box ganda
+        boxes_xyxy = ()
+        boxes_conf = ()
+        boxes_cls = ()
+        if getattr(self, "_gpu_onnx_runner", None) is not None:
+            boxes_xyxy, boxes_conf, boxes_cls = self._gpu_onnx_runner.predict(
+                infer_img,
+                conf_thresh=self.conf_threshold,
+                iou_thresh=self.iou_threshold,
+                agnostic_nms=self.agnostic_nms,
+            )
+        else:
+            try:
+                call_kwargs = {
+                    "source": infer_img,
+                    "conf": self.conf_threshold,
+                    "iou": self.iou_threshold,
+                    "device": self.device,
+                    "agnostic_nms": self.agnostic_nms,
+                    "verbose": False
                 }
+                is_trt_or_onnx = hasattr(self, "actual_model_to_load") and (str(self.actual_model_to_load).endswith((".engine", ".onnx")))
+                if not is_trt_or_onnx:
+                    call_kwargs["imgsz"] = 640
+                    if self.use_half and self.device != "cpu":
+                        call_kwargs["half"] = True
+                results = self.model(**call_kwargs)
+            except (RuntimeError, Exception) as e_cuda:
+                err_str = str(e_cuda).lower()
+                if ("out of memory" in err_str or "cuda" in err_str or "allocation" in err_str) and self.device != "cpu":
+                    print(f"\n[WARN BOLT-PIN DETECTOR] CUDA Memory Error terdeteksi ({e_cuda}). Beralih otomatis ke komputasi CPU...")
+                    try:
+                        import torch
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    self.device = "cpu"
+                    self.device_info = "CPU (Fallback)"
+                    self.use_half = False
+                    try:
+                        if hasattr(self.model, "model") and self.model.model is not None:
+                            self.model.model.float()
+                            self.model.to("cpu")
+                    except Exception:
+                        pass
+                    fb_kwargs = {
+                        "source": infer_img,
+                        "conf": self.conf_threshold,
+                        "iou": self.iou_threshold,
+                        "device": "cpu",
+                        "agnostic_nms": self.agnostic_nms,
+                        "verbose": False
+                    }
+                    if not is_trt_or_onnx:
+                        fb_kwargs["imgsz"] = 480
+                    results = self.model(**fb_kwargs)
+                else:
+                    raise e_cuda
 
-                if "bolt" in cls_name:
-                    detected_bolts.append(item_data)
-                elif "pin" in cls_name:
-                    detected_pins.append(item_data)
+            if len(results) > 0 and results[0].boxes is not None and len(results[0].boxes) > 0:
+                boxes = results[0].boxes
+                boxes_xyxy = boxes.xyxy.cpu().numpy()
+                boxes_conf = boxes.conf.cpu().numpy()
+                boxes_cls = boxes.cls.cpu().numpy()
+
+        for i in range(len(boxes_xyxy)):
+            xyxy = boxes_xyxy[i]
+            conf = float(boxes_conf[i])
+            cls_id = int(boxes_cls[i])
+            cls_name = self.class_names.get(cls_id, str(cls_id)).lower()
+
+            # Konversi koordinat relatif ke global frame
+            gx1 = int(xyxy[0] + offset_x)
+            gy1 = int(xyxy[1] + offset_y)
+            gx2 = int(xyxy[2] + offset_x)
+            gy2 = int(xyxy[3] + offset_y)
+            cx = int((gx1 + gx2) / 2)
+            cy = int((gy1 + gy2) / 2)
+            bw = abs(gx2 - gx1)
+            bh = abs(gy2 - gy1)
+
+            # Filter spasial ROI (jika mode full frame aktif dan ROI ditentukan)
+            if roi_bounds is not None and not self.crop_before_infer:
+                bx1, by1, bx2, by2 = roi_bounds
+                if cx < bx1 or cx > bx2 or cy < by1 or cy > by2:
+                    continue
+
+            # Filter noise bentuk abnormal (kepala baut & pin tidak berbentuk garis gepeng ekstrem)
+            if bh > 0 and bw > 0:
+                aspect_ratio = bw / float(bh)
+                if aspect_ratio > 3.2 or aspect_ratio < 0.28:
+                    continue
+
+            item_data = {
+                "box": [gx1, gy1, gx2, gy2],
+                "centroid": (cx, cy),
+                "confidence": conf,
+                "class_name": cls_name,
+                "is_ng": "ng" in cls_name
+            }
+
+            if "bolt" in cls_name:
+                detected_bolts.append(item_data)
+            elif "pin" in cls_name:
+                detected_pins.append(item_data)
 
         # Pasangkan Baut dengan Pin terdekat untuk validasi integritas
         pairs = self._pair_bolts_and_pins(detected_bolts, detected_pins, roi_bounds=roi_bounds)

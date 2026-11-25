@@ -27,9 +27,20 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
 DEFAULT_MODELS = [
+    os.path.join(PROJECT_ROOT, "Vision_Engine_Core", "02_Top_Inspection_Slat_Rib", "models", "best_rib_segmentation_v2.pt"),
     os.path.join(PROJECT_ROOT, "Vision_Engine_Core", "02_Top_Inspection_Slat_Rib", "models", "best_rib_v5.pt"),
     os.path.join(PROJECT_ROOT, "Vision_Engine_Core", "01_Side_Inspection_Bolt_Pin_Lekukan", "models", "best_v26_ok.pt"),
 ]
+
+
+def _resolve_yolo_task(model_path, explicit_task=None):
+    """Infer YOLO task ('segment' vs 'detect') unless explicitly supplied."""
+    if explicit_task and explicit_task != "auto":
+        return str(explicit_task)
+    name = os.path.basename(str(model_path or "")).lower()
+    if "seg" in name:
+        return "segment"
+    return "detect"
 
 
 def check_cuda_and_tensorrt():
@@ -46,17 +57,18 @@ def check_cuda_and_tensorrt():
         return False, None
 
 
-def benchmark_engine(engine_path, pt_path=None, imgsz=640, device=0, num_runs=30):
+def benchmark_engine(engine_path, pt_path=None, imgsz=640, device=0, num_runs=30, task=None):
     """Menguji perbandingan latensi & FPS antara PyTorch .pt dan TensorRT .engine."""
     from ultralytics import YOLO
     import numpy as np
 
-    print(f"\n⚡ Menjalankan Verifikasi Benchmark Inferensi ({num_runs} frames, imgsz={imgsz})...")
+    resolved_task = _resolve_yolo_task(engine_path, task)
+    print(f"\n⚡ Menjalankan Verifikasi Benchmark Inferensi ({num_runs} frames, imgsz={imgsz}, task={resolved_task})...")
     dummy_frame = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
 
     # 1. Benchmark TensorRT Engine
     try:
-        trt_model = YOLO(engine_path, task="detect")
+        trt_model = YOLO(engine_path, task=resolved_task)
         # Warmup GPU
         for _ in range(5):
             _ = trt_model(dummy_frame, verbose=False)
@@ -94,7 +106,7 @@ def benchmark_engine(engine_path, pt_path=None, imgsz=640, device=0, num_runs=30
             pass
 
 
-def export_single_model(pt_path, imgsz=640, half=True, device=0, workspace=4, run_bench=False):
+def export_single_model(pt_path, imgsz=640, half=True, device=0, workspace=4, run_bench=False, task=None):
     """Mengekspor satu model YOLO ke format TensorRT FP16 engine."""
     from ultralytics import YOLO
 
@@ -103,15 +115,16 @@ def export_single_model(pt_path, imgsz=640, half=True, device=0, workspace=4, ru
         print(f"[-] Model tidak ditemukan: {os.path.relpath(real_pt, PROJECT_ROOT)}")
         return False
 
+    resolved_task = _resolve_yolo_task(real_pt, task)
     engine_path = os.path.splitext(real_pt)[0] + ".engine"
     print("\n" + "-" * 76)
     print(f"📦 Mengonversi: {os.path.basename(real_pt)} -> {os.path.basename(engine_path)}")
     print(f"   Lokasi File : {os.path.relpath(real_pt, PROJECT_ROOT)}")
-    print(f"   Parameter   : FP16={half}, ImgSz={imgsz}, Device=CUDA:{device}, Workspace={workspace}GB")
+    print(f"   Parameter   : Task={resolved_task}, FP16={half}, ImgSz={imgsz}, Device=CUDA:{device}, Workspace={workspace}GB")
     print("-" * 76)
 
     try:
-        model = YOLO(real_pt)
+        model = YOLO(real_pt, task=resolved_task)
         export_res = model.export(
             format="engine",
             half=half,
@@ -132,7 +145,7 @@ def export_single_model(pt_path, imgsz=640, half=True, device=0, workspace=4, ru
             sz_mb = os.path.getsize(target_engine) / (1024 * 1024)
             print(f"[✅] Berhasil membuat TensorRT Engine: {os.path.basename(target_engine)} ({sz_mb:.1f} MB)")
             if run_bench:
-                benchmark_engine(target_engine, pt_path=real_pt, imgsz=imgsz, device=device)
+                benchmark_engine(target_engine, pt_path=real_pt, imgsz=imgsz, device=device, task=resolved_task)
             return True
         else:
             print(f"[!] File engine tidak ditemukan setelah ekspor selesai.")
@@ -153,6 +166,7 @@ def main():
     parser.add_argument("--no-half", action="store_true", help="Nonaktifkan presisi FP16 (gunakan FP32)")
     parser.add_argument("--device", type=int, default=0, help="CUDA Device ID (default: 0)")
     parser.add_argument("--workspace", type=int, default=4, help="TensorRT Workspace limit dalam GiB (default: 4)")
+    parser.add_argument("--task", choices=("auto", "detect", "segment"), default="auto", help="Task YOLO model (auto/detect/segment)")
     parser.add_argument("--benchmark", action="store_true", default=True, help="Jalankan uji latensi/FPS setelah ekspor selesai")
     args = parser.parse_args()
 
@@ -186,7 +200,8 @@ def main():
                 half=not args.no_half,
                 device=args.device,
                 workspace=args.workspace,
-                run_bench=args.benchmark
+                run_bench=args.benchmark,
+                task=args.task,
             )
             if ok:
                 success_count += 1

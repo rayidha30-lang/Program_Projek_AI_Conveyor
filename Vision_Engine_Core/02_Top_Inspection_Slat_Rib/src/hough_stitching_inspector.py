@@ -182,16 +182,78 @@ class HoughStitchingInspector:
         self.conveyor_stopped_frames = 0
         self.gate_armed = True
 
-    def adaptive_edge_detection(self, unwarped_bgr):
+    @staticmethod
+    def _preprocess_slat_extreme_gray(unwarped_bgr):
+        """
+        Preprocessing cepat (<0.4ms) gerbang slat untuk karat & pantulan specular ekstrem:
+        1. Tekan ekses merah karat via vektorisasi C++ OpenCV (identik 100% jika grayscale netral).
+        2. Redam hanya puncak specular jenuh (>232 netral) agar tepi celah & nilai Void gelap utuh.
+        """
+        if unwarped_bgr is None or unwarped_bgr.size == 0:
+            return unwarped_bgr
+        if unwarped_bgr.ndim == 2:
+            return unwarped_bgr.astype(np.uint8, copy=False)
+
+        lum = cv2.cvtColor(unwarped_bgr, cv2.COLOR_BGR2GRAY)
+        b, g, r = cv2.split(unwarped_bgr)
+        rust_diff = cv2.subtract(r, cv2.max(b, g))
+        _, rmask = cv2.threshold(rust_diff, 16, 255, cv2.THRESH_BINARY)
+        if cv2.countNonZero(rmask) > 0:
+            cv2.subtract(lum, rust_diff >> 2, dst=lum)
+
+        min_bgr = cv2.min(cv2.min(b, g), r)
+        max_bgr = cv2.max(cv2.max(b, g), r)
+        chroma = cv2.subtract(max_bgr, min_bgr)
+        glare_mask = ((min_bgr > 232) & (chroma < 38)).astype(np.uint8) * 255
+        cnt = cv2.countNonZero(glare_mask)
+        total_px = int(lum.shape[0] * lum.shape[1])
+        if 16 <= cnt <= int(0.30 * total_px):
+            med = np.minimum(cv2.medianBlur(lum, 5), 210).astype(np.uint8)
+            cv2.copyTo(med, glare_mask, lum)
+
+        return lum
+
+    @staticmethod
+    def _compute_flicker_immune_motion_delta(roi_curr, roi_prev):
+        """Hitung energi gerak plat yang kebal kedipan lampu (AC/PWM) & mikrovibrasi holder."""
+        if roi_curr is None or roi_prev is None or roi_curr.size == 0 or roi_prev.shape != roi_curr.shape:
+            return 0.0
+        h_r, w_r = roi_curr.shape[:2]
+        tw, th = max(32, w_r // 2), max(16, h_r // 2)
+        tiny_c = cv2.resize(roi_curr, (tw, th), interpolation=cv2.INTER_AREA).astype(np.float32)
+        tiny_p = cv2.resize(roi_prev, (tw, th), interpolation=cv2.INTER_AREA).astype(np.float32)
+
+        m_c = float(np.mean(tiny_c))
+        m_p = float(np.mean(tiny_p))
+        if m_c > 8.0 and m_p > 8.0:
+            gain = float(np.clip(m_p / m_c, 0.60, 1.65))
+            c_norm = np.clip(tiny_c * gain, 0.0, 255.0)
+        else:
+            c_norm = tiny_c - m_c + m_p
+
+        diff_val = float(np.mean(np.abs(c_norm - tiny_p)))
+        # Guard mikrovibrasi holder kamera saat konveyor diam via Phase Correlation (~0.15ms)
+        if float(np.std(tiny_p)) >= 4.0 and float(np.std(c_norm)) >= 4.0:
+            try:
+                (dx_s, dy_s), resp = cv2.phaseCorrelate(tiny_p - float(np.mean(tiny_p)), c_norm - float(np.mean(c_norm)))
+                dy_full = abs(float(dy_s)) * (float(h_r) / float(th))
+                dx_full = abs(float(dx_s)) * (float(w_r) / float(tw))
+                if resp >= 0.25 and dy_full < 0.45 and dx_full < 0.80:
+                    diff_val *= 0.35
+            except Exception:
+                pass
+        return diff_val
+
+    def adaptive_edge_detection(self, unwarped_bgr, preprocessed_gray=None):
         """
         Pipeline Deteksi Tepi Super Bersih & Anti-Karat (Diadopsi dari video_hough_line_inspector):
-        1. Bilateral Filter d=9, sigma=75 (meratakan karat & oli tanpa memudarkan celah fisik).
+        1. Preprocessing Glare/Karat/Iluminasi Horizontal + Bilateral Filter d=9, sigma=75.
         2. Filter Dominansi Gradien Sobel-Y (|Sy| >= 1.15*|Sx|) untuk memotong goresan vertikal.
-        3. Canny selektif tegas (55-140) untuk memotong noise permukaan metal.
+        3. Canny selektif tegas untuk memotong noise permukaan metal.
         4. Morphological Horizontal Bridge (25x1) untuk menyambung patahan mikro garis celah.
         5. Morphological Open (3x1) untuk membersihkan bintik karat non-garis yang tersisa.
         """
-        gray = cv2.cvtColor(unwarped_bgr, cv2.COLOR_BGR2GRAY)
+        gray = preprocessed_gray if preprocessed_gray is not None else self._preprocess_slat_extreme_gray(unwarped_bgr)
         v_mean = float(np.mean(gray))
 
         # 1. Bilateral filter anti-karat kuat (d=9, sigma=75)
@@ -420,7 +482,115 @@ class HoughStitchingInspector:
             "is_empty": False
         }
 
-    def inspect_unwarped(self, unwarped_bgr):
+    @staticmethod
+    def _detect_rib_base_signature_and_void(gray, y_seam):
+        """
+        Diskriminator Fisika 3D Bagian Bawah Rib & Perhitungan Center Void Terapit Plat.
+        Membedakan celah antar-plat (dibatasi plat terang di atas & bawah) dari kaki bawah
+        bilah Rib tegak (dinding gelap tinggi menyambung ke atas di atas y_seam).
+        """
+        h, w = gray.shape[:2]
+        y_s = int(y_seam)
+        x_mid_lo, x_mid_hi = max(0, int(0.26 * w)), min(w, int(0.74 * w))
+        x_v_lo, x_v_hi = max(0, int(0.40 * w)), min(w, int(0.60 * w))
+
+        y_v1 = max(0, y_s - 22)
+        y_v2 = min(h, y_s + 22)
+        sub_v = gray[y_v1:y_v2, x_v_lo:x_v_hi]
+        if sub_v.size == 0:
+            return False, 0
+
+        # Analisis asimetri slab atas vs bawah pada bentang metal tengah [260..740]
+        ab_y1 = max(0, y_s - 30)
+        ab_y2 = max(ab_y1 + 1, y_s - 6)
+        bl_y1 = min(h - 1, y_s + 6)
+        bl_y2 = min(h, max(bl_y1 + 1, y_s + 30))
+
+        above_slab = gray[ab_y1:ab_y2, x_mid_lo:x_mid_hi]
+        below_slab = gray[bl_y1:bl_y2, x_mid_lo:x_mid_hi]
+        i_above = float(np.median(above_slab)) if above_slab.size > 0 else 128.0
+        i_below = float(np.median(below_slab)) if below_slab.size > 0 else 128.0
+
+        col_above = np.mean(above_slab, axis=0) if above_slab.size > 0 else np.array([128.0])
+        col_below = np.mean(below_slab, axis=0) if below_slab.size > 0 else np.array([128.0])
+        dark_wall_ratio = float(np.mean((col_above < 65.0) & ((col_below - col_above) >= 28.0)))
+
+        # Komponen void atas, tengah groove, dan bawah pada jendela void tengah [400..600]
+        y_g1 = max(y_v1, y_s - 2)
+        y_g2 = min(y_v2, y_s + 3)
+        void_above = int(np.sum(gray[y_v1:y_g1, x_v_lo:x_v_hi] < 45)) if y_g1 > y_v1 else 0
+        void_groove = int(np.sum(gray[y_g1:y_g2, x_v_lo:x_v_hi] < 45)) if y_g2 > y_g1 else 0
+        void_below = int(np.sum(gray[y_g2:y_v2, x_v_lo:x_v_hi] < 45)) if y_v2 > y_g2 else 0
+
+        top_strip_y2 = min(h, y_v1 + 5)
+        top_strip = gray[y_v1:top_strip_y2, x_v_lo:x_v_hi]
+        open_top_cols = int(np.sum(np.mean(top_strip, axis=0) < 55.0)) if top_strip.size > 0 else 0
+
+        bot_strip_y1 = max(0, y_v2 - 5)
+        bot_strip = gray[bot_strip_y1:y_v2, x_v_lo:x_v_hi]
+        open_bot_cols = int(np.sum(np.mean(bot_strip, axis=0) < 55.0)) if bot_strip.size > 0 else 0
+        dark_wall_below_ratio = float(np.mean((col_below < 60.0) & ((col_above - col_below) >= 42.0)))
+
+        diff_ba = i_below - i_above
+        diff_ab = i_above - i_below
+
+        # Guard kontras relatif anti-karat: dinding rib berkarat (gray 55-88) di atas y_seam
+        top_rel_cols = int(np.sum(np.mean(top_strip, axis=0) < min(88.0, i_below - 26.0))) if top_strip.size > 0 else 0
+        dark_wall_rel_ratio = float(np.mean((col_above < 88.0) & ((col_below - col_above) >= 32.0)))
+
+        is_rib_base = bool(
+            ((diff_ba >= 28.0) and (open_top_cols >= 45) and (void_above > 3 * max(1, void_below + void_groove)))
+            or ((diff_ba >= 32.0) and (dark_wall_ratio >= 0.45) and (i_above < 72.0))
+            or ((open_top_cols >= 75) and (void_above >= 900) and (void_below <= 250) and (diff_ba >= 20.0))
+            or ((diff_ba >= 34.0) and (i_above < 0.72 * max(1.0, i_below)) and (i_above < 88.0) and (dark_wall_rel_ratio >= 0.50) and (top_rel_cols >= 75))
+        )
+        # Deteksi simetris sisi puncak atas Rib (saat sudut kamera rendah memandang dinding gelap Rib di bawah crest)
+        is_rib_crest = bool(
+            ((diff_ab >= 45.0) and (i_below < 60.0) and (open_bot_cols >= 75) and (void_below > 3 * max(1, void_above + void_groove)))
+            or ((diff_ab >= 48.0) and (dark_wall_below_ratio >= 0.55) and (i_below < 55.0) and (open_bot_cols >= 60))
+        )
+        is_rib_wall = bool(is_rib_base or is_rib_crest)
+
+        # Verifikasi Black Top-Hat (1, 25): hanya parit celah terapit plat terang atas & bawah
+        # yang lolos sebagai center_void; dinding gelap tinggi rib (>25px) menghasilkan respons BTH ~ 0.
+        bth_by1 = max(0, y_v1 - 25)
+        bth_by2 = min(h, y_v2 + 25)
+        bth_band = gray[bth_by1:bth_by2, x_v_lo:x_v_hi]
+        if bth_band.size > 0:
+            k_bth = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25))
+            bth_resp = cv2.morphologyEx(bth_band, cv2.MORPH_BLACKHAT, k_bth)
+            rel_v1 = y_v1 - bth_by1
+            rel_v2 = rel_v1 + sub_v.shape[0]
+            bth_sub = bth_resp[rel_v1:rel_v2, :]
+            bounded_dark_mask = (sub_v < 45) & (bth_sub >= 32)
+        else:
+            bounded_dark_mask = (sub_v < 45)
+
+        # Hitung center_void hanya untuk celah terapit plat (tolak bayangan dinding terbuka ke atas atau ke bawah)
+        if sub_v.shape[0] >= 12:
+            top_col_mean = np.mean(sub_v[:4, :], axis=0)
+            bot_col_mean = np.mean(sub_v[-4:, :], axis=0)
+            top8_col_mean = np.mean(sub_v[:8, :], axis=0)
+            bot8_col_mean = np.mean(sub_v[-8:, :], axis=0)
+            unbounded_top_cols = (top_col_mean < 52.0) & ((bot8_col_mean - top_col_mean) >= 18.0)
+            unbounded_bot_cols = (bot_col_mean < 52.0) & ((top8_col_mean - bot_col_mean) >= 24.0)
+            if np.any(unbounded_top_cols) or np.any(unbounded_bot_cols):
+                dark_mask = bounded_dark_mask.copy()
+                if np.any(unbounded_top_cols):
+                    groove_rel_lo = max(0, (y_s - 3) - y_v1)
+                    dark_mask[:groove_rel_lo, unbounded_top_cols] = False
+                if np.any(unbounded_bot_cols):
+                    groove_rel_hi = min(sub_v.shape[0], (y_s + 4) - y_v1)
+                    dark_mask[groove_rel_hi:, unbounded_bot_cols] = False
+                center_void = int(np.sum(dark_mask))
+            else:
+                center_void = int(np.sum(bounded_dark_mask))
+        else:
+            center_void = int(np.sum(bounded_dark_mask))
+
+        return is_rib_wall, center_void
+
+    def inspect_unwarped(self, unwarped_bgr, preprocessed_gray=None):
         """
         Menjalankan seluruh pipeline inspeksi pada citra kanonikal unwarped (1000 x 140).
         Mengimplementasikan Metrologi Profil Geometris:
@@ -435,8 +605,11 @@ class HoughStitchingInspector:
         t0 = time.time()
         h, w = unwarped_bgr.shape[:2]
 
-        # 1. Adaptive Edge Detection anti-karat & oli
-        edges, mode_tag, v_mean, max_line_gap = self.adaptive_edge_detection(unwarped_bgr)
+        # 1. Adaptive Edge Detection anti-karat, anti-glare & pencahayaan
+        gray = preprocessed_gray if preprocessed_gray is not None else self._preprocess_slat_extreme_gray(unwarped_bgr)
+        edges, mode_tag, v_mean, max_line_gap = self.adaptive_edge_detection(
+            unwarped_bgr, preprocessed_gray=gray
+        )
 
         # 2. Deteksi Garis Hough & Filter Sudut (untuk visualisasi & stitching kompatibel)
         lines = self.detect_and_filter_lines(edges, max_line_gap)
@@ -460,8 +633,7 @@ class HoughStitchingInspector:
         y_hi = min(h, y_seam + band)
         sub_edges = edges[y_lo:y_hi, 240:680]
 
-        # Citra Grayscale untuk Dark Valley Intensity Weighting (parit gelap celah vs pantulan terang)
-        gray = cv2.cvtColor(unwarped_bgr, cv2.COLOR_BGR2GRAY)
+        # Citra Grayscale anti-glare untuk Dark Valley Intensity Weighting (parit gelap celah vs pantulan terang)
         sub_gray = gray[y_lo:y_hi, 240:680]
 
         # Ekstraksi kontur fisik celah kontinu (Tahap 1: Ekstraksi tepi kasar dengan Dark Valley Weighting - Vectorized)
@@ -556,8 +728,8 @@ class HoughStitchingInspector:
                 raw_ys = np.where(valid_mask3, y_lo + best_pts3, np.nan)
                 valid_mask = ~np.isnan(raw_ys)
 
-        # Deteksi Gap Void pada celah tengah
-        center_void = int(np.sum(gray[max(0, y_seam - 22):min(h, y_seam + 22), 400:600] < 45))
+        # Deteksi Gap Void pada celah tengah + Diskriminator Fisika 3D Bagian Bawah Rib
+        is_rib_base, center_void = self._detect_rib_base_signature_and_void(gray, y_seam)
 
         if np.sum(valid_mask) > 50:
             valid_indices = np.where(valid_mask)[0]
@@ -612,8 +784,8 @@ class HoughStitchingInspector:
 
         is_seam_ok = bool(is_flat_ok and is_curv_ok and is_cov_ok and is_void_ok)
 
-        # Cek kondisi transisi: Jika energi celah rendah ATAU sampel kontur tidak memadai (< 40 titik)
-        is_transition = bool(seam_energy < 18.0 or np.sum(valid_mask) <= 40)
+        # Cek kondisi transisi: Jika energi celah rendah, sampel tidak memadai, atau terdeteksi kaki bawah Rib 3D
+        is_transition = bool(is_rib_base or seam_energy < 18.0 or np.sum(valid_mask) <= 40)
 
         # Panjang efektif celah tersambung (proporsional bentang terukur)
         l_seam = float(cov * float(w_span))
@@ -626,7 +798,13 @@ class HoughStitchingInspector:
             if (d_ang >= 2.5 or abs(l["angle"]) >= 3.5) and l["length"] >= 35.0:
                 deform_lines.append(l)
 
-        if is_transition:
+        if is_rib_base:
+            status = "WAIT"
+            is_ok = False
+            is_ng = False
+            center_void = 0
+            mode_eval = "WAIT (Oklusi Bagian Bawah Sirip / Rib Base)"
+        elif is_transition:
             status = "WAIT"
             is_ok = False
             is_ng = False
@@ -653,6 +831,7 @@ class HoughStitchingInspector:
             "is_ok": is_ok,
             "is_ng": is_ng,
             "is_transition": is_transition,
+            "is_rib_base_occluded": bool(is_rib_base),
             "l_seam": l_seam,
             "y_seam": y_seam,
             "seam_energy": seam_energy,
@@ -766,13 +945,12 @@ class HoughStitchingInspector:
 
         unwarped = cv2.warpPerspective(frame, self._warp_M, (self.canonical_w, self.canonical_h))
 
-        # 0. Deteksi Gerakan Konveyor (Conveyor Motion Detector)
-        # Menghitung perbedaan intensitas piksel frame-ke-frame pada pelat baja kanonikal
-        unwarped_gray = cv2.cvtColor(unwarped, cv2.COLOR_BGR2GRAY)
+        # 0. Deteksi Gerakan Konveyor (Flicker & Micro-Vibration Immune Motion Detector)
+        unwarped_gray = self._preprocess_slat_extreme_gray(unwarped)
         if self.prev_unwarped_gray is not None:
             roi_curr = unwarped_gray[15:125, 200:800]
             roi_prev = self.prev_unwarped_gray[15:125, 200:800]
-            diff_val = float(np.mean(cv2.absdiff(roi_curr, roi_prev)))
+            diff_val = self._compute_flicker_immune_motion_delta(roi_curr, roi_prev)
             self.motion_energy = 0.35 * diff_val + 0.65 * self.motion_energy
         else:
             self.motion_energy = 10.0
@@ -787,8 +965,8 @@ class HoughStitchingInspector:
 
         self.is_conveyor_moving = bool(self.conveyor_stopped_frames < 4)
 
-        # 1. Jalankan inspeksi unwarped pada horizon celah utama
-        res = self.inspect_unwarped(unwarped)
+        # 1. Jalankan inspeksi unwarped pada horizon celah utama (reuse preprocessed_gray)
+        res = self.inspect_unwarped(unwarped, preprocessed_gray=unwarped_gray)
         y_seam = res["y_seam"]
         seam_energy = res["seam_energy"]
 
@@ -806,8 +984,8 @@ class HoughStitchingInspector:
             if self.is_conveyor_moving and (y_seam < 55 or res["is_transition"] or y_seam >= 95):
                 self.gate_armed = True
 
-        # Kondisi pemicuan awal: Konveyor HARUS bergerak, gerbang ter-arm, celah plat di zona masuk tengah
-        in_entry_zone = (not res["is_transition"]) and (60 <= y_seam <= 84)
+        # Kondisi pemicuan awal: Konveyor HARUS bergerak, gerbang ter-arm, celah plat di zona masuk tengah (bukan bagian bawah Rib)
+        in_entry_zone = (not res["is_transition"]) and (not res.get("is_rib_base_occluded", False)) and (60 <= y_seam <= 84)
         trigger_now = (
             self.is_conveyor_moving and
             self.gate_armed and
@@ -835,7 +1013,7 @@ class HoughStitchingInspector:
             if self.is_conveyor_moving:
                 self.transit_frames += 1
             dist_center = abs(y_seam - 70.0)
-            if not res["is_transition"]:
+            if not res["is_transition"] and not res.get("is_rib_base_occluded", False):
                 self.transit_samples.append({
                     "res": dict(res),
                     "dist": dist_center,
@@ -930,7 +1108,7 @@ class HoughStitchingInspector:
             frames_since_fin = self.current_frame_idx - self.last_finish_frame
             if frames_since_fin <= 25 and self.latched_status in ["OK", "NG"]:
                 display_status = self.latched_status
-            elif res.get("is_ng", False) and not res.get("is_transition", True) and (58 <= res.get("y_seam", 0) <= 88) and (
+            elif res.get("is_ng", False) and not res.get("is_transition", True) and not res.get("is_rib_base_occluded", False) and (58 <= res.get("y_seam", 0) <= 88) and (
                 res.get("sagitta", 0) > self.max_sagitta or
                 res.get("pv_flatness", 0) > self.max_flatness_pv or
                 res.get("center_void", 0) > self.max_center_void

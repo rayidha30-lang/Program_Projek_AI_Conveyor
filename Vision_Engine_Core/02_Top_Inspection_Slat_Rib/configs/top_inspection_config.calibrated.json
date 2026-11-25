@@ -51,7 +51,7 @@
     "calibrated_mll_ratio": 0.684,
     "calibrated_v_thresh": 94.4,
     "total_slats_in_loop": 16,
-    "bracket_tilt_deg": 0.249,
+    "bracket_tilt_deg": -1.228,
     "max_flatness_pv": 16.5,
     "max_sagitta": 8.6,
     "max_center_void": 1450,
@@ -68,9 +68,9 @@
     "scale_factor_mm_per_px": 0.515,
     "scale_factor_y_mm_per_px": 0.442
   },
-  "updated_at": "2026-11-15 08:04:35",
+  "updated_at": "2026-11-20 07:16:12",
   "calibration_profile": {
-    "calibrated_at": "2026-11-15 08:04:35",
+    "calibrated_at": "2026-11-20 07:16:12",
     "total_slats_in_loop": 16,
     "bracket_tilt_deg": 0.9,
     "median_y_seam_px": 89.0,
@@ -99,50 +99,54 @@
     },
     "left_rail_px": 188,
     "right_rail_px": 1759,
-    "conveyor_center_x": 958.5,
+    "conveyor_center_x": 677.0,
     "conveyor_width_px": 1571,
     "calibration_method": "INTERACTIVE_DUAL_RAILS_PERSPECTIVE",
-    "measured_tilt_deg": 0.249,
+    "measured_tilt_deg": -1.228,
     "target_tilt_deg": 0.9,
-    "angle_correction_deg": -0.249,
-    "lateral_offset_px": -3.5,
-    "measured_width_px": 1526.0,
-    "scale_x": 1.001,
+    "angle_correction_deg": 1.228,
+    "lateral_offset_px": -40.3,
+    "measured_width_px": 1004.0,
+    "scale_x": 1.015,
+    "pitch_width_ratio": 0.979,
+    "recommended_rib_y_top_frac": 0.28,
+    "recommended_prime_min_y": 315,
+    "recommended_min_span_px": 680.0,
     "left_rail_pts": [
       [
-        278.0,
-        216.0
+        241.0,
+        144.0
       ],
       [
-        113.0,
-        864.0
+        109.0,
+        576.0
       ]
     ],
     "right_rail_pts": [
       [
-        1636.0,
-        216.0
+        1123.0,
+        144.0
       ],
       [
-        1807.0,
-        864.0
+        1235.0,
+        576.0
       ]
     ]
   },
   "rectification_matrix": [
     [
-      0.9921881639543833,
-      -0.016603926632867853,
-      4.810538283968616
+      1.0263413283295417,
+      0.04600721011093534,
+      -67.8380976716113
     ],
     [
-      1.2779545607196047e-17,
-      0.9829568293271165,
-      2.9450598922742706
+      5.609547913895528e-17,
+      1.0216332499472836,
+      -2.492150393927082
     ],
     [
-      -1.0438353713097348e-21,
-      -1.578071358600325e-05,
+      1.1475116300159574e-21,
+      3.0046180482338466e-05,
       1.0
     ]
   ]

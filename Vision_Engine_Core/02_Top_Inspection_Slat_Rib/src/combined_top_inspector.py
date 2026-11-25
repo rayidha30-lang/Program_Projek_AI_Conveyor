@@ -309,6 +309,8 @@ class CombinedTopInspector:
         self.profile_banner_text = ""
         self.profile_banner_timer = 0
         self.rect_matrix = None
+        self._rect_calib_size = (1920, 1080)
+        self._scaled_rect_cache = {}
         self.motion_calibrator = None
         self.device = device
 
@@ -383,6 +385,8 @@ class CombinedTopInspector:
                     self.rect_matrix = np.array(cfg["rectification_matrix"], dtype=np.float32)
                 else:
                     self.rect_matrix = None
+                self._rect_calib_size = self._infer_calib_frame_size(cfg)
+                self._scaled_rect_cache.clear()
 
                 if "calibration_profile" in cfg:
                     cp = cfg["calibration_profile"]
@@ -504,6 +508,8 @@ class CombinedTopInspector:
         self.slat_history_samples = []
         self.latched_slat_data = None
         self.latched_hold_frames = 0
+        self._slat_frame_idx = 0
+        self._last_rib_slat_occl_frame = -100
 
         # Single-Capture Per-Object Latch & Best-Shot Peak Buffer (Terpisah Slat vs Rib)
         self.logged_slat_id = None
@@ -575,6 +581,55 @@ class CombinedTopInspector:
             self.slat_y_min = 0.50 * h
             self.slat_y_max = 0.70 * h
 
+    @staticmethod
+    def _infer_calib_frame_size(cfg):
+        """Ambil atau simpulkan dimensi frame (w, h) asal tempat rectification_matrix dikalibrasi."""
+        cp = (cfg or {}).get("calibration_profile", {}) if isinstance(cfg, dict) else {}
+        cw = cp.get("calib_frame_w")
+        ch = cp.get("calib_frame_h")
+        try:
+            if cw is not None and ch is not None and int(cw) > 0 and int(ch) > 0:
+                return int(cw), int(ch)
+        except (TypeError, ValueError):
+            pass
+        # Inferensi profil kalibrasi historis 720p (left_rail_pts Y <= 620 & center_x <= 780)
+        lpts = cp.get("left_rail_pts")
+        cx = cp.get("conveyor_center_x")
+        try:
+            if isinstance(lpts, list) and len(lpts) >= 2:
+                max_y = max(float(pt[1]) for pt in lpts)
+                if max_y <= 620.0 and (cx is None or float(cx) <= 780.0):
+                    return 1280, 720
+        except (TypeError, ValueError, IndexError):
+            pass
+        return 1920, 1080
+
+    def _get_scaled_rect_matrix(self, w_f, h_f):
+        """Kembalikan rectification_matrix terskala via S @ H @ S^-1 jika resolusi frame berbeda dari kalibrasi."""
+        M = getattr(self, "rect_matrix", None)
+        if M is None:
+            return None
+        cw, ch = getattr(self, "_rect_calib_size", (1920, 1080))
+        wf_i, hf_i = int(w_f), int(h_f)
+        if wf_i <= 0 or hf_i <= 0 or cw <= 0 or ch <= 0 or (wf_i == int(cw) and hf_i == int(ch)):
+            return M
+        cache_key = (wf_i, hf_i)
+        cached = self._scaled_rect_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        sx = float(wf_i) / float(cw)
+        sy = float(hf_i) / float(ch)
+        S = np.diag([sx, sy, 1.0])
+        S_inv = np.diag([1.0 / sx, 1.0 / sy, 1.0])
+        if M.shape == (3, 3):
+            M_scaled = (S @ M.astype(np.float64) @ S_inv).astype(np.float32)
+        else:
+            M3 = np.eye(3, dtype=np.float64)
+            M3[:2, :] = M.astype(np.float64)
+            M_scaled = (S @ M3 @ S_inv)[:2, :].astype(np.float32)
+        self._scaled_rect_cache[cache_key] = M_scaled
+        return M_scaled
+
     def reset_counters(self):
         """Mereset seluruh statistik QC (Slat dan Rib) ke nilai 0."""
         with self._inspect_lock:
@@ -583,6 +638,8 @@ class CombinedTopInspector:
             self.slat_history_samples.clear()
             self.latched_slat_data = None
             self.latched_hold_frames = 0
+            self._slat_frame_idx = 0
+            self._last_rib_slat_occl_frame = -100
             self.logged_slat_id = None
             self.logged_rib_id = None
             self._best_slat_candidate = None
@@ -593,6 +650,20 @@ class CombinedTopInspector:
             self._last_emitted_rib_id = None
             if self.db_bridge is not None and hasattr(self.db_bridge, "reset_entity_cache"):
                 self.db_bridge.reset_entity_cache()
+
+    def reset_active_tracking(self):
+        """Mereset state pelacakan aktif in-flight saja (saat seek video) tanpa menghapus counter QC."""
+        with self._inspect_lock:
+            if hasattr(self.rib_inspector, "reset_active_tracking"):
+                self.rib_inspector.reset_active_tracking()
+            self.slat_history_samples.clear()
+            self.latched_slat_data = None
+            self.latched_hold_frames = 0
+            self._last_rib_slat_occl_frame = -100
+            self._best_slat_candidate = None
+            self._best_rib_candidate = None
+            self._current_slat_cycle_id = None
+            self._current_rib_cycle_id = None
 
     def toggle_db(self):
         """Membalik status saklar database logging (ON <-> OFF)."""
@@ -612,6 +683,8 @@ class CombinedTopInspector:
                     self.rect_matrix = np.array(cfg["rectification_matrix"], dtype=np.float32)
                 else:
                     self.rect_matrix = None
+                self._rect_calib_size = self._infer_calib_frame_size(cfg)
+                self._scaled_rect_cache.clear()
 
                 if "slat_polygon" in cfg and len(cfg["slat_polygon"]) >= 4:
                     self.slat_polygon = cfg["slat_polygon"]
@@ -622,6 +695,13 @@ class CombinedTopInspector:
 
                 if "calibration_profile" in cfg:
                     self._apply_golden_reference(cfg["calibration_profile"])
+                    if hasattr(self.rib_inspector, "set_adaptive_geometry"):
+                        cp = cfg["calibration_profile"] or {}
+                        self.rib_inspector.set_adaptive_geometry(
+                            min_span_px=cp.get("recommended_min_span_px")
+                        )
+                elif hasattr(self.rib_inspector, "set_adaptive_geometry"):
+                    self.rib_inspector.set_adaptive_geometry(min_span_px=None)
 
             th = cfg.get("thresholds", {})
             if "max_flatness_pv" in th:
@@ -912,6 +992,9 @@ class CombinedTopInspector:
                 # Pasang matriks rektifikasi langsung ke memori runtime
                 m_rect_list = calib_res["rectification_matrix"]
                 self.rect_matrix = np.array(m_rect_list, dtype=np.float32)
+                h_cal, w_cal = self.calib_buffer[0].shape[:2]
+                self._rect_calib_size = (int(w_cal), int(h_cal))
+                self._scaled_rect_cache.clear()
 
                 # Muat struktur konfigurasi golden default untuk menjaga integritas seluruh batas QC
                 cfg_data = {}
@@ -950,6 +1033,8 @@ class CombinedTopInspector:
                     cfg_data["calibration_profile"] = {}
                 cfg_data["calibration_profile"].update({
                     "calibrated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "calib_frame_w": int(w_cal),
+                    "calib_frame_h": int(h_cal),
                     "golden_reference": {
                         "source_video": "Kamera posisi 3 dimmer 2 - Reverse.mp4",
                         "source_image": "WIN_20261005_09_01_08_Pro.jpg",
@@ -1018,11 +1103,22 @@ class CombinedTopInspector:
         try:
             from calibrate_dual_rails import DualRailCalibrator
             calib = DualRailCalibrator(config_path=self.config_path)
-            calib.auto_snap_rails(frame)
+            rib_boxes_hint = None
+            try:
+                if hasattr(self.rib_inspector, "detect_yolo_zone"):
+                    h_fr, w_fr = frame.shape[:2]
+                    _, _, _, rib_boxes_hint = self.rib_inspector.detect_yolo_zone(
+                        frame, (int(0.02 * w_fr), int(0.18 * h_fr), int(0.98 * w_fr), int(0.68 * h_fr))
+                    )
+            except Exception:
+                rib_boxes_hint = None
+            calib.auto_snap_rails(frame, rib_boxes=rib_boxes_hint)
             M, m_type = calib.compute_rectification(frame.shape[1], frame.shape[0])
 
             with self._inspect_lock:
                 self.rect_matrix = np.array(M, dtype=np.float32)
+                self._rect_calib_size = (int(frame.shape[1]), int(frame.shape[0]))
+                self._scaled_rect_cache.clear()
                 saved_web_th = None
                 if getattr(self, "threshold_source_mode", "DATASET") == "WEB" and os.path.exists(self.config_path):
                     try:
@@ -1045,6 +1141,22 @@ class CombinedTopInspector:
                         pass
                 self._sync_config_mtime()
                 self.active_profile_name = "HASIL_KALIBRASI"
+                # Terapkan adaptasi zona & bentang minimum langsung di memori tanpa menarik batas ke lorong jauh
+                rec_top_y = max(0.26, float(calib.metrology.get("recommended_rib_y_top_frac", 0.28)))
+                rec_prime_min = max(295, int(calib.metrology.get("recommended_prime_min_y", 315)))
+                rec_min_span = calib.metrology.get("recommended_min_span_px")
+                if rec_top_y < 0.28 and isinstance(self.rib_zone, list) and len(self.rib_zone) >= 4:
+                    new_zone = [list(pt) for pt in self.rib_zone]
+                    new_zone[0][1] = min(float(new_zone[0][1]), rec_top_y)
+                    new_zone[1][1] = min(float(new_zone[1][1]), rec_top_y)
+                    self.rib_zone = new_zone
+                    pmax_cur = getattr(self.rib_inspector, "prime_max_y", 505)
+                    self.rib_inspector.set_prime_zone(
+                        min(getattr(self.rib_inspector, "prime_min_y", 315), rec_prime_min),
+                        pmax_cur,
+                    )
+                if hasattr(self.rib_inspector, "set_adaptive_geometry"):
+                    self.rib_inspector.set_adaptive_geometry(min_span_px=rec_min_span)
                 tilt_val = calib.metrology.get("measured_tilt_deg", 0.0)
                 offset_val = calib.metrology.get("lateral_offset_px", 0.0)
                 self.profile_banner_text = f"AUTO-SNAP REL: Tilt {tilt_val:+.2f} deg, Geser {offset_val:+.1f} px ({m_type})"
@@ -1079,11 +1191,12 @@ class CombinedTopInspector:
         """
         if frame_raw is None:
             return None
-        if getattr(self, "rect_matrix", None) is not None:
-            if self.rect_matrix.shape == (3, 3):
-                ann = cv2.warpPerspective(frame_raw, self.rect_matrix, (frame_raw.shape[1], frame_raw.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        rect_m_full = self._get_scaled_rect_matrix(frame_raw.shape[1], frame_raw.shape[0])
+        if rect_m_full is not None:
+            if rect_m_full.shape == (3, 3):
+                ann = cv2.warpPerspective(frame_raw, rect_m_full, (frame_raw.shape[1], frame_raw.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
             else:
-                ann = cv2.warpAffine(frame_raw, self.rect_matrix, (frame_raw.shape[1], frame_raw.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                ann = cv2.warpAffine(frame_raw, rect_m_full, (frame_raw.shape[1], frame_raw.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         else:
             ann = frame_raw.copy()
         h_f, w_f = ann.shape[:2]
@@ -1185,9 +1298,10 @@ class CombinedTopInspector:
         title = f"[AI METROLOGY EVIDENCE] TOP CAM-01 | SLAT #{slat_no if slat_no is not None else '-'}: [{s_stat}]{conf_slat_hdr} | RIB #{rib_no if rib_no is not None else '-'}: [{r_stat}]{conf_rib_hdr}"
         cv2.putText(ann, title, (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 230, 255), 2, cv2.LINE_AA)
 
+        rib_scale = float(rib_res.get("rib_mm_per_px", 750.0 / 1200.0) or (750.0 / 1200.0))
         metrics_txt = (
             f"PLAT: PV={s_pv*scale:.1f}mm ({s_pv:.1f}px) | Sag={s_sag*scale:.1f}mm ({s_sag:.1f}px) | Void={s_void}px  ||  "
-            f"RIB: Dev={r_dev*scale:.1f}mm ({r_dev:.1f}px) | Sag={r_sag*scale:.1f}mm ({r_sag:.1f}px)"
+            f"RIB: Dev={r_dev*rib_scale:.1f}mm ({r_dev:.1f}px) | Sag={r_sag*rib_scale:.1f}mm ({r_sag:.1f}px)"
         )
         cv2.putText(ann, metrics_txt, (20, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (240, 240, 240), 1, cv2.LINE_AA)
 
@@ -1312,6 +1426,38 @@ class CombinedTopInspector:
 
         # 1a. Siklus Slat independen: pergantian slat hanya men-flush kandidat slat
         slat_changed = (self._current_slat_cycle_id is not None and curr_slat_no != self._current_slat_cycle_id)
+        if self._best_slat_candidate is not None:
+            cand_s_res = self._best_slat_candidate.get("slat_res", {})
+            cand_void_only = (
+                float(cand_s_res.get("pv_flatness", 0.0) or 0.0) <= self.slat_inspector.max_flatness_pv
+                and float(cand_s_res.get("sagitta", 0.0) or 0.0) <= self.slat_inspector.max_sagitta
+            )
+            cand_y_frame = self._best_slat_candidate.get("y_seam_frame")
+            pg_overlaps_cand = False
+            if cand_y_frame is not None:
+                for pb in (rib_res.get("pre_gate_rib_boxes", []) or []):
+                    b = pb.get("box") if isinstance(pb, dict) else pb
+                    if b is not None and (b[1] - 15) <= cand_y_frame <= (b[3] + 25):
+                        pg_overlaps_cand = True
+                        break
+            if cand_void_only:
+                active_box = rib_res.get("active_box")
+                cand_frame = self._best_slat_candidate.get("captured_frame_idx", -999)
+                curr_frame = getattr(self, "_slat_frame_idx", 0)
+                y_slat_lo = float(getattr(self, "slat_y_min", 0.50 * getattr(self, "_last_h_f", 1080)))
+                rising_out_of_gate = (
+                    active_box is not None
+                    and (curr_frame - cand_frame) <= 15
+                    and float(active_box[3]) >= (y_slat_lo - max(18.0, 0.05 * float(getattr(self, "_last_h_f", 1080))))
+                )
+                if (
+                    slat_res.get("is_rib_base_occluded", False)
+                    or slat_res.get("is_seam_masked_occluded", False)
+                    or pg_overlaps_cand
+                    or rising_out_of_gate
+                ):
+                    self._best_slat_candidate = None
+
         if slat_changed:
             self._flush_slat_candidate_if_needed()
             self._current_slat_cycle_id = curr_slat_no
@@ -1359,7 +1505,12 @@ class CombinedTopInspector:
             slat_res, rib_res, slat_no=slat_no, rib_no=rib_no
         )
 
-        is_slat_ng = bool(slat_res.get("is_ng", False)) and (slat_res.get("status") == "NG")
+        is_slat_ng = (
+            bool(slat_res.get("is_ng", False))
+            and (slat_res.get("status") == "NG")
+            and not bool(slat_res.get("is_rib_base_occluded", False))
+            and not bool(slat_res.get("is_seam_masked_occluded", False))
+        )
         is_rib_ng = bool(rib_res.get("is_ng", False)) and (rib_res.get("status") == "NG")
 
         # Filter eliminasi false alarm: Abaikan vonis NG jika kontur garis sirip belum membentang penuh
@@ -1389,6 +1540,8 @@ class CombinedTopInspector:
                     "slat_res": dict(slat_res),
                     "slat_no": curr_slat_no,
                     "rib_no": curr_rib_no,
+                    "y_seam_frame": slat_res.get("y_seam_frame"),
+                    "captured_frame_idx": getattr(self, "_slat_frame_idx", 0),
                 }
                 updated = True
 
@@ -1443,6 +1596,7 @@ class CombinedTopInspector:
             }
 
         h_f, w_f = frame.shape[:2]
+        self._slat_frame_idx = getattr(self, "_slat_frame_idx", 0) + 1
 
         # Cek hot-reload jika operator sedang memakai mode threshold WEB Dashboard
         self._check_web_config_hot_reload()
@@ -1464,12 +1618,13 @@ class CombinedTopInspector:
         if not hasattr(self, "slat_y_min") or self.slat_y_min is None:
             self._update_slat_y_bounds(w_f, h_f)
 
-        # Virtual Image Rectification (Metode 4) jika profil terkalibrasi aktif
-        if getattr(self, "rect_matrix", None) is not None:
-            if self.rect_matrix.shape == (3, 3):
+        # Virtual Image Rectification (Metode 4) jika profil terkalibrasi aktif (otomatis diskalakan ke resolusi frame)
+        rect_m = self._get_scaled_rect_matrix(w_f, h_f)
+        if rect_m is not None:
+            if rect_m.shape == (3, 3):
                 frame_inspected = cv2.warpPerspective(
                     frame,
-                    self.rect_matrix,
+                    rect_m,
                     (w_f, h_f),
                     flags=cv2.INTER_LINEAR,
                     borderMode=cv2.BORDER_REPLICATE
@@ -1477,7 +1632,7 @@ class CombinedTopInspector:
             else:
                 frame_inspected = cv2.warpAffine(
                     frame,
-                    self.rect_matrix,
+                    rect_m,
                     (w_f, h_f),
                     flags=cv2.INTER_LINEAR,
                     borderMode=cv2.BORDER_REPLICATE
@@ -1513,19 +1668,26 @@ class CombinedTopInspector:
             b = yb.get("box") if isinstance(yb, dict) else yb
             if b is not None and b[3] >= gate_top and b[1] <= gate_bot and b not in all_boxes_to_mask:
                 all_boxes_to_mask.append(b)
+        for pb in rib_res.get("pre_gate_rib_boxes", []):
+            b = pb.get("box") if isinstance(pb, dict) else pb
+            if b is not None and b[3] >= gate_top and b[1] <= gate_bot and b not in all_boxes_to_mask:
+                all_boxes_to_mask.append(b)
 
+        masked_y_intervals = []
         if len(all_boxes_to_mask) > 0:
             is_slat_occluded = True
             frame_for_slat = frame_inspected.copy()
+            pad_bot_extra = max(22, int(round(0.032 * h_f)))
+            feather_px = 6
             for box in all_boxes_to_mask:
                 bx1, by1, bx2, by2 = box
 
-                # Ambil sampel warna bersih plat slat dari bawah bilah sirip (atau dari atas jika di dasar frame)
-                sample_y1 = min(h_f - 12, max(0, by2 + 10))
+                # Ambil sampel warna bersih plat slat dari bawah bilah sirip (di luar bayangan akar las)
+                sample_y1 = min(h_f - 12, max(0, by2 + pad_bot_extra + 4))
                 sample_y2 = min(h_f, sample_y1 + 12)
                 sample_strip = frame_for_slat[sample_y1:sample_y2, max(0, bx1):min(w_f, bx2)]
                 if sample_strip.size == 0 or sample_strip.shape[0] < 2:
-                    sample_y1 = max(0, by1 - 20)
+                    sample_y1 = max(0, by1 - 24)
                     sample_y2 = min(h_f, sample_y1 + 12)
                     sample_strip = frame_for_slat[sample_y1:sample_y2, max(0, bx1):min(w_f, bx2)]
 
@@ -1537,11 +1699,13 @@ class CombinedTopInspector:
                 else:
                     med_col = np.array([80, 80, 80], dtype=np.uint8)
 
-                # Isi area bilah dan akar las dengan tekstur datar homogen (gradien Sobel Y = 0)
-                pad_y1 = max(0, by1 - 10)
-                pad_y2 = min(h_f, by2 + 18)
-                pad_x1 = max(0, bx1 - 25)
-                pad_x2 = min(w_f, bx2 + 25)
+                # Isi area bilah dan akar las dengan tekstur datar homogen + feathering batas atas/bawah
+                pad_y1 = max(0, int(by1) - 6)
+                pad_y2 = min(h_f, int(by2) + pad_bot_extra)
+                pad_x1 = max(0, int(bx1) - 25)
+                pad_x2 = min(w_f, int(bx2) + 25)
+                masked_y_intervals.append((pad_y1, pad_y2))
+
                 cv2.rectangle(
                     frame_for_slat,
                     (pad_x1, pad_y1),
@@ -1549,6 +1713,25 @@ class CombinedTopInspector:
                     (int(med_col[0]), int(med_col[1]), int(med_col[2])),
                     -1
                 )
+                # Feathering 6px di batas horizontal atas & bawah agar tidak timbul tepi Sobel-Y buatan
+                if pad_x2 > pad_x1:
+                    col_f = med_col.astype(np.float32)[None, None, :]
+                    top_f1 = max(0, pad_y1 - feather_px // 2)
+                    top_f2 = min(h_f, pad_y1 + feather_px // 2)
+                    if top_f2 > top_f1 + 1:
+                        alphas = np.linspace(0.0, 1.0, top_f2 - top_f1, dtype=np.float32)[:, None, None]
+                        orig_top = frame_inspected[top_f1:top_f2, pad_x1:pad_x2].astype(np.float32)
+                        frame_for_slat[top_f1:top_f2, pad_x1:pad_x2] = np.clip(
+                            orig_top * (1.0 - alphas) + col_f * alphas, 0, 255
+                        ).astype(np.uint8)
+                    bot_f1 = max(0, pad_y2 - feather_px // 2)
+                    bot_f2 = min(h_f, pad_y2 + feather_px // 2)
+                    if bot_f2 > bot_f1 + 1:
+                        alphas = np.linspace(1.0, 0.0, bot_f2 - bot_f1, dtype=np.float32)[:, None, None]
+                        orig_bot = frame_inspected[bot_f1:bot_f2, pad_x1:pad_x2].astype(np.float32)
+                        frame_for_slat[bot_f1:bot_f2, pad_x1:pad_x2] = np.clip(
+                            orig_bot * (1.0 - alphas) + col_f * alphas, 0, 255
+                        ).astype(np.uint8)
 
         # 4. JALANKAN INSPEKSI PLAT SLAT DENGAN CITRA TERMASKING
         slat_res = self.slat_inspector.inspect_frame(frame_for_slat, polygon_pts=self.slat_polygon)
@@ -1558,8 +1741,28 @@ class CombinedTopInspector:
         y_seam = slat_res.get("y_seam", 0.0)
         seam_energy = slat_res.get("seam_energy", 0.0)
         is_trans = slat_res.get("is_transition", True)
+        is_rib_base_occ = bool(slat_res.get("is_rib_base_occluded", False))
         xs = slat_res.get("xs_contour")
         ys = slat_res.get("ys_contour")
+
+        # Hitung posisi Y seam di koordinat frame kamera untuk memeriksa oklusi oleh box Rib
+        poly_px_slat = slat_res.get("polygon_px")
+        if poly_px_slat is not None and len(poly_px_slat) >= 4:
+            top_mid_y = 0.5 * (float(poly_px_slat[0][1]) + float(poly_px_slat[1][1]))
+            bot_mid_y = 0.5 * (float(poly_px_slat[2][1]) + float(poly_px_slat[3][1]))
+        else:
+            top_mid_y = y_min_gate
+            bot_mid_y = y_max_gate
+        seam_frac = float(y_seam) / float(max(1, self.slat_inspector.canonical_h - 1))
+        y_seam_frame = top_mid_y + seam_frac * (bot_mid_y - top_mid_y)
+        slat_res["y_seam_frame"] = float(y_seam_frame)
+
+        seam_tol_px = max(5.0, 0.005 * h_f)
+        seam_masked_occluded = any(
+            (my1 - seam_tol_px) <= y_seam_frame <= (my2 + seam_tol_px)
+            for (my1, my2) in masked_y_intervals
+        )
+        slat_res["is_seam_masked_occluded"] = bool(seam_masked_occluded)
 
         # Pembagian Zona Inspeksi Celah Slat:
         # - Probing Zone (36 <= y_seam < 58 px): Celah baru masuk gerbang -> status WAIT (tahan penilaian)
@@ -1570,12 +1773,14 @@ class CombinedTopInspector:
 
         has_valid_seam = (
             (not is_trans) and
+            (not is_rib_base_occ) and
+            (not seam_masked_occluded) and
             (xs is not None) and
             (len(xs) > 30) and
             (seam_energy >= 22.0)
         )
 
-        if in_probing_zone:
+        if in_probing_zone and not is_rib_base_occ and not seam_masked_occluded:
             # Fase transisi masuk: status wajib WAIT agar noise batas atas kanonikal tidak memicu False NG
             slat_res["status"] = "WAIT"
             slat_res["display_status"] = "WAIT"
@@ -1642,6 +1847,20 @@ class CombinedTopInspector:
 
         else:
             # Skenario: Celah terhalang/tertutup fisik sirip atau plat selesai lewat zona prime
+            if is_rib_base_occ or seam_masked_occluded or is_slat_occluded:
+                self._last_rib_slat_occl_frame = self._slat_frame_idx
+
+            if (
+                (is_rib_base_occ or seam_masked_occluded)
+                and self.latched_slat_data is not None
+                and self.latched_slat_data.get("is_ng", False)
+                and float(self.latched_slat_data.get("pv_flatness", 0.0) or 0.0) <= self.slat_inspector.max_flatness_pv
+                and float(self.latched_slat_data.get("sagitta", 0.0) or 0.0) <= self.slat_inspector.max_sagitta
+            ):
+                # Bersihkan latch void-only yang terkontaminasi kaki rib agar tidak ditahan 28 frame
+                self.latched_slat_data = None
+                self.latched_hold_frames = 0
+
             if len(self.slat_history_samples) >= 2:
                 # Evaluasi seluruh sampel bersih yang berhasil terekam sebelum celah tertutup sirip
                 all_sags = [s["sagitta"] for s in self.slat_history_samples]
@@ -1657,36 +1876,43 @@ class CombinedTopInspector:
                 is_curv_ok = bool(eval_sag <= self.slat_inspector.max_sagitta)
                 is_void_ok = bool(eval_void < self.slat_inspector.max_center_void)
                 is_plate_ok = bool(is_flat_ok and is_curv_ok and is_void_ok)
+                is_void_only_ng = bool(is_flat_ok and is_curv_ok and (not is_void_ok))
 
-                # Pilih sampel representatif terbaik untuk proyeksi kontur visual
-                best_sample = min(self.slat_history_samples, key=lambda s: abs(s["y_seam"] - 70.0))
-
-                if is_plate_ok:
-                    msg = f"LURUS OK (Early-Catch Latch: PV={eval_pv:.1f}px, Sag={eval_sag:.1f}px)"
-                elif not is_curv_ok:
-                    msg = f"NG: BENGKOK (Early-Catch Latch: Sag={eval_sag:.1f}px > {self.slat_inspector.max_sagitta:.1f}px)"
-                elif not is_flat_ok:
-                    msg = f"NG: DEFLEKSI KASAR (Early-Catch Latch: PV={eval_pv:.1f}px > {self.slat_inspector.max_flatness_pv:.1f}px)"
+                if (is_rib_base_occ or seam_masked_occluded) and is_void_only_ng:
+                    # Jangan kunci void-only NG ke latch saat oklusi rib terjadi (mencegah bocornya False Slat NG)
+                    self.slat_history_samples.clear()
+                    self.latched_slat_data = None
+                    self.latched_hold_frames = 0
                 else:
-                    msg = f"NG: CELAH TERBUKA (Early-Catch Latch: Void={eval_void}px)"
+                    # Pilih sampel representatif terbaik untuk proyeksi kontur visual
+                    best_sample = min(self.slat_history_samples, key=lambda s: abs(s["y_seam"] - 70.0))
 
-                self.latched_slat_data = {
-                    "status": "OK" if is_plate_ok else "NG",
-                    "display_status": "OK" if is_plate_ok else "NG",
-                    "is_ok": is_plate_ok,
-                    "is_ng": not is_plate_ok,
-                    "pv_flatness": eval_pv,
-                    "sagitta": eval_sag,
-                    "coverage": eval_cov,
-                    "center_void": eval_void,
-                    "eval_mode": msg,
-                    "xs_contour": best_sample["xs"],
-                    "ys_contour": best_sample["ys"],
-                    "y_seam": best_sample["y_seam"],
-                    "polygon_px": best_sample["polygon_px"]
-                }
-                self.latched_hold_frames = 28  # Tahan data selama 28 frame (~0.9 detik saat sirip melintas)
-                self.slat_history_samples.clear()
+                    if is_plate_ok:
+                        msg = f"LURUS OK (Early-Catch Latch: PV={eval_pv:.1f}px, Sag={eval_sag:.1f}px)"
+                    elif not is_curv_ok:
+                        msg = f"NG: BENGKOK (Early-Catch Latch: Sag={eval_sag:.1f}px > {self.slat_inspector.max_sagitta:.1f}px)"
+                    elif not is_flat_ok:
+                        msg = f"NG: DEFLEKSI KASAR (Early-Catch Latch: PV={eval_pv:.1f}px > {self.slat_inspector.max_flatness_pv:.1f}px)"
+                    else:
+                        msg = f"NG: CELAH TERBUKA (Early-Catch Latch: Void={eval_void}px)"
+
+                    self.latched_slat_data = {
+                        "status": "OK" if is_plate_ok else "NG",
+                        "display_status": "OK" if is_plate_ok else "NG",
+                        "is_ok": is_plate_ok,
+                        "is_ng": not is_plate_ok,
+                        "pv_flatness": eval_pv,
+                        "sagitta": eval_sag,
+                        "coverage": eval_cov,
+                        "center_void": eval_void,
+                        "eval_mode": msg,
+                        "xs_contour": best_sample["xs"],
+                        "ys_contour": best_sample["ys"],
+                        "y_seam": best_sample["y_seam"],
+                        "polygon_px": best_sample["polygon_px"]
+                    }
+                    self.latched_hold_frames = 28  # Tahan data selama 28 frame (~0.9 detik saat sirip melintas)
+                    self.slat_history_samples.clear()
 
             # Pertahankan durasi latch selama bilah sirip masih menutupi gerbang slat
             if is_slat_occluded and self.latched_slat_data is not None:
@@ -1706,8 +1932,14 @@ class CombinedTopInspector:
                 slat_res["eval_mode"] = self.latched_slat_data["eval_mode"]
                 slat_res["xs_contour"] = self.latched_slat_data["xs_contour"]
                 slat_res["ys_contour"] = self.latched_slat_data["ys_contour"]
+            elif is_rib_base_occ or seam_masked_occluded:
+                slat_res["status"] = "WAIT"
+                slat_res["display_status"] = "WAIT"
+                slat_res["is_ok"] = False
+                slat_res["is_ng"] = False
+                slat_res["eval_mode"] = "WAIT (Oklusi Bagian Bawah Rib / Sirip)"
 
-        slat_res["is_occluded"] = is_slat_occluded
+        slat_res["is_occluded"] = bool(is_slat_occluded or seam_masked_occluded or is_rib_base_occ)
 
         # Sinkronkan lifecycle purge/flush kandidat NG secara independen di setiap frame
         if self.db_bridge is not None and self.db_bridge.is_enabled():
@@ -1821,14 +2053,17 @@ class CombinedTopInspector:
         is_paused=False,
         frame_idx=0,
         total_frames=0,
-        sync_realtime=True
+        sync_realtime=True,
+        video_time_str="",
+        speed_label=""
     ):
         """
         Merender visualisasi terpadu pada resolusi asli frame kamera dengan proteksi thread lock.
         """
         with self._render_lock:
             return self._render_combined_dashboard_internal(
-                frame, inspect_result, fps, is_paused, frame_idx, total_frames, sync_realtime
+                frame, inspect_result, fps, is_paused, frame_idx, total_frames,
+                sync_realtime, video_time_str=video_time_str, speed_label=speed_label
             )
 
     def _render_combined_dashboard_internal(
@@ -1839,7 +2074,9 @@ class CombinedTopInspector:
         is_paused=False,
         frame_idx=0,
         total_frames=0,
-        sync_realtime=True
+        sync_realtime=True,
+        video_time_str="",
+        speed_label=""
     ):
         """
         Merender visualisasi terpadu pada resolusi asli frame kamera:
@@ -1980,8 +2217,8 @@ class CombinedTopInspector:
                 rx1, ry1, rx2, ry2 = int(bx1 * sx), int(by1 * sy), int(bx2 * sx), int(by2 * sy)
                 w_px = bx2 - bx1
                 h_px = by2 - by1
-                scale_x = getattr(self, "scale_factor_mm_per_px", 0.515)
-                scale_y = getattr(self, "scale_factor_y_mm_per_px", 0.442)
+                scale_x = float(rib_res.get("rib_raw_mm_per_px", 0.0) or getattr(self, "scale_factor_mm_per_px", 0.515))
+                scale_y = float(rib_res.get("rib_raw_mm_per_px", 0.0) or getattr(self, "scale_factor_y_mm_per_px", 0.442))
                 w_mm = int(round(w_px * scale_x))
                 h_mm = int(round(h_px * scale_y))
                 rib_conf = float(rib_res.get("confidence", 0.0) or 0.0)
@@ -2150,6 +2387,8 @@ class CombinedTopInspector:
             eng_badge = "HOUGH"
         elif getattr(self.rib_inspector, "tracker_engine", "LEGACY") == "TIER1_VITERBI":
             eng_badge = "VITERBI"
+        elif getattr(self.rib_inspector, "tracker_engine", "LEGACY") == "LEGACY_1DCNN":
+            eng_badge = "1DCNN+MAHAL"
         else:
             eng_badge = "SOBEL"
         src_badge = "WEB" if getattr(self, "threshold_source_mode", "DATASET") == "WEB" else "DATA"
@@ -2166,12 +2405,13 @@ class CombinedTopInspector:
 
         rpv_c = (0, 255, 0) if r_pv <= self.rib_inspector.pv_thresh else (0, 0, 255)
         rsag_c = (0, 255, 0) if r_sag <= self.rib_inspector.sagitta_thresh else (0, 0, 255)
-        r_pv_mm = r_pv * scale
-        r_sag_mm = r_sag * scale
-        r_dev_mm = r_dev * scale
-        dev_lim_mm = self.rib_inspector.dev_thresh * scale
-        r_tip_mm = r_tip * scale
-        tip_lim_mm = self.rib_inspector.tip_thresh * scale
+        rib_scale = float(rib_res.get("rib_mm_per_px", 750.0 / 1200.0) or (750.0 / 1200.0)) if rib_res else (750.0 / 1200.0)
+        r_pv_mm = r_pv * rib_scale
+        r_sag_mm = r_sag * rib_scale
+        r_dev_mm = r_dev * rib_scale
+        dev_lim_mm = self.rib_inspector.dev_thresh * rib_scale
+        r_tip_mm = r_tip * rib_scale
+        tip_lim_mm = self.rib_inspector.tip_thresh * rib_scale
 
         cv2.putText(hud, f"Flatness PV : {r_pv_mm:4.1f} mm | Sagitta: {r_sag_mm:.1f} mm",
                     (505, 139), cv2.FONT_HERSHEY_SIMPLEX, 0.46, rpv_c, 1, cv2.LINE_AA)
@@ -2191,12 +2431,17 @@ class CombinedTopInspector:
         cv2.rectangle(hud, (15, 192), (985, 292), (45, 45, 55), 1)
         cv2.putText(hud, "PANDUAN KONTROL & PINTASAN KEYBOARD (HOTKEYS):", (25, 214),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (150, 180, 220), 2, cv2.LINE_AA)
-        cv2.putText(hud, "[SPACE]: Pause  [K]: Align Rel Instan  [L]: Wizard Rel  [G]: Reticle Acuan  [P]: Profil  [U]: Def", (25, 238),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
-        cv2.putText(hud, "[T]: Engine Rib  [V]: Video  [1]/[2]: Media  [R]: Reset  [D]: DB Logging  [Q]: Keluar", (25, 260),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
-        cv2.putText(hud, f"File: {inspect_result.get('filename', '-')} | Posisi: {frame_idx}/{total_frames}", (25, 282),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (140, 210, 140), 1, cv2.LINE_AA)
+        cv2.putText(hud, "[SPACE]: Pause | [ / ]: -/+10s | [-/=]: -/+60s | [X]: Speed | [I]: Skip-Diam | [Z]: Loncat", (25, 238),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.39, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(hud, "[K]: Align Rel | [L]: Wizard Rel | [G]: Acuan | [P]: Profil | [T]/[E]: Engine | [R]: Reset | [D]: DB | [Q]: Keluar", (25, 260),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1, cv2.LINE_AA)
+        pos_parts = [f"File: {inspect_result.get('filename', '-')}", f"Frame: {frame_idx}/{total_frames}"]
+        if video_time_str:
+            pos_parts.append(f"Waktu: {video_time_str}")
+        if speed_label:
+            pos_parts.append(speed_label)
+        cv2.putText(hud, " | ".join(pos_parts), (25, 282),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 210, 140), 1, cv2.LINE_AA)
 
         # Selesai: kembalikan buffer terpadu yang sudah terisi penuh (thread-safe copy)
         return self._screen_buf.copy()

@@ -580,23 +580,28 @@ class SideConveyorInspector:
         h, w = frame.shape[:2]
         pts_px = np.array([[int(p[0] * w), int(p[1] * h)] for p in self.polygon_pts], dtype=np.int32)
         bx, by, bw, bh = cv2.boundingRect(pts_px)
-        if bw < 10 or bh < 10:
+        x1 = max(0, bx)
+        y1 = max(0, by)
+        x2 = min(w, bx + bw)
+        y2 = min(h, by + bh)
+        cw = x2 - x1
+        ch = y2 - y1
+        if cw < 10 or ch < 10:
             return None, None, pts_px, (bx, by, bw, bh)
 
-        # Buat masking poligon
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(mask, [pts_px], 255)
-        masked_frame = cv2.bitwise_and(frame, frame, mask=mask)
+        # Buat masking langsung di ruang crop (hindari alokasi & bitwise_and full frame 1080p)
+        roi_crop = frame[y1:y2, x1:x2]
+        pts_local = pts_px - np.array([x1, y1], dtype=np.int32)
+        crop_mask = np.zeros((ch, cw), dtype=np.uint8)
+        cv2.fillPoly(crop_mask, [pts_local], 255)
+        crop_poly = cv2.bitwise_and(roi_crop, roi_crop, mask=crop_mask)
+        return crop_poly, crop_mask, pts_px, (x1, y1, cw, ch)
 
-        # Potong area bounding box dari masked image
-        crop_poly = masked_frame[by:by+bh, bx:bx+bw]
-        crop_mask = mask[by:by+bh, bx:bx+bw]
-        return crop_poly, crop_mask, pts_px, (bx, by, bw, bh)
-
-    def process_frame(self, frame):
+    def process_frame(self, frame, render_display=True):
         """
         Memproses satu frame untuk inspeksi lengkap Baut, Pin, dan Lekukan Poligon Diam.
         :param frame: Citra BGR (np.ndarray)
+        :param render_display: Jika False, lewati copy/anotasi GUI penuh untuk menghemat CPU di mode headless/pacing
         :return: (display_frame, inspection_payload)
         """
         if frame is None or frame.size == 0:
@@ -604,16 +609,18 @@ class SideConveyorInspector:
 
         self.stats["total_frames"] += 1
         h_frame, w_frame = frame.shape[:2]
-        display_frame = frame.copy()
+        should_render = bool(render_display or (self.db_bridge is not None and self.db_bridge.is_enabled()))
+        display_frame = frame.copy() if should_render else frame
 
         # Dapatkan Koordinat Master ROI & Poligon
         rx1, ry1, rx2, ry2 = self._get_pixel_roi(w_frame, h_frame)
         crop_poly, crop_mask, pts_px, (bx, by, bw, bh) = self.extract_masked_polygon_crop(frame)
 
-        # 1. Gambar Batas Master ROI (Zona Kuning - YOLO)
-        cv2.rectangle(display_frame, (rx1, ry1), (rx2, ry2), (0, 230, 255), 2)
-        cv2.putText(display_frame, f"MASTER ROI ({self.side})", (rx1 + 5, max(20, ry1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 230, 255), 2)
+        if should_render:
+            # 1. Gambar Batas Master ROI (Zona Kuning - YOLO)
+            cv2.rectangle(display_frame, (rx1, ry1), (rx2, ry2), (0, 230, 255), 2)
+            cv2.putText(display_frame, f"MASTER ROI ({self.side})", (rx1 + 5, max(20, ry1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 230, 255), 2)
 
         # 2. Jalankan Deteksi Baut & Pin pada Master ROI via YOLO
         det_res = self.bolt_pin_detector.detect(frame, roi=(rx1, ry1, rx2, ry2))
@@ -639,32 +646,33 @@ class SideConveyorInspector:
                 pin_verdict = "NG"
 
         # Visualisasi Baut & Pin (Seragam Warna Hijau, Status Evaluasi di Panel HUD Atas)
-        box_color = (0, 255, 0)
-        drawn_pins = set()
-        for pair in pairs:
-            b = pair["bolt"]
-            p = pair["pin"]
-            bx_1, by_1, bx_2, by_2 = b["box"]
+        if should_render:
+            box_color = (0, 255, 0)
+            drawn_pins = set()
+            for pair in pairs:
+                b = pair["bolt"]
+                p = pair["pin"]
+                bx_1, by_1, bx_2, by_2 = b["box"]
 
-            cv2.rectangle(display_frame, (bx_1, by_1), (bx_2, by_2), box_color, 2)
-            cv2.putText(display_frame, f"{b['class_name']} {b['confidence']:.2f}",
-                        (bx_1, max(15, by_1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, box_color, 2)
+                cv2.rectangle(display_frame, (bx_1, by_1), (bx_2, by_2), box_color, 2)
+                cv2.putText(display_frame, f"{b['class_name']} {b['confidence']:.2f}",
+                            (bx_1, max(15, by_1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, box_color, 2)
 
-            if p is not None:
-                drawn_pins.add(id(p))
-                px1, py1, px2, py2 = p["box"]
-                cv2.rectangle(display_frame, (px1, py1), (px2, py2), box_color, 2)
-                cv2.putText(display_frame, f"{p['class_name']} {p['confidence']:.2f}",
-                            (px1, max(15, py1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.44, box_color, 2)
-                cv2.line(display_frame, b["centroid"], p["centroid"], (0, 255, 180), 1)
+                if p is not None:
+                    drawn_pins.add(id(p))
+                    px1, py1, px2, py2 = p["box"]
+                    cv2.rectangle(display_frame, (px1, py1), (px2, py2), box_color, 2)
+                    cv2.putText(display_frame, f"{p['class_name']} {p['confidence']:.2f}",
+                                (px1, max(15, py1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.44, box_color, 2)
+                    cv2.line(display_frame, b["centroid"], p["centroid"], (0, 255, 180), 1)
 
-        # Gambar pin yang belum berpasangan (jika ada)
-        for p in pins:
-            if id(p) not in drawn_pins:
-                px1, py1, px2, py2 = p["box"]
-                cv2.rectangle(display_frame, (px1, py1), (px2, py2), box_color, 2)
-                cv2.putText(display_frame, f"{p['class_name']} {p['confidence']:.2f}",
-                            (px1, max(15, py1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.44, box_color, 2)
+            # Gambar pin yang belum berpasangan (jika ada)
+            for p in pins:
+                if id(p) not in drawn_pins:
+                    px1, py1, px2, py2 = p["box"]
+                    cv2.rectangle(display_frame, (px1, py1), (px2, py2), box_color, 2)
+                    cv2.putText(display_frame, f"{p['class_name']} {p['confidence']:.2f}",
+                                (px1, max(15, py1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.44, box_color, 2)
 
         # 3. Virtual Photocell / Optical Probe (Sensor Kehadiran Pelat Slat di Gerbang Masuk Poligon)
         # Menghitung koordinat adaptif sensor probe tepat di area masuk / leher poligon braket
@@ -785,22 +793,23 @@ class SideConveyorInspector:
         is_plate_present = self.photocell_state
 
         # Visualisasi Sensor Virtual Photocell pada Layar
-        beam_color = (0, 255, 255) if is_plate_present else (100, 100, 100)
-        cv2.line(display_frame, (px1, py), (px2, py), beam_color, 2)
-        cv2.circle(display_frame, (px1, py), 4, beam_color, -1)
-        cv2.circle(display_frame, (px2, py), 4, beam_color, -1)
-        sensor_status_text = f"PHOTOCELL: {'ON [PLAT]' if is_plate_present else 'OFF [GAP]'} ({beam_val:.1f} | Th:{self.photocell_thresh_high:.0f}/{self.photocell_thresh_low:.0f})"
-        font_scale = 0.58
-        font_thick = 2
-        (t_w, t_h), _ = cv2.getTextSize(sensor_status_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
-        bg_x1 = max(5, px1 - 20)
-        bg_y1 = max(5, py - t_h - 12)
-        bg_x2 = min(w_frame - 5, bg_x1 + t_w + 10)
-        bg_y2 = bg_y1 + t_h + 8
-        cv2.rectangle(display_frame, (bg_x1, bg_y1), (bg_x2, bg_y2), (20, 20, 20), -1)
-        cv2.rectangle(display_frame, (bg_x1, bg_y1), (bg_x2, bg_y2), beam_color, 1)
-        cv2.putText(display_frame, sensor_status_text, (bg_x1 + 5, bg_y2 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, beam_color, font_thick)
+        if should_render:
+            beam_color = (0, 255, 255) if is_plate_present else (100, 100, 100)
+            cv2.line(display_frame, (px1, py), (px2, py), beam_color, 2)
+            cv2.circle(display_frame, (px1, py), 4, beam_color, -1)
+            cv2.circle(display_frame, (px2, py), 4, beam_color, -1)
+            sensor_status_text = f"PHOTOCELL: {'ON [PLAT]' if is_plate_present else 'OFF [GAP]'} ({beam_val:.1f} | Th:{self.photocell_thresh_high:.0f}/{self.photocell_thresh_low:.0f})"
+            font_scale = 0.58
+            font_thick = 2
+            (t_w, t_h), _ = cv2.getTextSize(sensor_status_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
+            bg_x1 = max(5, px1 - 20)
+            bg_y1 = max(5, py - t_h - 12)
+            bg_x2 = min(w_frame - 5, bg_x1 + t_w + 10)
+            bg_y2 = bg_y1 + t_h + 8
+            cv2.rectangle(display_frame, (bg_x1, bg_y1), (bg_x2, bg_y2), (20, 20, 20), -1)
+            cv2.rectangle(display_frame, (bg_x1, bg_y1), (bg_x2, bg_y2), beam_color, 1)
+            cv2.putText(display_frame, sensor_status_text, (bg_x1 + 5, bg_y2 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, beam_color, font_thick)
 
         # 4. Pemicuan & Audit Inspeksi Lekukan Plat (PADA POLIGON DIAM MASKED)
         inspected_bracket_info = None
@@ -831,24 +840,31 @@ class SideConveyorInspector:
                     "overlay": patch_res.get("overlay")
                 }
 
-                # Simpan snapshot sweet-spot yang memiliki anotasi poligon & badge terpasang
-                sample_ann_frame = display_frame.copy()
-                sample_color = (0, 0, 255) if raw_status == "NG" else (0, 255, 0)
-                cv2.polylines(sample_ann_frame, [pts_px], isClosed=True, color=sample_color, thickness=3)
-                for p_pt in pts_px:
-                    cv2.circle(sample_ann_frame, (int(p_pt[0]), int(p_pt[1])), 5, (0, 255, 255), -1)
-                    cv2.circle(sample_ann_frame, (int(p_pt[0]), int(p_pt[1])), 7, (0, 0, 0), 1)
-                cv2.rectangle(sample_ann_frame, (bx, max(0, by - 24)), (bx + 280, by), (20, 20, 20), -1)
-                cv2.putText(sample_ann_frame, f"BRACKET CRACK: {raw_status} [{raw_score:.3f}]",
-                            (bx + 5, max(16, by - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, sample_color, 2)
+                # Simpan snapshot sweet-spot yang memiliki anotasi poligon & badge terpasang (hanya jika render/DB aktif)
+                if should_render:
+                    sample_ann_frame = display_frame.copy()
+                    sample_color = (0, 0, 255) if raw_status == "NG" else (0, 255, 0)
+                    cv2.polylines(sample_ann_frame, [pts_px], isClosed=True, color=sample_color, thickness=3)
+                    for p_pt in pts_px:
+                        cv2.circle(sample_ann_frame, (int(p_pt[0]), int(p_pt[1])), 5, (0, 255, 255), -1)
+                        cv2.circle(sample_ann_frame, (int(p_pt[0]), int(p_pt[1])), 7, (0, 0, 0), 1)
+                    cv2.rectangle(sample_ann_frame, (bx, max(0, by - 24)), (bx + 280, by), (20, 20, 20), -1)
+                    cv2.putText(sample_ann_frame, f"BRACKET CRACK: {raw_status} [{raw_score:.3f}]",
+                                (bx + 5, max(16, by - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, sample_color, 2)
 
-                self.current_slat_samples.append({
-                    "score": raw_score,
-                    "status": raw_status,
-                    "raw_frame": frame.copy(),
-                    "ann_frame": sample_ann_frame,
-                    "bracket_info": inspected_bracket_info
-                })
+                    self.current_slat_samples.append({
+                        "score": raw_score,
+                        "status": raw_status,
+                        "raw_frame": frame.copy(),
+                        "ann_frame": sample_ann_frame,
+                        "bracket_info": inspected_bracket_info
+                    })
+                else:
+                    self.current_slat_samples.append({
+                        "score": raw_score,
+                        "status": raw_status,
+                        "bracket_info": inspected_bracket_info
+                    })
 
                 self.last_bracket_info = inspected_bracket_info
                 self.last_audit_frame = self.stats["total_frames"]
@@ -888,18 +904,19 @@ class SideConveyorInspector:
                 lek_color = (0, 215, 255)  # Cyan standby
                 label_text = "BRACKET CRACK [STANDBY]"
 
-        # Gambar Garis Poligon Diam di Layar
-        cv2.polylines(display_frame, [pts_px], isClosed=True, color=lek_color, thickness=3)
+        if should_render:
+            # Gambar Garis Poligon Diam di Layar
+            cv2.polylines(display_frame, [pts_px], isClosed=True, color=lek_color, thickness=3)
 
-        # Gambar Titik-titik Sudut Poligon (Interactive Handles)
-        for i, p in enumerate(pts_px):
-            cv2.circle(display_frame, (int(p[0]), int(p[1])), 5, (0, 255, 255), -1)
-            cv2.circle(display_frame, (int(p[0]), int(p[1])), 7, (0, 0, 0), 1)
+            # Gambar Titik-titik Sudut Poligon (Interactive Handles)
+            for i, p in enumerate(pts_px):
+                cv2.circle(display_frame, (int(p[0]), int(p[1])), 5, (0, 255, 255), -1)
+                cv2.circle(display_frame, (int(p[0]), int(p[1])), 7, (0, 0, 0), 1)
 
-        # Badge Label di atas Poligon
-        cv2.rectangle(display_frame, (bx, max(0, by - 24)), (bx + 280, by), (20, 20, 20), -1)
-        cv2.putText(display_frame, label_text, (bx + 5, max(16, by - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, lek_color, 2)
+            # Badge Label di atas Poligon
+            cv2.rectangle(display_frame, (bx, max(0, by - 24)), (bx + 280, by), (20, 20, 20), -1)
+            cv2.putText(display_frame, label_text, (bx + 5, max(16, by - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, lek_color, 2)
 
         # Akumulasi temuan keberadaan dan defek komponen sepanjang transit plat slat aktif
         if is_plate_present:
@@ -1017,25 +1034,26 @@ class SideConveyorInspector:
             "bracket_details": inspected_bracket_info or self.last_bracket_info
         }
 
-        # 6. Gambar HUD Panel Atas
-        self._draw_hud(display_frame, payload)
+        if should_render:
+            # 6. Gambar HUD Panel Atas
+            self._draw_hud(display_frame, payload)
 
-        # 7. Gambar Mini PIP Heatmap Preview di Pojok Kanan Atas
-        if self.last_bracket_info is not None and self.last_bracket_info.get("overlay") is not None:
-            ov = self.last_bracket_info["overlay"]
-            if ov is not None and ov.size > 0:
-                pip_w, pip_h = 160, 160
-                pip_resized = cv2.resize(ov, (pip_w, pip_h))
-                px1 = max(0, w_frame - pip_w - 20)
-                py1 = 85
-                px2 = px1 + pip_w
-                py2 = py1 + pip_h
-                display_frame[py1:py2, px1:px2] = pip_resized
-                ov_col = (0, 255, 0) if self.last_bracket_info["status"] == "OK" else (0, 0, 255)
-                cv2.rectangle(display_frame, (px1, py1), (px2, py2), ov_col, 2)
-                cv2.rectangle(display_frame, (px1, py1 - 20), (px2, py1), (20, 20, 20), -1)
-                cv2.putText(display_frame, f"HEATMAP: {self.last_bracket_info['status']}", (px1 + 4, py1 - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.40, ov_col, 1)
+            # 7. Gambar Mini PIP Heatmap Preview di Pojok Kanan Atas
+            if self.last_bracket_info is not None and self.last_bracket_info.get("overlay") is not None:
+                ov = self.last_bracket_info["overlay"]
+                if ov is not None and ov.size > 0:
+                    pip_w, pip_h = 160, 160
+                    pip_resized = cv2.resize(ov, (pip_w, pip_h))
+                    px1 = max(0, w_frame - pip_w - 20)
+                    py1 = 85
+                    px2 = px1 + pip_w
+                    py2 = py1 + pip_h
+                    display_frame[py1:py2, px1:px2] = pip_resized
+                    ov_col = (0, 255, 0) if self.last_bracket_info["status"] == "OK" else (0, 0, 255)
+                    cv2.rectangle(display_frame, (px1, py1), (px2, py2), ov_col, 2)
+                    cv2.rectangle(display_frame, (px1, py1 - 20), (px2, py1), (20, 20, 20), -1)
+                    cv2.putText(display_frame, f"HEATMAP: {self.last_bracket_info['status']}", (px1 + 4, py1 - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.40, ov_col, 1)
 
         return display_frame, payload
 

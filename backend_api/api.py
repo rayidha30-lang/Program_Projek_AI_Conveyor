@@ -100,51 +100,75 @@ def get_stats():
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Hitung jumlah NG per komponen & sisi
+        # Hitung jumlah NG per komponen & sisi (pisahkan aktif vs resolved; abaikan INVALID/False Alarm)
         query = """
             SELECT 
-                ComponentType,
-                Side,
-                COUNT(1) as TotalNG
-            FROM Inspection_Detections
-            WHERE Result = 'NG'
-            GROUP BY ComponentType, Side
+                d.ComponentType,
+                d.Side,
+                COUNT(1) as TotalNG,
+                SUM(CASE WHEN i.StatusLifecycle != 'RESOLVED' THEN 1 ELSE 0 END) as ActiveNG,
+                SUM(CASE WHEN i.StatusLifecycle = 'RESOLVED' THEN 1 ELSE 0 END) as ResolvedNG
+            FROM Inspection_Detections d
+            INNER JOIN Inspections i ON i.InspectionID = d.InspectionID
+            WHERE d.Result = 'NG'
+            GROUP BY d.ComponentType, d.Side
         """
         cursor.execute(query)
         rows = cursor.fetchall()
 
         counts = {
-            "plat-slat": 0,
-            "rib-sirip": 0,
-            "bolt-kanan": 0,
-            "pin-kanan": 0,
-            "bolt-kiri": 0,
-            "pin-kiri": 0,
+            "plat-slat": {"total": 0, "active": 0, "resolved": 0},
+            "rib-sirip": {"total": 0, "active": 0, "resolved": 0},
+            "bolt-kanan": {"total": 0, "active": 0, "resolved": 0},
+            "pin-kanan": {"total": 0, "active": 0, "resolved": 0},
+            "bolt-kiri": {"total": 0, "active": 0, "resolved": 0},
+            "pin-kiri": {"total": 0, "active": 0, "resolved": 0},
         }
 
         for r in rows:
             comp = str(r[0]).upper()
             side = str(r[1]).upper() if r[1] else "NONE"
-            cnt = int(r[2])
+            cnt = int(r[2] or 0)
+            active_cnt = int(r[3] or 0)
+            resolved_cnt = int(r[4] or 0)
 
+            key = None
             if comp == "PLAT":
-                counts["plat-slat"] += cnt
+                key = "plat-slat"
             elif comp == "RIB":
-                counts["rib-sirip"] += cnt
+                key = "rib-sirip"
             elif comp == "BOLT" and side == "RH":
-                counts["bolt-kanan"] += cnt
+                key = "bolt-kanan"
             elif comp == "PIN" and side == "RH":
-                counts["pin-kanan"] += cnt
+                key = "pin-kanan"
             elif comp == "BOLT" and side == "LH":
-                counts["bolt-kiri"] += cnt
+                key = "bolt-kiri"
             elif comp == "PIN" and side == "LH":
-                counts["pin-kiri"] += cnt
+                key = "pin-kiri"
+
+            if key:
+                counts[key]["total"] += cnt
+                counts[key]["active"] += active_cnt
+                counts[key]["resolved"] += resolved_cnt
 
         # Total inspeksi keseluruhan
-        cursor.execute("SELECT COUNT(1), SUM(CASE WHEN OverallResult = 'NG' THEN 1 ELSE 0 END) FROM Inspections")
+        cursor.execute(
+            """
+            SELECT
+                COUNT(1),
+                SUM(CASE WHEN OverallResult = 'NG' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN OverallResult = 'NG' AND StatusLifecycle != 'RESOLVED' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN OverallResult = 'NG' AND StatusLifecycle = 'RESOLVED' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN OverallResult = 'INVALID' THEN 1 ELSE 0 END)
+            FROM Inspections
+            """
+        )
         row_tot = cursor.fetchone()
-        total_inspections = row_tot[0] or 0
-        total_ng = row_tot[1] or 0
+        total_inspections = int(row_tot[0] or 0)
+        total_ng = int(row_tot[1] or 0)
+        active_ng = int(row_tot[2] or 0)
+        resolved_ng = int(row_tot[3] or 0)
+        invalid_count = int(row_tot[4] or 0)
 
         return jsonify({
             "components": [
@@ -153,7 +177,9 @@ def get_stats():
                     "label": "Total Abnormal Plat/Slat",
                     "shortLabel": "Plat / Slat",
                     "camera": "CAM-01",
-                    "count": counts["plat-slat"],
+                    "count": counts["plat-slat"]["total"],
+                    "activeCount": counts["plat-slat"]["active"],
+                    "resolvedCount": counts["plat-slat"]["resolved"],
                     "dotColor": "bg-danger"
                 },
                 {
@@ -161,7 +187,9 @@ def get_stats():
                     "label": "Total Abnormal Rib/Sirip",
                     "shortLabel": "Rib / Sirip",
                     "camera": "CAM-01",
-                    "count": counts["rib-sirip"],
+                    "count": counts["rib-sirip"]["total"],
+                    "activeCount": counts["rib-sirip"]["active"],
+                    "resolvedCount": counts["rib-sirip"]["resolved"],
                     "dotColor": "bg-warning"
                 },
                 {
@@ -169,7 +197,9 @@ def get_stats():
                     "label": "Total Abnormal Bolt Sisi Kanan",
                     "shortLabel": "Bolt Kanan (RH)",
                     "camera": "CAM-02",
-                    "count": counts["bolt-kanan"],
+                    "count": counts["bolt-kanan"]["total"],
+                    "activeCount": counts["bolt-kanan"]["active"],
+                    "resolvedCount": counts["bolt-kanan"]["resolved"],
                     "dotColor": "bg-primary"
                 },
                 {
@@ -177,7 +207,9 @@ def get_stats():
                     "label": "Total Abnormal Pin Sisi Kanan",
                     "shortLabel": "Pin Kanan (RH)",
                     "camera": "CAM-02",
-                    "count": counts["pin-kanan"],
+                    "count": counts["pin-kanan"]["total"],
+                    "activeCount": counts["pin-kanan"]["active"],
+                    "resolvedCount": counts["pin-kanan"]["resolved"],
                     "dotColor": "bg-info"
                 },
                 {
@@ -185,7 +217,9 @@ def get_stats():
                     "label": "Total Abnormal Bolt Sisi Kiri",
                     "shortLabel": "Bolt Kiri (LH)",
                     "camera": "CAM-03",
-                    "count": counts["bolt-kiri"],
+                    "count": counts["bolt-kiri"]["total"],
+                    "activeCount": counts["bolt-kiri"]["active"],
+                    "resolvedCount": counts["bolt-kiri"]["resolved"],
                     "dotColor": "bg-primary"
                 },
                 {
@@ -193,14 +227,19 @@ def get_stats():
                     "label": "Total Abnormal Pin Sisi Kiri",
                     "shortLabel": "Pin Kiri (LH)",
                     "camera": "CAM-03",
-                    "count": counts["pin-kiri"],
+                    "count": counts["pin-kiri"]["total"],
+                    "activeCount": counts["pin-kiri"]["active"],
+                    "resolvedCount": counts["pin-kiri"]["resolved"],
                     "dotColor": "bg-danger"
                 }
             ],
             "overview": {
                 "totalInspections": total_inspections,
                 "totalNG": total_ng,
-                "totalOK": total_inspections - total_ng,
+                "activeNG": active_ng,
+                "resolvedNG": resolved_ng,
+                "invalidCount": invalid_count,
+                "totalOK": total_inspections - total_ng - invalid_count,
                 "accuracy": "99.2%"
             }
         })
@@ -235,7 +274,7 @@ def get_inspections():
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Query join Inspections dengan Inspection_Detections yang NG
+        # Query join Inspections dengan Inspection_Detections yang NG atau INVALID (False Alarm)
         sql = """
             SELECT 
                 i.InspectionID,
@@ -255,10 +294,13 @@ def get_inspections():
                 d.PVFlatness,
                 d.MaxDeviation,
                 d.RawImagePath,
-                d.AnnotatedPath
+                d.AnnotatedPath,
+                i.OverallResult,
+                d.Result,
+                i.ResolvedAt
             FROM Inspections i
             INNER JOIN Inspection_Detections d ON i.InspectionID = d.InspectionID
-            WHERE d.Result = 'NG'
+            WHERE d.Result IN ('NG', 'INVALID')
         """
 
         params = []
@@ -272,8 +314,12 @@ def get_inspections():
         if severity_filter != "ALL":
             sql += " AND i.OverallSeverity = ?"
             params.append(severity_filter)
-        if status_filter != "ALL":
-            sql += " AND i.StatusLifecycle LIKE ?"
+        if status_filter == "OPEN":
+            sql += " AND d.Result = 'NG' AND i.StatusLifecycle IN ('UNACKNOWLEDGED', 'ACKNOWLEDGED')"
+        elif status_filter == "INVALID":
+            sql += " AND (d.Result = 'INVALID' OR i.OverallResult = 'INVALID')"
+        elif status_filter != "ALL":
+            sql += " AND d.Result = 'NG' AND i.StatusLifecycle LIKE ?"
             params.append(f"{status_filter}%")
 
         sql += " ORDER BY i.InspectionTime DESC, d.DetectionID DESC"
@@ -301,12 +347,17 @@ def get_inspections():
             dev = r[15]
             raw_path = r[16]
             ann_path = r[17]
+            overall_res = r[18]
+            det_res = r[19]
+            resolved_dt = parse_dt(r[20])
 
             # Format waktu & tanggal
             time_str = insp_time.strftime("%H:%M:%S") if insp_time else ""
             date_str = insp_time.strftime("%Y-%m-%d") if insp_time else ""
             display_date_str = insp_time.strftime("%d %b %Y") if insp_time else ""
             full_time_str = insp_time.strftime("%d %b %Y, %H:%M:%S WIB") if insp_time else ""
+            resolved_iso = resolved_dt.strftime("%Y-%m-%d %H:%M:%S") if resolved_dt else None
+            resolved_display = resolved_dt.strftime("%d %b %Y, %H:%M:%S WIB") if resolved_dt else None
 
             # Deskripsi objek & jenis cacat
             obj_desc = f"{comp}"
@@ -332,7 +383,10 @@ def get_inspections():
             conf_str = f"{float(conf):.1f}%" if conf is not None else "95.4%"
 
             # Status visual
-            if status_life == "ACKNOWLEDGED" and pic:
+            is_invalid = (overall_res == "INVALID" or det_res == "INVALID")
+            if is_invalid:
+                status_display = "FALSE ALARM"
+            elif status_life == "ACKNOWLEDGED" and pic:
                 status_display = f"ACK: {pic}"
             elif status_life == "RESOLVED":
                 status_display = "RESOLVED"
@@ -354,6 +408,10 @@ def get_inspections():
                 "severity": sev,
                 "status": status_display,
                 "statusLifecycle": status_life,
+                "overallResult": overall_res,
+                "detectionResult": det_res,
+                "resolvedAt": resolved_iso,
+                "resolvedAtDisplay": resolved_display,
                 "picName": pic or "",
                 "maintenanceNote": note or "",
                 "pvFlatness": float(pv) if pv is not None else None,
@@ -385,7 +443,8 @@ def get_evidence():
     """
     conn = None
     try:
-        limit = request.args.get("limit", default=100, type=int)
+        limit = request.args.get("limit", default=150, type=int)
+        filter_mode = request.args.get("filter", "ALL").upper()
         conn = get_connection()
         cursor = conn.cursor()
 
@@ -407,13 +466,22 @@ def get_evidence():
                 d.RawImagePath,
                 d.AnnotatedPath,
                 d.PVFlatness,
-                d.MaxDeviation
+                d.MaxDeviation,
+                i.OverallResult,
+                d.Result,
+                i.ResolvedAt
             FROM Inspections i
             INNER JOIN Inspection_Detections d ON i.InspectionID = d.InspectionID
-            WHERE d.Result = 'NG'
-            ORDER BY i.InspectionTime DESC, d.DetectionID DESC
-            LIMIT ?
+            WHERE d.Result IN ('NG', 'INVALID')
         """
+        if filter_mode == "OPEN":
+            sql += " AND d.Result = 'NG' AND i.StatusLifecycle IN ('UNACKNOWLEDGED', 'ACKNOWLEDGED')"
+        elif filter_mode == "RESOLVED":
+            sql += " AND d.Result = 'NG' AND i.StatusLifecycle = 'RESOLVED'"
+        elif filter_mode == "INVALID":
+            sql += " AND (d.Result = 'INVALID' OR i.OverallResult = 'INVALID')"
+
+        sql += " ORDER BY i.InspectionTime DESC, d.DetectionID DESC LIMIT ?"
         cursor.execute(sql, (limit,))
         rows = cursor.fetchall()
 
@@ -436,11 +504,16 @@ def get_evidence():
             ann_path = r[14]
             pv = r[15] if len(r) > 15 else None
             dev = r[16] if len(r) > 16 else None
+            overall_res = r[17] if len(r) > 17 else "NG"
+            det_res = r[18] if len(r) > 18 else "NG"
+            resolved_dt = parse_dt(r[19]) if len(r) > 19 else None
 
             time_str = insp_time.strftime("%H:%M:%S WIB") if insp_time else ""
             date_str = insp_time.strftime("%Y-%m-%d") if insp_time else ""
             display_date_str = insp_time.strftime("%d %b %Y") if insp_time else ""
             full_date_str = insp_time.strftime("%d %b %Y, %H:%M:%S") if insp_time else ""
+            resolved_iso = resolved_dt.strftime("%Y-%m-%d %H:%M:%S") if resolved_dt else None
+            resolved_display = resolved_dt.strftime("%d %b %Y, %H:%M:%S WIB") if resolved_dt else None
 
             area_desc = "Conveyor Plate & Rib Overhead"
             if cam_id == "CAM-02":
@@ -478,6 +551,10 @@ def get_evidence():
                 "area": area_desc,
                 "confidence": conf_str,
                 "statusLifecycle": status_life,
+                "overallResult": overall_res,
+                "detectionResult": det_res,
+                "resolvedAt": resolved_iso,
+                "resolvedAtDisplay": resolved_display,
                 "picName": pic or "",
                 "maintenanceNote": note or "",
                 "pvFlatness": float(pv) if pv is not None else None,
@@ -548,22 +625,22 @@ def get_image():
 
 
 # ==========================================================
-# 6. ACTION (ACKNOWLEDGE / RESOLVE)
+# 6. ACTION (ACKNOWLEDGE / RESOLVE / FALSE ALARM / REOPEN)
 # ==========================================================
 @app.route("/api/inspections/<int:inspection_id>/action", methods=["POST"])
 def update_inspection_action(inspection_id):
     """
-    Menyimpan aksi PIC di dashboard:
-    - action: 'ACKNOWLEDGED' atau 'RESOLVED'
-    - picName: nama PIC (misal: Sarah Jenkins)
-    - maintenanceNote: catatan teknisi
+    Menyimpan aksi PIC di dashboard & menulis audit trail ke Maintenance_Logs:
+    - action: 'ACKNOWLEDGED', 'RESOLVED', 'FALSE_ALARM', atau 'UNACKNOWLEDGED'
+    - picName: nama PIC (misal: Admin (QA Lead))
+    - maintenanceNote: catatan teknisi / verifikasi PIC
     """
     data = request.get_json() or {}
-    action = data.get("action", "ACKNOWLEDGED")
-    pic_name = data.get("picName", "Operator")
-    note = data.get("maintenanceNote", "")
+    action = str(data.get("action", "ACKNOWLEDGED")).upper()
+    pic_name = str(data.get("picName", "Operator")).strip() or "Operator"
+    note = str(data.get("maintenanceNote", "")).strip()
 
-    if action not in ("ACKNOWLEDGED", "RESOLVED", "UNACKNOWLEDGED"):
+    if action not in ("ACKNOWLEDGED", "RESOLVED", "FALSE_ALARM", "UNACKNOWLEDGED"):
         return jsonify({"error": "Invalid action"}), 400
 
     conn = None
@@ -571,42 +648,191 @@ def update_inspection_action(inspection_id):
         conn = get_connection()
         cursor = conn.cursor()
 
+        cursor.execute(
+            "SELECT InspectionID, OverallResult, StatusLifecycle FROM Inspections WHERE InspectionID = ?",
+            (inspection_id,)
+        )
+        existing = cursor.fetchone()
+        if not existing:
+            return jsonify({"error": "Inspection not found"}), 404
+
         if action == "RESOLVED":
+            resolved_note = note or "Telah diperbaiki & dikalibrasi ulang"
             cursor.execute(
                 """
                 UPDATE Inspections
                 SET 
+                    OverallResult = CASE WHEN OverallResult = 'INVALID' THEN 'NG' ELSE OverallResult END,
                     StatusLifecycle = 'RESOLVED',
                     PICName = ?,
                     MaintenanceNote = ?,
-                    ResolvedAt = CURRENT_TIMESTAMP
+                    ResolvedAt = datetime('now', 'localtime')
                 WHERE InspectionID = ?
                 """,
-                (pic_name, note, inspection_id)
+                (pic_name, resolved_note, inspection_id)
             )
-        else:
+            cursor.execute(
+                """
+                UPDATE Inspection_Detections
+                SET Result = 'NG'
+                WHERE InspectionID = ? AND Result = 'INVALID'
+                """,
+                (inspection_id,)
+            )
+            cursor.execute(
+                """
+                INSERT INTO Maintenance_Logs (InspectionID, Action, PICName, Notes, LoggedAt)
+                VALUES (?, 'RESOLVED', ?, ?, datetime('now', 'localtime'))
+                """,
+                (inspection_id, pic_name, resolved_note)
+            )
+        elif action == "FALSE_ALARM":
+            false_note = note or "Ditandai sebagai False Alarm / Invalid oleh PIC"
             cursor.execute(
                 """
                 UPDATE Inspections
                 SET 
-                    StatusLifecycle = ?,
+                    OverallResult = 'INVALID',
+                    StatusLifecycle = 'RESOLVED',
+                    PICName = ?,
+                    MaintenanceNote = ?,
+                    ResolvedAt = datetime('now', 'localtime')
+                WHERE InspectionID = ?
+                """,
+                (pic_name, false_note, inspection_id)
+            )
+            cursor.execute(
+                """
+                UPDATE Inspection_Detections
+                SET Result = 'INVALID'
+                WHERE InspectionID = ? AND Result = 'NG'
+                """,
+                (inspection_id,)
+            )
+            log_note = false_note if false_note.startswith("[FALSE ALARM]") else f"[FALSE ALARM] {false_note}"
+            cursor.execute(
+                """
+                INSERT INTO Maintenance_Logs (InspectionID, Action, PICName, Notes, LoggedAt)
+                VALUES (?, 'RESOLVED', ?, ?, datetime('now', 'localtime'))
+                """,
+                (inspection_id, pic_name, log_note)
+            )
+        elif action == "UNACKNOWLEDGED":
+            reopen_note = note or "Dibuka kembali untuk pengecekan ulang"
+            cursor.execute(
+                """
+                UPDATE Inspections
+                SET 
+                    OverallResult = CASE WHEN OverallResult = 'INVALID' THEN 'NG' ELSE OverallResult END,
+                    StatusLifecycle = 'UNACKNOWLEDGED',
+                    PICName = ?,
+                    MaintenanceNote = ?,
+                    ResolvedAt = NULL
+                WHERE InspectionID = ?
+                """,
+                (pic_name, reopen_note, inspection_id)
+            )
+            cursor.execute(
+                """
+                UPDATE Inspection_Detections
+                SET Result = 'NG'
+                WHERE InspectionID = ? AND Result = 'INVALID'
+                """,
+                (inspection_id,)
+            )
+            cursor.execute(
+                """
+                INSERT INTO Maintenance_Logs (InspectionID, Action, PICName, Notes, LoggedAt)
+                VALUES (?, 'ACKNOWLEDGED', ?, ?, datetime('now', 'localtime'))
+                """,
+                (inspection_id, pic_name, f"[REOPEN] {reopen_note}")
+            )
+        else:
+            ack_note = note or "Dikonfirmasi oleh QA PIC"
+            cursor.execute(
+                """
+                UPDATE Inspections
+                SET 
+                    StatusLifecycle = 'ACKNOWLEDGED',
                     PICName = ?,
                     MaintenanceNote = ?
                 WHERE InspectionID = ?
                 """,
-                (action, pic_name, note, inspection_id)
+                (pic_name, ack_note, inspection_id)
+            )
+            cursor.execute(
+                """
+                INSERT INTO Maintenance_Logs (InspectionID, Action, PICName, Notes, LoggedAt)
+                VALUES (?, 'ACKNOWLEDGED', ?, ?, datetime('now', 'localtime'))
+                """,
+                (inspection_id, pic_name, ack_note)
             )
 
         conn.commit()
+
+        cursor.execute(
+            "SELECT OverallResult, StatusLifecycle, ResolvedAt, PICName, MaintenanceNote FROM Inspections WHERE InspectionID = ?",
+            (inspection_id,)
+        )
+        updated = cursor.fetchone()
+        resolved_dt = parse_dt(updated[2]) if updated and updated[2] else None
+
         return jsonify({
             "success": True,
             "inspectionId": inspection_id,
-            "statusLifecycle": action
+            "overallResult": updated[0] if updated else "NG",
+            "statusLifecycle": updated[1] if updated else action,
+            "resolvedAt": resolved_dt.strftime("%Y-%m-%d %H:%M:%S") if resolved_dt else None,
+            "resolvedAtDisplay": resolved_dt.strftime("%d %b %Y, %H:%M:%S WIB") if resolved_dt else None,
+            "picName": updated[3] if updated else pic_name,
+            "maintenanceNote": updated[4] if updated else note,
         })
 
     except Exception as e:
         if conn:
             conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.route("/api/inspections/<int:inspection_id>/logs", methods=["GET"])
+def get_inspection_logs(inspection_id):
+    """
+    Mengambil riwayat audit tindakan PIC dari tabel Maintenance_Logs.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT LogID, InspectionID, Action, PICName, Notes, LoggedAt
+            FROM Maintenance_Logs
+            WHERE InspectionID = ?
+            ORDER BY LogID DESC
+            """,
+            (inspection_id,)
+        )
+        rows = cursor.fetchall()
+        logs = []
+        for r in rows:
+            logged_dt = parse_dt(r[5])
+            notes_str = r[4] or ""
+            logs.append({
+                "logId": r[0],
+                "inspectionId": r[1],
+                "action": r[2],
+                "picName": r[3],
+                "notes": notes_str,
+                "isFalseAlarm": notes_str.startswith("[FALSE ALARM]"),
+                "isReopen": notes_str.startswith("[REOPEN]"),
+                "loggedAt": logged_dt.strftime("%Y-%m-%d %H:%M:%S") if logged_dt else str(r[5] or ""),
+                "loggedAtDisplay": logged_dt.strftime("%d %b %Y, %H:%M:%S WIB") if logged_dt else str(r[5] or ""),
+            })
+        return jsonify(logs)
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
         if conn:
@@ -619,7 +845,8 @@ def update_inspection_action(inspection_id):
 @app.route("/api/analytics", methods=["GET"])
 def get_analytics():
     """
-    Menghasilkan data grafik mingguan dan diagram pareto untuk tab Analytics.
+    Menghasilkan data grafik mingguan, diagram pareto, dan ringkasan resolusi untuk tab Analytics.
+    Hanya menghitung kerusakan nyata (Result = 'NG'); data False Alarm ('INVALID') dipisahkan.
     """
     conn = None
     try:
@@ -698,10 +925,45 @@ def get_analytics():
                 "barCls": colors.get(comp, "bg-primary")
             })
 
+        # 3. Ringkasan Resolusi & MTTR (Mean Time To Resolve)
+        cursor.execute(
+            """
+            SELECT
+                SUM(CASE WHEN OverallResult = 'NG' AND StatusLifecycle != 'RESOLVED' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN OverallResult = 'NG' AND StatusLifecycle = 'RESOLVED' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN OverallResult = 'INVALID' THEN 1 ELSE 0 END),
+                AVG(
+                    CASE
+                        WHEN OverallResult = 'NG'
+                             AND StatusLifecycle = 'RESOLVED'
+                             AND ResolvedAt IS NOT NULL
+                             AND julianday(ResolvedAt) >= julianday(InspectionTime)
+                        THEN (julianday(ResolvedAt) - julianday(InspectionTime)) * 1440.0
+                        ELSE NULL
+                    END
+                )
+            FROM Inspections
+            """
+        )
+        res_row = cursor.fetchone()
+        open_count = int(res_row[0] or 0)
+        resolved_count = int(res_row[1] or 0)
+        invalid_count = int(res_row[2] or 0)
+        avg_mttr = round(float(res_row[3]), 1) if res_row and res_row[3] is not None else None
+        total_real_ng = open_count + resolved_count
+        resolution_rate_pct = round((resolved_count / total_real_ng) * 100.0, 1) if total_real_ng > 0 else 0.0
+
         return jsonify({
             "weekly": days_result,
             "pareto": pareto_result,
-            "totalIncidents": total_incidents
+            "totalIncidents": total_incidents,
+            "resolutionSummary": {
+                "openCount": open_count,
+                "resolvedCount": resolved_count,
+                "invalidCount": invalid_count,
+                "resolutionRatePct": resolution_rate_pct,
+                "avgMttrMinutes": avg_mttr,
+            }
         })
 
     except Exception as e:

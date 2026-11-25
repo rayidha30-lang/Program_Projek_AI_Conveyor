@@ -3,10 +3,12 @@ import { useNavigate } from "react-router-dom";
 import { useQueryState, parseAsString, parseAsStringLiteral } from "nuqs";
 import {
   AlertTriangle,
+  Ban,
   BarChart3,
   Calendar,
   Camera,
   Check,
+  CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -20,6 +22,7 @@ import {
   Folder,
   FolderOpen,
   Gauge,
+  History,
   Layers,
   LayoutDashboard,
   LogOut,
@@ -37,6 +40,7 @@ import {
   fetchStats,
   fetchInspections,
   fetchEvidence,
+  fetchInspectionLogs,
   submitInspectionAction,
   fetchAnalytics,
   getImageUrl,
@@ -47,6 +51,7 @@ import {
   MONTH_SHORT_ID,
   type RecordRow,
   type EvidenceItem,
+  type MaintenanceLogItem,
   type AbnormalComponentSummary,
   type AnalyticsData,
   type Severity,
@@ -951,9 +956,13 @@ function Dashboard({
       tone: "text-danger",
       bgTone: "bg-danger-soft text-danger",
     };
+    const activeVal = s.activeCount ?? s.count;
+    const resolvedVal = s.resolvedCount ?? Math.max(0, s.count - activeVal);
     return {
       label: s.label,
-      value: s.count.toString(),
+      value: activeVal.toString(),
+      totalValue: s.count,
+      resolvedValue: resolvedVal,
       camera: s.camera,
       note: meta.note,
       Icon: meta.Icon,
@@ -962,6 +971,8 @@ function Dashboard({
       dotColor: s.dotColor,
     };
   });
+
+  const activeRecentRecords = recentRecords.filter((r) => r.overallResult !== "INVALID");
 
   return (
     <div className="space-y-6">
@@ -979,7 +990,13 @@ function Dashboard({
                   <p className="text-[10px] font-bold text-muted-foreground leading-tight">
                     {stat.label}
                   </p>
-                  <p className="text-2xl font-extrabold text-foreground">{stat.value}</p>
+                  <div className="flex items-baseline gap-1.5">
+                    <p className="text-2xl font-extrabold text-foreground">{stat.value}</p>
+                    <span className="text-[9px] font-semibold text-muted-foreground">aktif</span>
+                  </div>
+                  <p className="text-[8.5px] font-mono text-muted-foreground">
+                    Total: {stat.totalValue} • {stat.resolvedValue} Resolved
+                  </p>
                 </div>
                 <span
                   className={`flex size-8 shrink-0 items-center justify-center rounded-lg ${stat.bgTone}`}
@@ -1056,7 +1073,7 @@ function Dashboard({
           />
         </div>
         <RecordTable
-          rows={recentRecords.slice(0, 5)}
+          rows={activeRecentRecords.slice(0, 5)}
           compact
           onSelectRecord={onSelectRecord}
         />
@@ -1242,6 +1259,18 @@ function getSlidePageNumbers(current: number, total: number): (number | "...")[]
   return pages;
 }
 
+type LifecycleBucket = "OPEN" | "RESOLVED" | "INVALID";
+
+function getRecordBucket(r: {
+  overallResult?: string;
+  detectionResult?: string;
+  statusLifecycle?: string;
+}): LifecycleBucket {
+  if (r.overallResult === "INVALID" || r.detectionResult === "INVALID") return "INVALID";
+  if (r.statusLifecycle === "RESOLVED") return "RESOLVED";
+  return "OPEN";
+}
+
 function Abnormality({
   allRecords,
   onSelectRecord,
@@ -1249,6 +1278,7 @@ function Abnormality({
   allRecords: RecordRow[];
   onSelectRecord?: (record: RecordRow) => void;
 }) {
+  const [viewTab, setViewTab] = useState<"OPEN" | "RESOLVED" | "INVALID" | "ALL">("OPEN");
   const [camera, setCamera] = useState("ALL");
   const [severity, setSeverity] = useState("ALL");
   const [status, setStatus] = useState("ALL");
@@ -1261,6 +1291,14 @@ function Abnormality({
   // Default 10 riwayat per slide agar pas satu layar dashboard tanpa perlu scroll vertikal
   const [pageSize, setPageSize] = useState<number>(10);
   const [currentSlide, setCurrentSlide] = useState<number>(1);
+
+  const tabCounts = useMemo(() => {
+    const counts = { OPEN: 0, RESOLVED: 0, INVALID: 0, ALL: allRecords.length };
+    allRecords.forEach((r) => {
+      counts[getRecordBucket(r)] += 1;
+    });
+    return counts;
+  }, [allRecords]);
 
   const availableYears = useMemo(() => {
     const years = new Set<string>();
@@ -1289,14 +1327,17 @@ function Abnormality({
 
   const filtered = useMemo(() => {
     return allRecords.filter((r) => {
+      const bucket = getRecordBucket(r);
+      if (viewTab !== "ALL" && bucket !== viewTab) return false;
       if (camera !== "ALL" && r.camera !== camera) return false;
       if (severity !== "ALL" && r.severity !== severity) return false;
-      if (
-        status !== "ALL" &&
-        !r.status.startsWith(status) &&
-        r.statusLifecycle !== status
-      )
-        return false;
+      if (status !== "ALL") {
+        if (status === "FALSE ALARM") {
+          if (bucket !== "INVALID") return false;
+        } else if (!r.status.startsWith(status) && r.statusLifecycle !== status) {
+          return false;
+        }
+      }
 
       const dateInfo = extractRecordDate(r);
 
@@ -1323,7 +1364,7 @@ function Abnormality({
 
       return true;
     });
-  }, [allRecords, camera, severity, status, selectedYear, selectedMonth, selectedDate, searchQuery]);
+  }, [allRecords, viewTab, camera, severity, status, selectedYear, selectedMonth, selectedDate, searchQuery]);
 
   // Hitung total slide berdasarkan jumlah record hasil filter & pageSize
   const totalSlides = Math.max(1, Math.ceil(filtered.length / pageSize));
@@ -1331,7 +1372,7 @@ function Abnormality({
   // Auto-reset ke slide 1 ketika kriteria filter atau ukuran slide berubah
   useEffect(() => {
     setCurrentSlide(1);
-  }, [camera, severity, status, selectedYear, selectedMonth, selectedDate, searchQuery, pageSize]);
+  }, [viewTab, camera, severity, status, selectedYear, selectedMonth, selectedDate, searchQuery, pageSize]);
 
   // Proteksi bounds slide jika data berkurang akibat polling
   useEffect(() => {
@@ -1369,7 +1410,7 @@ function Abnormality({
 
   function exportCsv() {
     const head =
-      "Tanggal,Waktu,Abnormality ID,Kamera,Objek,Tipe Kelainan,AI Confidence,Severity,Status,Timestamp Penuh\n";
+      "Tanggal,Waktu,Abnormality ID,Kamera,Objek,Tipe Kelainan,AI Confidence,Severity,Status,Waktu Resolved,PIC,Catatan Maintenance,Timestamp Penuh\n";
     const csv =
       head +
       filtered
@@ -1385,6 +1426,9 @@ function Abnormality({
             `"${r.confidence}"`,
             `"${r.severity}"`,
             `"${r.status.replace(/"/g, '""')}"`,
+            `"${(r.resolvedAtDisplay || "").replace(/"/g, '""')}"`,
+            `"${(r.picName || "").replace(/"/g, '""')}"`,
+            `"${(r.maintenanceNote || "").replace(/"/g, '""')}"`,
             `"${(r.fullTime || "").replace(/"/g, '""')}"`,
           ].join(",");
         })
@@ -1396,9 +1440,52 @@ function Abnormality({
     URL.revokeObjectURL(a.href);
   }
 
+  const quickTabs: { id: "OPEN" | "RESOLVED" | "INVALID" | "ALL"; label: string; count: number; tone: string }[] = [
+    { id: "OPEN", label: "Perlu Tindakan (Open)", count: tabCounts.OPEN, tone: "text-warning" },
+    { id: "RESOLVED", label: "Arsip Selesai (Resolved)", count: tabCounts.RESOLVED, tone: "text-success" },
+    { id: "INVALID", label: "False Alarm / Invalid", count: tabCounts.INVALID, tone: "text-muted-foreground" },
+    { id: "ALL", label: "Semua Riwayat", count: tabCounts.ALL, tone: "text-primary" },
+  ];
+
   return (
     <Panel className="overflow-hidden">
       <div className="p-3.5 pb-2.5 space-y-3">
+        {/* Quick View Tabs: Open vs Resolved vs False Alarm vs All */}
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/60 pb-2.5">
+          <div className="flex flex-wrap items-center gap-1.5">
+            {quickTabs.map((tab) => {
+              const active = viewTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => {
+                    setViewTab(tab.id);
+                    setStatus("ALL");
+                  }}
+                  className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[10px] font-bold transition-all cursor-pointer border ${
+                    active
+                      ? "border-primary/40 bg-primary/10 text-primary shadow-2xs"
+                      : "border-border/60 bg-secondary/40 text-muted-foreground hover:bg-secondary hover:text-foreground"
+                  }`}
+                >
+                  <span>{tab.label}</span>
+                  <span
+                    className={`rounded-full px-1.5 py-0.2 font-mono text-[9px] ${
+                      active ? "bg-primary/20 text-primary" : `bg-background/80 ${tab.tone}`
+                    }`}
+                  >
+                    {tab.count}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <span className="text-[9px] text-muted-foreground hidden sm:inline">
+            Data tersimpan sebagai audit trail (retensi otomatis 7 hari)
+          </span>
+        </div>
+
         {/* Filter Bar Multi-Parameter & Aksi Cepat */}
         <div className="flex items-center justify-between gap-2 overflow-x-auto custom-scrollbar pb-1">
           <div className="flex items-center gap-1.5 shrink-0">
@@ -1463,7 +1550,7 @@ function Abnormality({
               value={status}
               setValue={setStatus}
               label="Semua Status"
-              options={["UNACKNOWLEDGED", "ACK", "RESOLVED"]}
+              options={["UNACKNOWLEDGED", "ACK", "RESOLVED", "FALSE ALARM"]}
             />
 
             {/* 8. Tombol Reset Filter */}
@@ -1807,7 +1894,9 @@ function Badge({ text }: { text: Severity }) {
 
 function StatusBadge({ text }: { text: string }) {
   const cls =
-    text === "RESOLVED"
+    text === "FALSE ALARM" || text === "INVALID"
+      ? "border-muted-foreground/30 bg-secondary text-muted-foreground"
+      : text === "RESOLVED"
       ? "border-success/30 bg-success-soft text-success"
       : text.startsWith("ACK")
       ? "border-info/30 bg-info-soft text-info"
@@ -1922,6 +2011,24 @@ const evidence: EvidenceItem[] = [
   },
 ];
 
+function extractPicRemarkOnly(picName: string | undefined, userName: string): string {
+  if (!picName) return "";
+  const prefix = `${userName} - `;
+  if (picName.startsWith(prefix)) return picName.slice(prefix.length).trim();
+  if (picName.trim() === userName.trim()) return "";
+  const dashIdx = picName.indexOf(" - ");
+  return dashIdx !== -1 ? picName.slice(dashIdx + 3).trim() : "";
+}
+
+function getEvidenceStatusLabel(item: EvidenceItem): string {
+  if (item.overallResult === "INVALID" || item.detectionResult === "INVALID") {
+    return "FALSE ALARM";
+  }
+  if (item.statusLifecycle === "RESOLVED") return "RESOLVED";
+  if (item.statusLifecycle === "ACKNOWLEDGED") return "ACK";
+  return "OPEN";
+}
+
 function Evidence({
   evidenceList,
   onRefresh,
@@ -1941,26 +2048,99 @@ function Evidence({
 }) {
   const currentItems = evidenceList.length > 0 ? evidenceList : evidence;
 
-  // Single Source of Truth: Item aktif langsung di-derive dari selectedTraceId, selectedCamera, dan currentItems
+  const [evidenceTab, setEvidenceTab] = useState<"OPEN" | "RESOLVED" | "INVALID" | "ALL">("OPEN");
+  const [actionFeedback, setActionFeedback] = useState<{
+    type: "success" | "info" | "error";
+    message: string;
+    jumpTab?: "RESOLVED" | "INVALID";
+  } | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [logs, setLogs] = useState<MaintenanceLogItem[]>([]);
+  const lastMovedIdRef = React.useRef<string | null>(null);
+  const lastAutoSyncedTraceIdRef = React.useRef<string | null>(null);
+
+  const tabCounts = useMemo(() => {
+    const counts = { OPEN: 0, RESOLVED: 0, INVALID: 0, ALL: currentItems.length };
+    currentItems.forEach((item) => {
+      counts[getRecordBucket(item)] += 1;
+    });
+    return counts;
+  }, [currentItems]);
+
+  const visibleItems = useMemo(() => {
+    if (evidenceTab === "ALL") return currentItems;
+    return currentItems.filter((item) => getRecordBucket(item) === evidenceTab);
+  }, [currentItems, evidenceTab]);
+
+  // Saat deep-link membawa selectedTraceId baru yang berbeda tab, arahkan tabnya SEKALI saja (tidak saat polling 4 detik)
+  useEffect(() => {
+    if (!selectedTraceId) {
+      lastAutoSyncedTraceIdRef.current = null;
+      return;
+    }
+    if (currentItems.length === 0) return;
+    if (lastMovedIdRef.current === selectedTraceId) return;
+    if (lastAutoSyncedTraceIdRef.current === selectedTraceId) return;
+
+    const target = currentItems.find(
+      (e) => e.id === selectedTraceId || e.inspectionId.toString() === selectedTraceId
+    );
+    if (target) {
+      lastAutoSyncedTraceIdRef.current = selectedTraceId;
+      const bucket = getRecordBucket(target);
+      if (evidenceTab !== "ALL" && bucket !== evidenceTab) {
+        setEvidenceTab(bucket);
+      }
+    }
+  }, [selectedTraceId, currentItems, evidenceTab]);
+
+  const handleSwitchEvidenceTab = (tabId: "OPEN" | "RESOLVED" | "INVALID" | "ALL") => {
+    lastMovedIdRef.current = null;
+    setEvidenceTab(tabId);
+
+    const nextItems =
+      tabId === "ALL"
+        ? currentItems
+        : currentItems.filter((item) => getRecordBucket(item) === tabId);
+
+    const stillVisible = selectedTraceId
+      ? nextItems.some((e) => e.id === selectedTraceId || e.inspectionId.toString() === selectedTraceId)
+      : false;
+
+    if (!stillVisible) {
+      const nextItem = nextItems[0] || null;
+      if (nextItem) {
+        lastAutoSyncedTraceIdRef.current = nextItem.id;
+        if (typeof window !== "undefined") {
+          sessionStorage.setItem("last_valid_trace_id", nextItem.id);
+        }
+        onSelectTraceId?.(nextItem.id);
+        if (nextItem.camera) onSelectCamera?.(nextItem.camera);
+      } else {
+        lastAutoSyncedTraceIdRef.current = selectedTraceId ?? null;
+      }
+    }
+  };
+
+  // Single Source of Truth: Item aktif langsung di-derive dari selectedTraceId, selectedCamera, dan visibleItems
   const selected = useMemo(() => {
-    // 1. Coba cari match dari selectedTraceId di URL
-    if (selectedTraceId && currentItems.length > 0) {
-      // Prioritaskan kecocokan ID DAN Kamera jika kamera dispesifikasikan di URL
+    if (visibleItems.length === 0) return null;
+
+    if (selectedTraceId) {
       let match = null;
       if (selectedCamera) {
-        match = currentItems.find(
+        match = visibleItems.find(
           (e) =>
             (e.id === selectedTraceId || e.inspectionId.toString() === selectedTraceId) &&
             e.camera.toUpperCase() === selectedCamera.toUpperCase()
         );
       }
       if (!match) {
-        match = currentItems.find(
+        match = visibleItems.find(
           (e) => e.id === selectedTraceId || e.inspectionId.toString() === selectedTraceId
         );
       }
       if (match) {
-        // HANYA simpan ke sessionStorage jika match berasal dari data riil database (evidenceList)
         if (typeof window !== "undefined" && evidenceList.length > 0) {
           sessionStorage.setItem("last_valid_trace_id", match.id);
         }
@@ -1968,30 +2148,25 @@ function Evidence({
       }
     }
 
-    // 1b. Jika hanya selectedCamera tanpa trace ID
-    if (selectedCamera && currentItems.length > 0) {
-      const camMatch = currentItems.find(
+    if (selectedCamera) {
+      const camMatch = visibleItems.find(
         (e) => e.camera.toUpperCase() === selectedCamera.toUpperCase()
       );
       if (camMatch) return camMatch;
     }
 
-    // 2. Jika ID di URL tidak ditemukan di database (misal user mengetik 00015 padahal baru ada sampai 00014):
-    // Prioritaskan kembali ke trace ID valid terakhir yang sedang/pernah dibuka user di tab ini!
     if (typeof window !== "undefined") {
       const lastValid = sessionStorage.getItem("last_valid_trace_id");
-      if (lastValid && currentItems.length > 0) {
-        const prevMatch = currentItems.find(
+      if (lastValid) {
+        const prevMatch = visibleItems.find(
           (e) => e.id === lastValid || e.inspectionId.toString() === lastValid
         );
         if (prevMatch) return prevMatch;
       }
     }
 
-    // 3. Fallback jika sesi baru / belum pernah buka item apa pun: gunakan item pertama/terbaru
-    // (JANGAN menimpa sessionStorage di sini agar riwayat valid sebelumnya tidak hilang!)
-    return currentItems[0] || evidence[0]!;
-  }, [selectedTraceId, selectedCamera, currentItems, evidenceList.length]);
+    return visibleItems[0] || null;
+  }, [selectedTraceId, selectedCamera, visibleItems, evidenceList.length]);
 
   const [open, setOpen] = useState<Record<string, boolean>>({
     "CAM-01": selectedCamera ? selectedCamera.toUpperCase() === "CAM-01" : true,
@@ -2001,14 +2176,15 @@ function Evidence({
   const [openDates, setOpenDates] = useState<Record<string, boolean>>({});
   const [action, setAction] = useState(selected?.statusLifecycle || "UNACKNOWLEDGED");
   const [maintenanceAction, setMaintenanceAction] = useState(selected?.maintenanceNote || "");
-  const [picRemark, setPicRemark] = useState(selected?.picName || "");
+  const [picRemark, setPicRemark] = useState("");
+  const userName = (typeof window !== "undefined" && localStorage.getItem("userName")) || "Sarah Jenkins";
 
-  // Sinkronkan form teknisi & buka direktori folder saat item terpilih berubah
+  // Sinkronkan form teknisi, folder explorer, & audit logs saat item terpilih berubah
   useEffect(() => {
     if (selected) {
       setAction(selected.statusLifecycle || "UNACKNOWLEDGED");
       setMaintenanceAction(selected.maintenanceNote || "");
-      setPicRemark(selected.picName || "");
+      setPicRemark(extractPicRemarkOnly(selected.picName, userName));
 
       if (selected.camera) {
         setOpen((prev) => ({ ...prev, [selected.camera]: true }));
@@ -2018,11 +2194,20 @@ function Evidence({
           [`${selected.camera}_${matchDate}`]: true,
         }));
       }
-    }
-  }, [selected?.id, selected?.inspectionId, selected?.statusLifecycle]);
 
-  // Auto-Redirect URL: Jika parameter trace di URL tidak ditemukan di database (misal ID 00015 padahal baru sampai 00014),
-  // otomatis selaraskan (redirect) URL di browser kembali ke ID yang terakhir dibuka user (selected.id)
+      if (selected.inspectionId > 0) {
+        fetchInspectionLogs(selected.inspectionId)
+          .then(setLogs)
+          .catch(() => setLogs([]));
+      } else {
+        setLogs([]);
+      }
+    } else {
+      setLogs([]);
+    }
+  }, [selected?.id, selected?.inspectionId, selected?.statusLifecycle, selected?.overallResult, userName]);
+
+  // Auto-Redirect URL: Jika parameter trace di URL tidak ditemukan di database sama sekali
   useEffect(() => {
     if (selectedTraceId && evidenceList.length > 0) {
       const match = evidenceList.find(
@@ -2049,6 +2234,8 @@ function Evidence({
   }, [selectedCamera]);
 
   const handleSelectItem = (item: EvidenceItem) => {
+    lastMovedIdRef.current = null;
+    setActionFeedback(null);
     if (typeof window !== "undefined") {
       sessionStorage.setItem("last_valid_trace_id", item.id);
     }
@@ -2060,44 +2247,81 @@ function Evidence({
     }
     setAction(item.statusLifecycle || "UNACKNOWLEDGED");
     setMaintenanceAction(item.maintenanceNote || "");
-    setPicRemark(item.picName || "");
+    setPicRemark(extractPicRemarkOnly(item.picName, userName));
   };
 
-  if (!selected) return null;
+  const handleLifecycleAction = async (
+    targetAction: "ACKNOWLEDGED" | "RESOLVED" | "FALSE_ALARM" | "UNACKNOWLEDGED"
+  ) => {
+    if (!selected || isSubmitting) return;
+    setIsSubmitting(true);
+    setActionFeedback(null);
 
-  const userName = localStorage.getItem("userName") || "Sarah Jenkins";
+    const defaultNotes: Record<typeof targetAction, string> = {
+      ACKNOWLEDGED: "Dikonfirmasi oleh QA PIC",
+      RESOLVED: "Telah diperbaiki & dikalibrasi ulang",
+      FALSE_ALARM: "Ditandai sebagai False Alarm / Invalid oleh PIC",
+      UNACKNOWLEDGED: "Dibuka kembali untuk pengecekan ulang",
+    };
 
-  const handleAcknowledge = async () => {
-    setAction("ACKNOWLEDGED");
+    const picLabel = picRemark.trim() ? `${userName} - ${picRemark.trim()}` : userName;
+    const noteLabel = maintenanceAction.trim() || defaultNotes[targetAction];
+
     try {
-      const picLabel = picRemark.trim() ? `${userName} - ${picRemark.trim()}` : userName;
-      const noteLabel = maintenanceAction.trim() || "Dikonfirmasi oleh QA PIC";
-      await submitInspectionAction(
-        selected.inspectionId,
-        "ACKNOWLEDGED",
-        picLabel,
-        noteLabel
-      );
-      if (onRefresh) onRefresh();
-    } catch (e) {
-      console.error(e);
-    }
-  };
+      const movedTraceId = selected.id;
+      const movedInspectionId = selected.inspectionId;
+      await submitInspectionAction(movedInspectionId, targetAction, picLabel, noteLabel);
 
-  const handleResolve = async () => {
-    setAction("RESOLVED");
-    try {
-      const picLabel = picRemark.trim() ? `${userName} - ${picRemark.trim()}` : userName;
-      const noteLabel = maintenanceAction.trim() || "Telah diperbaiki & dikalibrasi ulang";
-      await submitInspectionAction(
-        selected.inspectionId,
-        "RESOLVED",
-        picLabel,
-        noteLabel
-      );
+      if (targetAction === "RESOLVED" || targetAction === "FALSE_ALARM") {
+        lastMovedIdRef.current = movedTraceId;
+        if (evidenceTab === "OPEN") {
+          const remainingOpen = visibleItems.filter((item) => item.id !== movedTraceId);
+          const nextItem = remainingOpen[0] || null;
+          if (typeof window !== "undefined") {
+            if (nextItem) sessionStorage.setItem("last_valid_trace_id", nextItem.id);
+            else sessionStorage.removeItem("last_valid_trace_id");
+          }
+          onSelectTraceId?.(nextItem ? nextItem.id : null);
+          onSelectCamera?.(nextItem ? nextItem.camera : null);
+        }
+        const destTab = targetAction === "FALSE_ALARM" ? "INVALID" : "RESOLVED";
+        setActionFeedback({
+          type: "success",
+          message:
+            targetAction === "FALSE_ALARM"
+              ? `${movedTraceId} ditandai sebagai False Alarm / Invalid dan dipindahkan dari antrian aktif.`
+              : `${movedTraceId} ditandai RESOLVED (data tetap tersimpan) dan dipindahkan ke tab Resolved.`,
+          jumpTab: destTab,
+        });
+      } else if (targetAction === "UNACKNOWLEDGED") {
+        lastMovedIdRef.current = movedTraceId;
+        setAction("UNACKNOWLEDGED");
+        setEvidenceTab("OPEN");
+        setActionFeedback({
+          type: "info",
+          message: `${movedTraceId} dibuka kembali ke antrian Active / Open.`,
+        });
+      } else {
+        setAction("ACKNOWLEDGED");
+        setActionFeedback({
+          type: "info",
+          message: `${movedTraceId} berhasil di-Acknowledge oleh ${userName}.`,
+        });
+      }
+
+      if (movedInspectionId > 0) {
+        fetchInspectionLogs(movedInspectionId).then(setLogs).catch(() => {});
+      }
       if (onRefresh) onRefresh();
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
+      const detail = e?.message ? ` (${e.message})` : "";
+      setActionFeedback({
+        type: "error",
+        message: `Gagal memperbarui status ke server backend${detail}. Pastikan server API Flask sudah di-restart.`,
+      });
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -2128,13 +2352,22 @@ function Evidence({
     },
   ];
 
-  const imgUrl = getImageUrl(
-    selected.annotatedPath || selected.rawImagePath || selected.imageUrl
-  );
+  const imgUrl = selected
+    ? getImageUrl(selected.annotatedPath || selected.rawImagePath || selected.imageUrl)
+    : null;
+  const selectedBucket = selected ? getRecordBucket(selected) : "OPEN";
+  const selectedStatusLabel = selected ? getEvidenceStatusLabel(selected) : "OPEN";
+
+  const evidenceTabs: { id: "OPEN" | "RESOLVED" | "INVALID" | "ALL"; label: string; count: number }[] = [
+    { id: "OPEN", label: "Active / Open", count: tabCounts.OPEN },
+    { id: "RESOLVED", label: "Resolved", count: tabCounts.RESOLVED },
+    { id: "INVALID", label: "False Alarm", count: tabCounts.INVALID },
+    { id: "ALL", label: "Semua", count: tabCounts.ALL },
+  ];
 
   return (
     <div className="space-y-4">
-      {selectedTraceId && (
+      {selectedTraceId && selected && (
         <div className="flex items-center justify-between rounded-xl border border-primary/30 bg-primary/10 px-4 py-2.5 text-xs text-primary shadow-xs">
           <div className="flex items-center gap-2">
             <Eye className="size-4 shrink-0" />
@@ -2153,19 +2386,85 @@ function Evidence({
           )}
         </div>
       )}
-      <div className="grid gap-5 xl:grid-cols-[320px_1fr] items-start">
+      {actionFeedback && (
+        <div
+          className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-4 py-2.5 text-xs shadow-xs ${
+            actionFeedback.type === "success"
+              ? "border-success/30 bg-success-soft text-success"
+              : actionFeedback.type === "error"
+              ? "border-danger/30 bg-danger-soft text-danger"
+              : "border-info/30 bg-info-soft text-info"
+          }`}
+        >
+          <span className="font-semibold">{actionFeedback.message}</span>
+          <div className="flex items-center gap-2">
+            {actionFeedback.jumpTab && (
+              <button
+                type="button"
+                onClick={() => {
+                  const targetTab = actionFeedback.jumpTab!;
+                  const movedId = lastMovedIdRef.current;
+                  lastAutoSyncedTraceIdRef.current = movedId;
+                  setEvidenceTab(targetTab);
+                  if (movedId) onSelectTraceId?.(movedId);
+                  setActionFeedback(null);
+                }}
+                className="text-[10px] font-bold underline hover:opacity-80 cursor-pointer"
+              >
+                Lihat di Tab {actionFeedback.jumpTab === "INVALID" ? "False Alarm" : "Resolved"} &rarr;
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setActionFeedback(null)}
+              className="text-[10px] font-bold opacity-70 hover:opacity-100 cursor-pointer"
+            >
+              Tutup
+            </button>
+          </div>
+        </div>
+      )}
+      <div className="grid gap-5 xl:grid-cols-[340px_1fr] items-start">
         <Panel className="overflow-hidden">
-          <div className="border-b p-4">
-            <h3 className="text-xs font-extrabold">Camera Area Explorer</h3>
-            <p className="text-[9px] text-muted-foreground">
-              Klasifikasi Rekaman Anomali • {currentItems.length} Files
-            </p>
+          <div className="border-b p-4 space-y-3">
+            <div>
+              <h3 className="text-xs font-extrabold">Camera Area Explorer</h3>
+              <p className="text-[9px] text-muted-foreground">
+                Klasifikasi Rekaman Anomali • {visibleItems.length} dari {currentItems.length} Files
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-1.5 rounded-xl bg-secondary/70 p-1 border border-border/60">
+              {evidenceTabs.map((tab) => {
+                const isActive = evidenceTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => handleSwitchEvidenceTab(tab.id)}
+                    className={`flex items-center justify-between rounded-lg px-2 py-1.5 text-[9.5px] font-bold transition-all cursor-pointer ${
+                      isActive
+                        ? "bg-primary text-primary-foreground shadow-xs"
+                        : "text-muted-foreground hover:bg-background/60 hover:text-foreground"
+                    }`}
+                  >
+                    <span className="truncate">{tab.label}</span>
+                    <span
+                      className={`ml-1 rounded-full px-1.5 py-0.2 font-mono text-[8.5px] ${
+                        isActive ? "bg-white/20 text-white" : "bg-background text-foreground"
+                      }`}
+                    >
+                      {tab.count}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
           </div>
           <div className="p-3 space-y-3">
             {cameraFolders.map((folder) => {
               const cam = folder.cam;
               const isOpen = open[cam];
-              const items = currentItems.filter((e) => e.camera === cam);
+              const items = visibleItems.filter((e) => e.camera === cam);
               return (
                 <div key={cam} className="rounded-2xl border border-border/60 bg-secondary/30 p-1.5 transition-all">
                   <button
@@ -2220,7 +2519,7 @@ function Evidence({
                       <div className="space-y-2 pt-2 px-1 pb-1 max-h-[420px] overflow-y-auto custom-scrollbar pr-1.5">
                         {items.length === 0 ? (
                           <div className="rounded-xl border border-dashed border-border/70 p-3 text-center text-[10px] text-muted-foreground">
-                            Belum ada rekaman file pada folder ini
+                            Belum ada rekaman file pada filter ini
                           </div>
                         ) : (
                           sortedDateGroups.map((group, groupIdx) => {
@@ -2280,7 +2579,8 @@ function Evidence({
                                       const normalizedTitle = e.title.includes("#")
                                         ? e.title.replace(/#\d+/, `#${seq}`)
                                         : `${e.title} #${seq}`;
-                                      const isSelected = selected.id === e.id && (selected.object === e.object || selected.inspectionId === e.inspectionId);
+                                      const isSelected = !!selected && selected.id === e.id && (selected.object === e.object || selected.inspectionId === e.inspectionId);
+                                      const itemStatusLabel = getEvidenceStatusLabel(e);
 
                                       return (
                                         <button
@@ -2295,7 +2595,7 @@ function Evidence({
                                         >
                                           <div className="flex justify-between items-center gap-1.5">
                                             <span
-                                              className={`text-[9.5px] ${
+                                              className={`text-[9.5px] truncate ${
                                                 isSelected ? "text-primary font-extrabold" : "font-bold text-foreground"
                                               }`}
                                             >
@@ -2303,9 +2603,12 @@ function Evidence({
                                             </span>
                                             <Badge text={e.severity} />
                                           </div>
-                                          <div className="mt-1 flex justify-between text-[8px] text-muted-foreground">
-                                            <span className="truncate max-w-[140px]">{e.object}</span>
-                                            <span className="font-mono shrink-0">{e.time}</span>
+                                          <div className="mt-1 flex justify-between items-center gap-1 text-[8px] text-muted-foreground">
+                                            <span className="truncate max-w-[115px]">{e.object}</span>
+                                            <div className="flex items-center gap-1 shrink-0">
+                                              <StatusBadge text={itemStatusLabel} />
+                                              <span className="font-mono">{e.time.replace(" WIB", "")}</span>
+                                            </div>
                                           </div>
                                         </button>
                                       );
@@ -2324,6 +2627,38 @@ function Evidence({
             })}
           </div>
         </Panel>
+        {!selected ? (
+          <Panel className="p-10 text-center space-y-3">
+            <CheckCircle2 className="mx-auto size-10 text-success" />
+            <h3 className="text-sm font-extrabold">
+              {evidenceTab === "OPEN"
+                ? "Semua Anomali Aktif Telah Ditangani"
+                : "Belum Ada Data pada Kategori Ini"}
+            </h3>
+            <p className="text-xs text-muted-foreground max-w-md mx-auto">
+              {evidenceTab === "OPEN"
+                ? "Tidak ada temuan NG berstatus Open / Acknowledged saat ini. Anda dapat meninjau arsip perbaikan atau false alarm di tab samping."
+                : "Belum ada rekaman inspeksi pada tab filter yang sedang dipilih."}
+            </p>
+            <div className="flex flex-wrap justify-center gap-2 pt-2">
+              {tabCounts.RESOLVED > 0 && evidenceTab !== "RESOLVED" && (
+                <Button size="sm" variant="outline" onClick={() => handleSwitchEvidenceTab("RESOLVED")}>
+                  Lihat Arsip Resolved ({tabCounts.RESOLVED})
+                </Button>
+              )}
+              {tabCounts.INVALID > 0 && evidenceTab !== "INVALID" && (
+                <Button size="sm" variant="outline" onClick={() => handleSwitchEvidenceTab("INVALID")}>
+                  Lihat False Alarm ({tabCounts.INVALID})
+                </Button>
+              )}
+              {evidenceTab !== "ALL" && tabCounts.ALL > 0 && (
+                <Button size="sm" variant="ghost" onClick={() => handleSwitchEvidenceTab("ALL")}>
+                  Tampilkan Semua ({tabCounts.ALL})
+                </Button>
+              )}
+            </div>
+          </Panel>
+        ) : (
         <div className="space-y-5">
           <Panel className="overflow-hidden">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b p-4">
@@ -2374,7 +2709,7 @@ function Evidence({
             </div>
           </Panel>
           <Panel className="p-5">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <div>
                 <p className="text-[9px] font-bold uppercase text-muted-foreground">
                   Traceability ID
@@ -2383,7 +2718,14 @@ function Evidence({
                   {selected.id}
                 </h2>
               </div>
-              <StatusBadge text={action} />
+              <div className="flex items-center gap-2">
+                {selected.picName && (
+                  <span className="text-[9.5px] text-muted-foreground font-medium">
+                    PIC: <b className="text-foreground">{selected.picName}</b>
+                  </span>
+                )}
+                <StatusBadge text={selectedStatusLabel === "OPEN" ? action : selectedStatusLabel} />
+              </div>
             </div>
             <dl className="mt-4 grid gap-4 border-y py-4 text-[10px] sm:grid-cols-2 lg:grid-cols-3">
               {[
@@ -2393,6 +2735,9 @@ function Evidence({
                 ["Abnormality Type", selected.title.split(" #")[0] ?? ""],
                 ["AI Confidence", selected.confidence],
                 ["Capture Time", selected.captureTime || selected.time],
+                ...(selected.resolvedAtDisplay
+                  ? [[selectedBucket === "INVALID" ? "Waktu Ditandai Invalid" : "Waktu Resolved", selected.resolvedAtDisplay]]
+                  : []),
                 ...(selected.pvFlatness !== undefined && selected.pvFlatness !== null
                   ? [["Metrologi Flatness PV", formatPxAndMm(selected.pvFlatness)]]
                   : []),
@@ -2408,46 +2753,118 @@ function Evidence({
             </dl>
             <div className="mt-4 grid gap-4 sm:grid-cols-2">
               <label className="block text-[10px] font-bold">
-                Tindakan Maintenance
+                Tindakan Maintenance / Alasan Verifikasi
                 <textarea
                   value={maintenanceAction}
                   onChange={(e) => setMaintenanceAction(e.target.value)}
                   className="mt-2 min-h-20 w-full resize-none rounded-lg border bg-secondary p-3 text-[10px] outline-none focus:ring-1 focus:ring-ring text-foreground"
-                  placeholder="Deskripsi tindakan perbaikan atau maintenance yang dilakukan..."
+                  placeholder="Deskripsi perbaikan atau alasan jika ini false alarm..."
                 />
               </label>
               <label className="block text-[10px] font-bold">
-                PIC Remark
+                PIC Remark (Opsional)
                 <textarea
                   value={picRemark}
                   onChange={(e) => setPicRemark(e.target.value)}
                   className="mt-2 min-h-20 w-full resize-none rounded-lg border bg-secondary p-3 text-[10px] outline-none focus:ring-1 focus:ring-ring text-foreground"
-                  placeholder="Catatan verifikasi PIC / remark teknisi..."
+                  placeholder="Catatan tambahan PIC / shift teknisi..."
                 />
               </label>
             </div>
-            <div className="mt-3 flex gap-2">
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={handleAcknowledge}
-                disabled={action === "ACKNOWLEDGED" || action === "RESOLVED"}
-              >
-                <Wrench className="size-4" />
-                Acknowledge
-              </Button>
-              <Button
-                size="sm"
-                className="bg-success text-white hover:bg-success/90"
-                onClick={handleResolve}
-                disabled={action === "RESOLVED"}
-              >
-                <Check className="size-4" />
-                Mark Resolved
-              </Button>
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => handleLifecycleAction("ACKNOWLEDGED")}
+                  disabled={isSubmitting || selectedBucket !== "OPEN" || action === "ACKNOWLEDGED"}
+                >
+                  <Wrench className="size-4" />
+                  Acknowledge
+                </Button>
+                <Button
+                  size="sm"
+                  className="bg-success text-white hover:bg-success/90"
+                  onClick={() => handleLifecycleAction("RESOLVED")}
+                  disabled={isSubmitting || selectedBucket === "RESOLVED"}
+                >
+                  <Check className="size-4" />
+                  Mark Resolved
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="border-amber-500/40 text-amber-600 dark:text-amber-400 hover:bg-amber-500/10"
+                  onClick={() => handleLifecycleAction("FALSE_ALARM")}
+                  disabled={isSubmitting || selectedBucket === "INVALID"}
+                  title="Tandai sebagai salah deteksi AI (False Positive) agar tidak masuk statistik NG"
+                >
+                  <Ban className="size-4" />
+                  False Alarm / Invalid
+                </Button>
+              </div>
+              {selectedBucket !== "OPEN" && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => handleLifecycleAction("UNACKNOWLEDGED")}
+                  disabled={isSubmitting}
+                  className="text-[10px] text-muted-foreground hover:text-foreground"
+                  title="Kembalikan status item ini ke antrian Active / Open"
+                >
+                  <RotateCcw className="size-3.5" />
+                  Reopen ke Active
+                </Button>
+              )}
             </div>
+            {actionFeedback && (
+              <div
+                className={`mt-3 rounded-lg border px-3 py-2 text-[10px] font-semibold ${
+                  actionFeedback.type === "success"
+                    ? "border-success/30 bg-success-soft text-success"
+                    : actionFeedback.type === "error"
+                    ? "border-danger/30 bg-danger-soft text-danger"
+                    : "border-info/30 bg-info-soft text-info"
+                }`}
+              >
+                {actionFeedback.message}
+              </div>
+            )}
+
+            {logs.length > 0 && (
+              <div className="mt-5 border-t pt-4">
+                <h4 className="flex items-center gap-1.5 text-[10px] font-extrabold uppercase tracking-wide text-muted-foreground">
+                  <History className="size-3.5" />
+                  Audit Trail Tindakan (Maintenance Logs)
+                </h4>
+                <div className="mt-2.5 space-y-2 max-h-40 overflow-y-auto custom-scrollbar pr-1">
+                  {logs.map((log) => (
+                    <div
+                      key={log.logId}
+                      className="flex flex-wrap items-start justify-between gap-2 rounded-lg border border-border/60 bg-secondary/40 px-3 py-2 text-[9.5px]"
+                    >
+                      <div className="space-y-0.5">
+                        <div className="flex items-center gap-1.5">
+                          <StatusBadge
+                            text={log.isFalseAlarm ? "FALSE ALARM" : log.action}
+                          />
+                          <span className="font-bold text-foreground">{log.picName}</span>
+                        </div>
+                        {log.notes && (
+                          <p className="text-muted-foreground">{log.notes}</p>
+                        )}
+                      </div>
+                      <span className="font-mono text-[8.5px] text-muted-foreground shrink-0">
+                        {log.loggedAtDisplay}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </Panel>
         </div>
+        )}
       </div>
     </div>
   );
@@ -2494,9 +2911,42 @@ function Analytics({ data }: { data?: AnalyticsData | null }) {
   const days = data?.weekly && data.weekly.length > 0 ? data.weekly : defaultDays;
   const pareto = data?.pareto && data.pareto.length > 0 ? data.pareto : defaultPareto;
   const maxN = Math.max(...days.map((x) => x.n), 1);
+  const resSummary = data?.resolutionSummary;
 
   return (
-    <div className="grid gap-5 xl:grid-cols-2">
+    <div className="space-y-5">
+      {resSummary && (
+        <div className="grid gap-3.5 sm:grid-cols-2 lg:grid-cols-4">
+          <Panel className="p-4">
+            <p className="text-[10px] font-bold text-muted-foreground">Active / Open NG</p>
+            <p className="mt-1 text-2xl font-extrabold text-warning">{resSummary.openCount}</p>
+            <p className="mt-1 text-[9px] text-muted-foreground">Menunggu tindakan maintenance</p>
+          </Panel>
+          <Panel className="p-4">
+            <p className="text-[10px] font-bold text-muted-foreground">Resolved NG</p>
+            <div className="mt-1 flex items-baseline gap-2">
+              <p className="text-2xl font-extrabold text-success">{resSummary.resolvedCount}</p>
+              <span className="text-[10px] font-mono font-bold text-success">
+                ({resSummary.resolutionRatePct}%)
+              </span>
+            </div>
+            <p className="mt-1 text-[9px] text-muted-foreground">Rasio penyelesaian kerusakan nyata</p>
+          </Panel>
+          <Panel className="p-4">
+            <p className="text-[10px] font-bold text-muted-foreground">Rata-rata MTTR</p>
+            <p className="mt-1 text-2xl font-extrabold text-primary">
+              {resSummary.avgMttrMinutes !== null ? `${resSummary.avgMttrMinutes} mnt` : "-"}
+            </p>
+            <p className="mt-1 text-[9px] text-muted-foreground">Durasi deteksi hingga resolved</p>
+          </Panel>
+          <Panel className="p-4">
+            <p className="text-[10px] font-bold text-muted-foreground">False Alarm / Invalid</p>
+            <p className="mt-1 text-2xl font-extrabold text-foreground">{resSummary.invalidCount}</p>
+            <p className="mt-1 text-[9px] text-muted-foreground">Dikecualikan dari trend & pareto</p>
+          </Panel>
+        </div>
+      )}
+      <div className="grid gap-5 xl:grid-cols-2">
       <Panel className="p-5">
         <SectionTitle
           title="Weekly Abnormality Trend"
@@ -2544,6 +2994,7 @@ function Analytics({ data }: { data?: AnalyticsData | null }) {
           ))}
         </div>
       </Panel>
+      </div>
     </div>
   );
 }
