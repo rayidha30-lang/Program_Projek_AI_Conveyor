@@ -187,13 +187,14 @@ def run_zenity_dual(default_top=None, default_side=None, side_id="CAM-02", defau
     side_options.append("Pilih File Video Baru...")
     side_combo_str = "|".join(side_options)
 
-    cur_mode = default_mode if default_mode in ("dual", "web", "headless") else "dual"
+    cur_mode = default_mode if default_mode in ("dual", "opencv", "web", "headless") else "dual"
     mode_map = {
-        "dual": "dual (2 Jendela GUI OpenCV)",
+        "dual": "dual (2 Jendela GUI OpenCV + WebSocket)",
+        "opencv": "opencv (Hanya 2 Jendela HUD OpenCV, Tanpa WebSocket)",
         "web": "web (Tanpa GUI OpenCV, Hybrid WS 3-Kam)",
         "headless": "headless (Tanpa GUI OpenCV)",
     }
-    ordered_modes = [cur_mode] + [m for m in ("dual", "web", "headless") if m != cur_mode]
+    ordered_modes = [cur_mode] + [m for m in ("dual", "opencv", "web", "headless") if m != cur_mode]
     mode_combo_str = "|".join(mode_map[m] for m in ordered_modes)
 
     cmd = [
@@ -245,7 +246,7 @@ def run_zenity_dual(default_top=None, default_side=None, side_id="CAM-02", defau
             final_mode = cur_mode
             if ch_mode:
                 final_mode = ch_mode.split(" ", 1)[0].strip().lower()
-                if final_mode not in ("dual", "web", "headless"):
+                if final_mode not in ("dual", "opencv", "web", "headless"):
                     final_mode = cur_mode
 
             if final_top:
@@ -421,8 +422,8 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02", defa
         except Exception:
             pass
 
-    root.geometry("640x650")
-    root.minsize(580, 560)
+    root.geometry("650x690")
+    root.minsize(580, 600)
 
     f_fam = "Segoe UI" if sys.platform.startswith("win") else "DejaVu Sans"
     f_title = (f_fam, 11, "bold")
@@ -430,7 +431,7 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02", defa
     f_reg = (f_fam, 9)
     f_sm = (f_fam, 8)
 
-    init_mode = default_mode if default_mode in ("dual", "web", "headless") else "dual"
+    init_mode = default_mode if default_mode in ("dual", "opencv", "web", "headless") else "dual"
     res = {"top": default_top, "side": default_side, "mode": init_mode}
 
     lbl_t = tk.Label(root, text="🎥 PENGATURAN SUMBER DUAL KAMERA", font=f_title, pady=8)
@@ -512,9 +513,17 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02", defa
     var_mode = tk.StringVar(master=root, value=init_mode)
     tk.Radiobutton(
         f_mode,
-        text="Dual GUI (dual) — Tampilkan 2 Jendela OpenCV (+ WebSocket)",
+        text="Dual GUI + Web (dual) — 2 Jendela OpenCV + WebSocket",
         variable=var_mode,
         value="dual",
+        font=f_reg,
+        anchor="w",
+    ).pack(fill="x", pady=1)
+    tk.Radiobutton(
+        f_mode,
+        text="OpenCV HUD Only (opencv) — Hanya 2 Jendela OpenCV (Tanpa WebSocket)",
+        variable=var_mode,
+        value="opencv",
         font=f_reg,
         anchor="w",
     ).pack(fill="x", pady=1)

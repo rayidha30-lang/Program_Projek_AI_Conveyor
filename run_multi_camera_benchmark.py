@@ -757,10 +757,10 @@ def _handle_isolated_gui_dialog():
             root = tk.Tk()
             root.title("Pengaturan Dual Kamera & Mode (CAM-01 Top & CAM-02 Side)")
             _apply_x11_safe_window_props(root)
-            root.geometry("640x650")
-            root.minsize(580, 560)
+            root.geometry("650x690")
+            root.minsize(580, 600)
 
-            init_mode = args.mode if args.mode in ("dual", "web", "headless") else "dual"
+            init_mode = args.mode if args.mode in ("dual", "opencv", "web", "headless") else "dual"
             res = {"top": args.top, "side": args.side, "mode": init_mode}
 
             lbl_t = tk.Label(root, text="🎥 PENGATURAN SUMBER DUAL KAMERA", font=F_TITLE, pady=8)
@@ -840,7 +840,8 @@ def _handle_isolated_gui_dialog():
             f_mode.pack(fill="x", padx=15, pady=6)
 
             var_mode = tk.StringVar(master=root, value=init_mode)
-            tk.Radiobutton(f_mode, text="Dual GUI (dual) — Tampilkan 2 Jendela OpenCV (+ WebSocket)", variable=var_mode, value="dual", font=F_REG, anchor="w").pack(fill="x", pady=1)
+            tk.Radiobutton(f_mode, text="Dual GUI + Web (dual) — 2 Jendela OpenCV + WebSocket", variable=var_mode, value="dual", font=F_REG, anchor="w").pack(fill="x", pady=1)
+            tk.Radiobutton(f_mode, text="OpenCV HUD Only (opencv) — Hanya 2 Jendela OpenCV (Tanpa WebSocket)", variable=var_mode, value="opencv", font=F_REG, anchor="w").pack(fill="x", pady=1)
             tk.Radiobutton(f_mode, text="Web Dashboard Only (web) — Tanpa GUI Desktop (Hybrid + WebSocket 3-Kamera)", variable=var_mode, value="web", font=F_REG, anchor="w").pack(fill="x", pady=1)
             tk.Radiobutton(f_mode, text="Headless (headless) — Tanpa GUI Desktop (Murni Inferensi)", variable=var_mode, value="headless", font=F_REG, anchor="w").pack(fill="x", pady=1)
 
@@ -1622,7 +1623,7 @@ def _run_threaded_engine(args):
     is_cam_top = False
     top_source_path = args.top_source
 
-    if args.mode in ["dual", "headless", "web", "top-only"]:
+    if args.mode in ["dual", "opencv", "headless", "web", "top-only"]:
         print("[*] Menginisialisasi Top Inspector (CAM-01 Slat & Rib)...")
         try:
             top_inspector = CombinedTopInspector(
@@ -1659,7 +1660,7 @@ def _run_threaded_engine(args):
     is_cam_side = False
     side_source_path = args.side_source
 
-    if args.mode in ["dual", "headless", "web", "side-only"]:
+    if args.mode in ["dual", "opencv", "headless", "web", "side-only"]:
         print(f"[*] Menginisialisasi Side Inspector ({args.side_cam_id} {args.side_name})...")
         try:
             side_inspector = SideConveyorInspector(
@@ -2614,7 +2615,7 @@ def _run_threaded_engine(args):
                     include_mode=True,
                 )
                 norm_mode = str(new_mode).strip().lower() if new_mode else args.mode
-                if norm_mode in ("dual", "web", "headless") and norm_mode != args.mode:
+                if norm_mode in ("dual", "opencv", "web", "headless") and norm_mode != args.mode:
                     restart_request = {
                         "top_source": new_top or top_source_path,
                         "side_source": new_side or side_source_path,
@@ -2729,9 +2730,9 @@ def _run_threaded_engine(args):
     print("📊 LAPORAN AKHIR HASIL BENCHMARK MULTI-KAMERA")
     print("=" * 86)
     print(f"  • Total Waktu Pengujian     : {total_elapsed:.1f} detik")
-    if args.mode in ["dual", "headless", "web", "top-only"]:
+    if args.mode in ["dual", "opencv", "headless", "web", "top-only"]:
         print(f"  • CAM-01 Top (Slat & Rib)   : {f_top} frames ({avg_top_fps:.1f} rata-rata FPS)")
-    if args.mode in ["dual", "headless", "web", "side-only"]:
+    if args.mode in ["dual", "opencv", "headless", "web", "side-only"]:
         print(f"  • {args.side_cam_id} Side (Bolt & Pin)  : {f_side} frames ({avg_side_fps:.1f} rata-rata FPS)")
     if side_inspector is not None:
         s_ok = getattr(side_inspector, 'slat_ok_count', getattr(side_inspector, 'stats', {}).get('ok_count', 0))
@@ -2839,12 +2840,12 @@ def _run_hybrid_engine(args):
             ws_server = None
 
     p_top = None
-    if args.mode in ["dual", "headless", "web", "top-only"]:
+    if args.mode in ["dual", "opencv", "headless", "web", "top-only"]:
         p_top = mp.Process(
             target=_run_top_worker,
             args=(
                 args.top_source,
-                "dual" if args.mode == "dual" else "headless",
+                "dual" if args.mode in ("dual", "opencv") else "headless",
                 args.rib_mode,
                 args.device,
                 args.enable_db,
@@ -2900,7 +2901,7 @@ def _run_hybrid_engine(args):
                     cap.set(cv2.CAP_PROP_POS_FRAMES, seek_frame)
         return {"cam_id": cam_id, "ins": ins, "dbb": dbb, "cap": cap, "is_cam": is_cam}
 
-    if args.mode in ["dual", "headless", "web", "side-only"]:
+    if args.mode in ["dual", "opencv", "headless", "web", "side-only"]:
         print(f"[*] Menginisialisasi Side Inspector ({args.side_cam_id} {args.side_name})...")
         side_workers.append(_init_side(args.side_cam_id, args.side_name, args.side_source))
         side_left_src = getattr(args, "side_left_source", None)
@@ -2954,7 +2955,7 @@ def _run_hybrid_engine(args):
                 t_inf0 = time.time()
                 ws_legacy = bool(ws_server is not None and ws_server.hud_mode == "legacy" and ws_server.client_count > 0)
                 need_render = (
-                    (is_primary and args.mode == "dual" and (t_inf0 - last_disp) >= gui_interval)
+                    (is_primary and args.mode in ("dual", "opencv") and (t_inf0 - last_disp) >= gui_interval)
                     or (dbb is not None and dbb.is_enabled())
                     or ws_legacy
                 )
@@ -2988,7 +2989,7 @@ def _run_hybrid_engine(args):
                         side_state["fps"] = avg_f
                         side_state["latency"] = lat_ms
                         side_state["status"] = payload.get("overall_result", "WAIT")
-                        if args.mode == "dual" and need_render:
+                        if args.mode in ("dual", "opencv") and need_render:
                             side_state["display"] = disp
                             side_state["has_new"] = True
 
@@ -3032,7 +3033,7 @@ def _run_hybrid_engine(args):
         threads.append(th_s)
 
     win_side = f"{args.side_cam_id} SIDE [HYBRID] | [W]: Setup | [Q]: Keluar"
-    if args.mode == "dual" and side_workers:
+    if args.mode in ("dual", "opencv") and side_workers:
         cv2.namedWindow(win_side, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win_side, 920, 518)
         cv2.moveWindow(win_side, 960, 40)
@@ -3077,7 +3078,7 @@ def _run_hybrid_engine(args):
                 stop_event.set()
                 break
 
-            if args.mode == "dual" and side_workers:
+            if args.mode in ("dual", "opencv") and side_workers:
                 with side_lock:
                     has_new = side_state["has_new"]
                     disp_s = side_state["display"]
@@ -3098,14 +3099,14 @@ def _run_hybrid_engine(args):
                     )
                     norm_mode = str(new_mode).strip().lower() if new_mode else args.mode
                     if (
-                        (norm_mode in ("dual", "web", "headless") and norm_mode != args.mode)
+                        (norm_mode in ("dual", "opencv", "web", "headless") and norm_mode != args.mode)
                         or (new_top and str(new_top) != str(args.top_source))
                         or (new_side and str(new_side) != str(args.side_source))
                     ):
                         restart_request = {
                             "top_source": new_top or args.top_source,
                             "side_source": new_side or args.side_source,
-                            "mode": norm_mode if norm_mode in ("dual", "web", "headless") else args.mode,
+                            "mode": norm_mode if norm_mode in ("dual", "opencv", "web", "headless") else args.mode,
                         }
                         stop_event.set()
                         break
@@ -3155,7 +3156,7 @@ def _run_hybrid_engine(args):
                 w["cap"].release()
             if w["dbb"] is not None:
                 w["dbb"].close()
-        if args.mode == "dual":
+        if args.mode in ("dual", "opencv"):
             cv2.destroyAllWindows()
         if csv_file is not None:
             csv_file.close()
@@ -3173,9 +3174,9 @@ def _run_hybrid_engine(args):
     print("📊 LAPORAN AKHIR HASIL BENCHMARK MULTI-KAMERA (HYBRID 2-PROSES)")
     print("=" * 86)
     print(f"  • Total Waktu Pengujian     : {total_elapsed:.1f} detik")
-    if args.mode in ["dual", "headless", "web", "top-only"]:
+    if args.mode in ["dual", "opencv", "headless", "web", "top-only"]:
         print(f"  • CAM-01 Top (Slat & Rib)   : {f_top} frames ({avg_top_fps:.1f} rata-rata FPS)")
-    if args.mode in ["dual", "headless", "web", "side-only"]:
+    if args.mode in ["dual", "opencv", "headless", "web", "side-only"]:
         print(f"  • {args.side_cam_id} Side (Bolt & Pin)  : {f_side} frames ({avg_side_fps:.1f} rata-rata FPS)")
     print(f"  • Throughput Gabungan       : {(avg_top_fps + avg_side_fps):.1f} frames/detik")
     print("=" * 86)
@@ -3255,9 +3256,9 @@ Shortcut Keyboard Saat Berjalan:
 
     parser.add_argument(
         "--mode",
-        choices=["dual", "headless", "web", "top-only", "side-only"],
+        choices=["dual", "opencv", "headless", "web", "top-only", "side-only"],
         default=env_mode,
-        help="Mode eksekusi: 'dual' (2 jendela OpenCV), 'headless' (tanpa display), 'web' (khusus Web Dashboard 3-kam + WebSocket hybrid), atau kamera tunggal."
+        help="Mode eksekusi: 'dual' (2 jendela OpenCV + WS opsional), 'opencv' (HUD OpenCV saja tanpa WebSocket), 'headless' (tanpa display), 'web' (Web Dashboard 3-kam + WebSocket hybrid), atau kamera tunggal."
     )
     parser.add_argument(
         "--browse",
@@ -3400,16 +3401,20 @@ Shortcut Keyboard Saat Berjalan:
 
 def resolve_mode_defaults(args, argv=None):
     """
-    Menyesuaikan default otomatis untuk mode khusus (seperti --mode web):
+    Menyesuaikan default otomatis untuk mode khusus:
     - Mode 'web' otomatis mengaktifkan ws_stream=True dan memilih engine 'hybrid'
       (CAM-01 terisolasi bebas GIL) kecuali user secara eksplisit menentukan --engine di CLI.
+    - Mode 'opencv' menonaktifkan WebSocket (ws_stream=False) agar murni menampilkan HUD OpenCV desktop.
     """
     raw_argv = list(argv) if argv is not None else []
     explicit_engine = any(a == "--engine" or a.startswith("--engine=") for a in raw_argv)
-    if str(getattr(args, "mode", "")).lower() == "web":
+    cur_mode = str(getattr(args, "mode", "")).lower()
+    if cur_mode == "web":
         args.ws_stream = True
         if not explicit_engine:
             args.engine = "hybrid"
+    elif cur_mode == "opencv":
+        args.ws_stream = False
     return args
 
 
@@ -3425,10 +3430,16 @@ def apply_setup_handoff(args, new_top=None, new_side=None, new_mode=None):
 
     norm_new = str(new_mode).strip().lower() if new_mode else ""
     cur_mode = str(getattr(args, "mode", "")).strip().lower()
-    if norm_new in ("dual", "web", "headless", "top-only", "side-only") and norm_new != cur_mode:
+    if norm_new in ("dual", "opencv", "web", "headless", "top-only", "side-only") and norm_new != cur_mode:
         args.mode = norm_new
         if norm_new == "web":
             resolve_mode_defaults(args, argv=[])
+        elif norm_new == "opencv":
+            resolve_mode_defaults(args, argv=[])
+            if getattr(args, "engine", "") == "hybrid":
+                args.engine = "threads"
+        elif norm_new == "dual":
+            args.ws_stream = os.environ.get("ENABLE_WS_STREAM", "false").lower() in ("true", "1", "yes")
         return True
     return False
 
@@ -3494,8 +3505,8 @@ def main():
         else:
             print("[!] Peringatan: Tidak ditemukan webcam fisik yang aktif. Tetap menggunakan input default.")
 
-    top_is_active = args.mode in ["dual", "headless", "web", "top-only"]
-    side_is_active = args.mode in ["dual", "headless", "web", "side-only"]
+    top_is_active = args.mode in ["dual", "opencv", "headless", "web", "top-only"]
+    side_is_active = args.mode in ["dual", "opencv", "headless", "web", "side-only"]
     missing_top_source = top_is_active and not is_usable_source(args.top_source)
     missing_side_source = side_is_active and not is_usable_source(args.side_source)
 
@@ -3509,8 +3520,8 @@ def main():
             include_mode=True,
         )
         apply_setup_handoff(args, ch_top, ch_side, ch_mode)
-        top_is_active = args.mode in ["dual", "headless", "web", "top-only"]
-        side_is_active = args.mode in ["dual", "headless", "web", "side-only"]
+        top_is_active = args.mode in ["dual", "opencv", "headless", "web", "top-only"]
+        side_is_active = args.mode in ["dual", "opencv", "headless", "web", "side-only"]
     else:
         if missing_top_source or args.select_top or str(args.top_source).lower() in ["select", "dialog", "file"]:
             ch_top = select_source_dialog(title="[CAM-01 TOP] Pilih Sumber Plat & Rib", default_source=args.top_source)
@@ -3605,7 +3616,7 @@ def main():
     processes = []
 
     # 1. Spawn Worker Top
-    if args.mode in ["dual", "headless", "web", "top-only"]:
+    if args.mode in ["dual", "opencv", "headless", "web", "top-only"]:
         p_top = mp.Process(
             target=_run_top_worker,
             args=(
@@ -3626,7 +3637,7 @@ def main():
         processes.append(("TOP", p_top))
 
     # 2. Spawn Worker Side
-    if args.mode in ["dual", "headless", "web", "side-only"]:
+    if args.mode in ["dual", "opencv", "headless", "web", "side-only"]:
         p_side = mp.Process(
             target=_run_side_worker,
             args=(
@@ -3767,9 +3778,9 @@ def main():
     print("📊 LAPORAN AKHIR HASIL BENCHMARK MULTI-KAMERA")
     print("=" * 86)
     print(f"  • Total Waktu Pengujian     : {total_elapsed:.1f} detik")
-    if args.mode in ["dual", "headless", "web", "top-only"]:
+    if args.mode in ["dual", "opencv", "headless", "web", "top-only"]:
         print(f"  • CAM-01 Top (Slat & Rib)   : {f_top} frames ({avg_top_fps:.1f} rata-rata FPS)")
-    if args.mode in ["dual", "headless", "web", "side-only"]:
+    if args.mode in ["dual", "opencv", "headless", "web", "side-only"]:
         print(f"  • {args.side_cam_id} Side (Bolt & Pin)  : {f_side} frames ({avg_side_fps:.1f} rata-rata FPS)")
     print(f"  • Throughput Gabungan       : {(avg_top_fps + avg_side_fps):.1f} frames/detik")
 
