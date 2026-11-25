@@ -1609,15 +1609,79 @@ def _run_threaded_engine(args):
     top_lock = threading.Lock()
     side_lock = threading.Lock()
 
+    # Optional Opt-In Binary WebSocket Stream Server (Port 8765) + 3rd Camera (CAM-03)
+    ws_hub = None
+    ws_server = None
+    if getattr(args, "ws_stream", False):
+        try:
+            from ws_stream_server import CameraFrameHub, WebSocketStreamServer
+
+            ws_hub = CameraFrameHub()
+            ws_server = WebSocketStreamServer(
+                ws_hub,
+                port=int(getattr(args, "ws_port", 8765) or 8765),
+                max_fps=float(getattr(args, "ws_fps", 0.0) or 0.0),
+                hud_mode=str(getattr(args, "ws_hud_mode", "clean") or "clean"),
+            )
+            if not ws_server.start():
+                ws_server = None
+        except Exception as e_ws:
+            print(f"[WARN WS-STREAM] Gagal menginisialisasi WebSocket server: {e_ws}")
+            ws_hub = None
+            ws_server = None
+
+    side_left_inspector = None
+    side_left_db_bridge = None
+    cap_side_left = None
+    is_cam_side_left = False
+    side_left_source_path = getattr(args, "side_left_source", None)
+    side_left_cam_id = "CAM-03" if str(args.side_cam_id).upper() != "CAM-03" else "CAM-02"
+    side_left_side_name = "LEFT" if side_left_cam_id == "CAM-03" else "RIGHT"
+
+    if args.mode in ["dual", "headless"] and (getattr(args, "ws_stream", False) or side_left_source_path):
+        print(f"[*] Menginisialisasi Side Inspector ke-2 ({side_left_cam_id} {side_left_side_name})...")
+        try:
+            side_left_inspector = SideConveyorInspector(
+                camera_id=side_left_cam_id,
+                side=side_left_side_name,
+                device=args.device,
+            )
+            if InspectionDBBridge is not None:
+                try:
+                    side_left_db_bridge = InspectionDBBridge(
+                        enabled=args.enable_db,
+                        camera_id=side_left_cam_id,
+                    )
+                except Exception as e_db2:
+                    print(f"[WARN] Gagal inisialisasi {side_left_cam_id} DB Bridge: {e_db2}")
+
+            cand_left_src = side_left_source_path or side_source_path or DEFAULT_SIDE_VIDEO
+            if cand_left_src and not is_usable_source(cand_left_src):
+                cand_left_src = resolve_source_path(cand_left_src) or DEFAULT_SIDE_VIDEO
+            cap_side_left, is_cam_side_left, side_left_source_path = create_capture(cand_left_src)
+            if (not cap_side_left.isOpened()) and DEFAULT_SIDE_VIDEO and os.path.exists(DEFAULT_SIDE_VIDEO):
+                side_left_source_path = DEFAULT_SIDE_VIDEO
+                cap_side_left, is_cam_side_left, side_left_source_path = create_capture(side_left_source_path)
+            if side_left_inspector is not None and side_left_source_path:
+                if getattr(side_left_inspector, "auto_preset_mode", True):
+                    det_p_l = side_left_inspector.resolve_preset_from_source(side_left_source_path)
+                    side_left_inspector.set_preset(det_p_l, verbose=True)
+        except Exception as e_sl:
+            print(f"[WARN] Gagal inisialisasi {side_left_cam_id} Side Inspector: {e_sl}")
+            side_left_inspector = None
+
     # Inisialisasi Dedicated CUDA Streams & cuDNN Benchmark untuk mencegah GPU serialization
     top_stream = None
     side_stream = None
+    side_left_stream = None
     try:
         import torch
         if torch.cuda.is_available() and args.device != "cpu":
             torch.backends.cudnn.benchmark = True
             top_stream = torch.cuda.Stream()
             side_stream = torch.cuda.Stream()
+            if side_left_inspector is not None:
+                side_left_stream = torch.cuda.Stream()
     except Exception:
         pass
 
@@ -1636,6 +1700,12 @@ def _run_threaded_engine(args):
                 side_inspector.process_frame(frame_w)
                 if not is_cam_side:
                     cap_side.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        if side_left_inspector is not None and cap_side_left is not None and cap_side_left.isOpened():
+            ret_w, frame_w = cap_side_left.read()
+            if ret_w and frame_w is not None:
+                side_left_inspector.process_frame(frame_w, render_display=False)
+                if not is_cam_side_left:
+                    cap_side_left.set(cv2.CAP_PROP_POS_FRAMES, 0)
         print("[*] Pre-warmup selesai. GPU siap pada performa steady-state.")
     except Exception as e_wm:
         print(f"[WARN] Pre-warmup skipped: {e_wm}")
@@ -1875,6 +1945,28 @@ def _run_threaded_engine(args):
                     top_state["inspect_res"] = inspect_res
                     top_state["disp_id"] += 1
                     top_state["has_new"] = True
+
+                if ws_hub is not None:
+                    leg_frame = None
+                    if ws_server is not None and ws_server.hud_mode == "legacy" and ws_server.client_count > 0:
+                        leg_frame = top_inspector.render_combined_dashboard(
+                            frame=frame,
+                            inspect_result=inspect_res,
+                            fps=avg_f,
+                            frame_idx=cur_pos_f,
+                            total_frames=total_f_top,
+                        )
+                    ws_hub.publish(
+                        "CAM-01",
+                        frame,
+                        inspect_res,
+                        avg_f,
+                        inspector_meta={
+                            "slat_no": getattr(top_inspector.slat_inspector, "slat_count", None),
+                            "rib_no": getattr(top_inspector.rib_inspector, "rib_count", None),
+                        },
+                        legacy_frame=leg_frame,
+                    )
             except Exception as e:
                 import traceback
                 print(f"\n[WARN Thread-TopInspector] Transient exception caught (auto-recovered): {e}")
@@ -1927,9 +2019,13 @@ def _run_threaded_engine(args):
                         continue
 
                 t_infer_start = time.time()
+                ws_needs_legacy = bool(
+                    ws_server is not None and ws_server.hud_mode == "legacy" and ws_server.client_count > 0
+                )
                 need_side_render = (
                     (args.mode != "headless" and (t_infer_start - last_render_side) >= gui_interval)
                     or (side_db_bridge is not None and side_db_bridge.is_enabled())
+                    or ws_needs_legacy
                 )
                 if side_stream is not None:
                     with torch.cuda.stream(side_stream):
@@ -1972,9 +2068,95 @@ def _run_threaded_engine(args):
                         side_state["display"] = display_frame
                         side_state["disp_id"] += 1
                         side_state["has_new"] = True
+
+                if ws_hub is not None:
+                    ws_hub.publish(
+                        args.side_cam_id,
+                        frame,
+                        payload,
+                        avg_f,
+                        inspector_meta={
+                            "master_roi": getattr(side_inspector, "master_roi", None),
+                            "polygon_pts": getattr(side_inspector, "polygon_pts", None),
+                        },
+                        legacy_frame=display_frame if ws_needs_legacy else None,
+                    )
             except Exception as e:
                 import traceback
                 print(f"\n[WARN Thread-SideInspector] Transient exception caught (auto-recovered): {e}")
+                traceback.print_exc()
+                time.sleep(0.01)
+
+    # Worker Thread 3 (Opsional): Side Left Inspector (CAM-03) untuk 3-Camera WebSocket Live Stream
+    def _side_left_loop():
+        t_prev = time.time()
+        fps_hist = []
+        while not stop_event.is_set():
+            try:
+                if cap_side_left is None or not cap_side_left.isOpened():
+                    time.sleep(0.02)
+                    continue
+                with nav_lock:
+                    s_paused = nav_state.get("paused", False)
+                if s_paused:
+                    time.sleep(0.02)
+                    continue
+                ret, frame = cap_side_left.read()
+                if not ret or frame is None:
+                    if not is_cam_side_left:
+                        cap_side_left.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        side_left_inspector.reset_session()
+                        ret, frame = cap_side_left.read()
+                        if not ret or frame is None:
+                            time.sleep(0.02)
+                            continue
+                    else:
+                        time.sleep(0.01)
+                        continue
+
+                ws_needs_legacy = bool(
+                    ws_server is not None and ws_server.hud_mode == "legacy" and ws_server.client_count > 0
+                )
+                need_render = bool(
+                    (side_left_db_bridge is not None and side_left_db_bridge.is_enabled()) or ws_needs_legacy
+                )
+                if side_left_stream is not None:
+                    with torch.cuda.stream(side_left_stream), torch.inference_mode():
+                        disp_l, payload_l = side_left_inspector.process_frame(frame, render_display=need_render)
+                else:
+                    disp_l, payload_l = side_left_inspector.process_frame(frame, render_display=need_render)
+
+                t_end = time.time()
+                dt = t_end - t_prev
+                t_prev = t_end
+                fps_hist.append(1.0 / dt if dt > 0 else 30.0)
+                if len(fps_hist) > 30:
+                    fps_hist.pop(0)
+                avg_f = sum(fps_hist) / len(fps_hist)
+
+                if side_left_db_bridge and side_left_db_bridge.is_enabled():
+                    if payload_l.get("should_emit", False) and payload_l.get("overall_result") == "NG":
+                        side_left_db_bridge.emit_side_inspection(
+                            frame_raw=payload_l.get("emit_raw_frame", frame),
+                            frame_ann=payload_l.get("emit_ann_frame", disp_l),
+                            side_payload=payload_l,
+                        )
+
+                if ws_hub is not None:
+                    ws_hub.publish(
+                        side_left_cam_id,
+                        frame,
+                        payload_l,
+                        avg_f,
+                        inspector_meta={
+                            "master_roi": getattr(side_left_inspector, "master_roi", None),
+                            "polygon_pts": getattr(side_left_inspector, "polygon_pts", None),
+                        },
+                        legacy_frame=disp_l if ws_needs_legacy else None,
+                    )
+            except Exception as e:
+                import traceback
+                print(f"\n[WARN Thread-{side_left_cam_id}] Transient exception caught (auto-recovered): {e}")
                 traceback.print_exc()
                 time.sleep(0.01)
 
@@ -1988,6 +2170,10 @@ def _run_threaded_engine(args):
         th_side = threading.Thread(target=_side_loop, daemon=True, name="Thread-SideInspector")
         th_side.start()
         threads.append(th_side)
+    if side_left_inspector is not None:
+        th_side_left = threading.Thread(target=_side_left_loop, daemon=True, name=f"Thread-{side_left_cam_id}")
+        th_side_left.start()
+        threads.append(th_side_left)
 
     # Windows GUI Setup
     win_top = "CAM-01 TOP (SLAT & RIB) | [SPACE]: Pause | [,/.]: +-10f | [;/']: +-60f | [[/]]: +-10s | [-/=]: +-60s | [X]: Speed | [I]: Skip-Diam | [Z]: Loncat | [Q]: Keluar"
@@ -2409,10 +2595,16 @@ def _run_threaded_engine(args):
             cap_top.release()
         if cap_side is not None:
             cap_side.release()
+        if cap_side_left is not None:
+            cap_side_left.release()
+        if ws_server is not None:
+            ws_server.stop()
         if top_inspector and hasattr(top_inspector, "db_bridge") and top_inspector.db_bridge:
             top_inspector.db_bridge.close()
         if side_db_bridge is not None:
             side_db_bridge.close()
+        if side_left_db_bridge is not None:
+            side_left_db_bridge.close()
         if args.mode != "headless":
             cv2.destroyAllWindows()
         if csv_file is not None:
@@ -2461,22 +2653,8 @@ def _run_threaded_engine(args):
 # ======================================================================================
 # MASTER ORCHESTRATOR & BENCHMARK SUPERVISOR
 # ======================================================================================
-def main():
-    if "--gui-dialog" in sys.argv:
-        _handle_isolated_gui_dialog()
-        return
-
-    import signal
-    def _sig_clean(sig, frame):
-        print(f"\n[*] Sinyal ({sig}) diterima. Menutup pipeline secara bersih...")
-        sys.exit(0)
-
-    try:
-        signal.signal(signal.SIGINT, _sig_clean)
-        signal.signal(signal.SIGTERM, _sig_clean)
-    except Exception:
-        pass
-
+def build_arg_parser():
+    """Membangun ArgumentParser CLI runner (diekstrak agar dapat diuji unit test)."""
     parser = argparse.ArgumentParser(
         description="Master Multi-Camera Benchmark Runner (Top Slat/Rib + Side Bolt/Pin)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2532,6 +2710,19 @@ Shortcut Keyboard Saat Berjalan:
     env_csv = os.environ.get("RECORD_CSV", None)
     env_db = os.environ.get("ENABLE_DB_LOGGING", "false").lower() in ("true", "1", "yes")
     env_engine = os.environ.get("BENCHMARK_ENGINE", "threads")
+    env_ws_stream = os.environ.get("ENABLE_WS_STREAM", "false").lower() in ("true", "1", "yes")
+    try:
+        env_ws_port = int(os.environ.get("WS_STREAM_PORT", "8765"))
+    except ValueError:
+        env_ws_port = 8765
+    try:
+        env_ws_fps = float(os.environ.get("WS_MAX_FPS", "0"))
+    except ValueError:
+        env_ws_fps = 0.0
+    env_ws_hud_mode = os.environ.get("WS_HUD_MODE", "clean").strip().lower()
+    if env_ws_hud_mode not in ("clean", "legacy"):
+        env_ws_hud_mode = "clean"
+    env_side_left_source = os.environ.get("SIDE_LEFT_CAMERA_SOURCE") or None
 
     parser.add_argument(
         "--mode",
@@ -2587,6 +2778,12 @@ Shortcut Keyboard Saat Berjalan:
         type=str,
         default=DEFAULT_SIDE_VIDEO,
         help="Path video, index webcam (0/1), atau ketik 'browse' untuk Side Bolt/Pin. Jika kosong, dialog pemilih sumber akan muncul."
+    )
+    parser.add_argument(
+        "--side-left-source",
+        type=str,
+        default=env_side_left_source,
+        help="Path video atau index webcam opsional untuk kamera samping ke-2 (CAM-03 LEFT) saat 3-camera WebSocket stream aktif."
     )
     parser.add_argument("--side-name", type=str, default=env_side_name, choices=["RIGHT", "LEFT"], help="Sisi konveyor (RIGHT / LEFT)")
     parser.add_argument("--side-cam-id", type=str, default=env_side_cam_id, help="ID Kamera samping (default: CAM-02 untuk RIGHT, CAM-03 untuk LEFT)")
@@ -2645,6 +2842,50 @@ Shortcut Keyboard Saat Berjalan:
         action="store_true",
         help="Aktifkan mode Auto-Skip otomatis melewati bagian video ketika conveyor diam."
     )
+    parser.add_argument(
+        "--ws-stream",
+        action="store_true",
+        default=env_ws_stream,
+        help="Aktifkan Binary WebSocket Live Stream 3 kamera ke Web Frontend (opt-in)."
+    )
+    parser.add_argument(
+        "--ws-port",
+        type=int,
+        default=env_ws_port,
+        help=f"Port WebSocket Live Stream (default: {env_ws_port})."
+    )
+    parser.add_argument(
+        "--ws-fps",
+        type=float,
+        default=env_ws_fps,
+        help=f"Batas maksimal FPS stream WebSocket per kamera (0 = uncapped, default: {env_ws_fps})."
+    )
+    parser.add_argument(
+        "--ws-hud-mode",
+        choices=["clean", "legacy"],
+        default=env_ws_hud_mode,
+        help=f"Mode visual stream WebSocket: 'clean' (16:9 penuh) atau 'legacy' (HUD OpenCV lama). Default: {env_ws_hud_mode}."
+    )
+    return parser
+
+
+def main():
+    if "--gui-dialog" in sys.argv:
+        _handle_isolated_gui_dialog()
+        return
+
+    import signal
+    def _sig_clean(sig, frame):
+        print(f"\n[*] Sinyal ({sig}) diterima. Menutup pipeline secara bersih...")
+        sys.exit(0)
+
+    try:
+        signal.signal(signal.SIGINT, _sig_clean)
+        signal.signal(signal.SIGTERM, _sig_clean)
+    except Exception:
+        pass
+
+    parser = build_arg_parser()
 
     args = parser.parse_args()
 
