@@ -1,0 +1,41 @@
+# ==============================================================================
+# REQUIREMENTS - WINDOWS / LINUX WORKSTATION (CUDA GPU / CPU)
+# Sistem Inspeksi AI Slat Rib Conveyor
+# ==============================================================================
+# Catatan:
+# 1. Untuk NVIDIA Jetson Orin Nano (ARM64 / JetPack), tetap gunakan: requirements.txt
+#    karena PyTorch Jetson menggunakan NVIDIA JetPack wheel dan numpy < 2.0.0.
+# 2. Di Windows/Linux x86_64, gunakan scripts/setup_windows.ps1 (atau Conda via
+#    environment.yml) agar PyTorch CUDA terinstal lebih dulu.
+# ==============================================================================
+
+# --- Numerical, Vision & Processing Core ---
+numpy>=1.23.5
+opencv-python>=4.8.0.76
+scipy>=1.10.0
+Pillow>=9.5.0
+scikit-image>=0.22.0
+scikit-learn>=1.2.0
+matplotlib>=3.7.0
+
+# --- Deep Learning, YOLO, ONNX & WebSocket Streaming ---
+ultralytics>=8.1.0
+onnx>=1.14.0
+onnxslim>=0.1.31
+onnxruntime-gpu>=1.18.0
+websockets>=12.0
+
+# --- Backend REST API, Config & Database Integration ---
+Flask>=2.3.0
+flask-cors>=3.0.10
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+pyodbc>=4.0.35
+python-dotenv>=1.0.0
+
+# --- Utilities & Testing ---
+tqdm>=4.65.0
+requests>=2.28.0
+PyYAML>=6.0
+pyserial>=3.5
+pytest>=8.0.0

@@ -1,0 +1,26 @@
+# ==============================================================================
+# CONDA ENVIRONMENT - AI SLAT & RIB CONVEYOR INSPECTION SYSTEM
+# ==============================================================================
+# Cocok untuk perpindahan ke PC/Laptop baru (Windows / Linux x86_64 dengan NVIDIA GPU).
+# (Untuk NVIDIA Jetson Orin ARM64, gunakan scripts/setup_jetson.sh + requirements.txt)
+#
+# Cara pakai:
+#   conda env create -f environment.yml
+#   conda activate ai-conveyor
+#   cd FE && npm ci && cd ..
+#
+# Update environment yang sudah ada:
+#   conda env update -f environment.yml --prune
+# ==============================================================================
+name: ai-conveyor
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch>=2.5.0
+      - torchvision>=0.20.0
+      - -r requirements-windows.txt

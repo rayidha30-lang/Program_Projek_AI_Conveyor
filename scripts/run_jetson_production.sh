@@ -22,10 +22,16 @@ fi
 
 # 2. Cek Mode Eksekusi
 MODE="${1:-headless}"
-ENGINE="${2:-process}"
+if [ -n "${2:-}" ]; then
+    ENGINE="$2"
+elif [ "$MODE" = "web" ]; then
+    ENGINE="hybrid"
+else
+    ENGINE="process"
+fi
 
 echo "[*] Mode Operasional : $MODE"
-echo "[*] Engine Runner    : $ENGINE (Multi-Core Process Isolation)"
+echo "[*] Engine Runner    : $ENGINE (web -> hybrid WS 3-kam, headless/dual -> isolated)"
 echo "[*] Database Logging : AKTIF (SQLite + Teams Alert)"
 echo "----------------------------------------------------------------------"
 

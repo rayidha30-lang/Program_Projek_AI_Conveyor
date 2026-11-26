@@ -34,11 +34,14 @@ cd "$PROJECT_ROOT"
 
 SKIP_TRT=false
 SKIP_PULL=false
-for arg in "$@"; do
-    case "$arg" in
+TARGET_BRANCH=""
+while [ $# -gt 0 ]; do
+    case "$1" in
         --skip-trt)  SKIP_TRT=true ;;
         --skip-pull) SKIP_PULL=true ;;
+        --branch)    TARGET_BRANCH="${2:-}"; shift ;;
     esac
+    shift
 done
 
 echo -e "${CYAN}======================================================================${NC}"
@@ -66,8 +69,11 @@ elif [ -d ".git" ]; then
         git stash push -m "auto-stash-before-jetson-update-$(date +%Y%m%d_%H%M%S)" || true
     fi
 
-    echo -e "[*] Menarik pembaruan dari origin/main..."
-    git pull origin main
+    if [ -z "$TARGET_BRANCH" ]; then
+        TARGET_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+    fi
+    echo -e "[*] Menarik pembaruan dari origin/${TARGET_BRANCH}..."
+    git pull origin "$TARGET_BRANCH"
 
     if [ -f ".env.bak_update" ]; then
         mv .env.bak_update .env
