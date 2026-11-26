@@ -401,46 +401,31 @@ export default function Index() {
           view={view}
           apiStatus={apiStatus}
           wsConnected={wsConnected}
+          dbEnabled={dbEnabled}
+          onToggleDb={toggleDb}
           theme={theme}
           onToggleTheme={toggleTheme}
           onOpenMobileMenu={() => setMobileMenuOpen(true)}
           contextActions={
-            view === "dashboard" || view === "live" ? (
+            view === "live" ? (
               <div className="flex items-center gap-1.5 flex-wrap">
-                {wsConnected && (
-                  <button
-                    type="button"
-                    onClick={toggleDb}
-                    className="cursor-pointer"
-                    title="Aktifkan / Nonaktifkan pencatatan NG ke Database SQLite & Notifikasi Teams (setara tombol [D])"
-                  >
-                    <StatusPill
-                      text={dbEnabled ? "DB Record: ON" : "DB Record: OFF"}
-                      online={Boolean(dbEnabled)}
-                    />
-                  </button>
-                )}
-                {view === "live" && (
-                  <>
-                    <button
-                      type="button"
-                      onClick={toggleOverlay}
-                      className="cursor-pointer"
-                      title="Toggle overlay bounding box & kontur deteksi"
-                    >
-                      <StatusPill
-                        text={showOverlay ? "Bounding Box: ON" : "Bounding Box: OFF"}
-                        online={showOverlay}
-                      />
-                    </button>
-                    <span className="hidden sm:inline-flex">
-                      <StatusPill
-                        text={wsConnected ? "WS Stream: Live" : "WS Stream: Standby"}
-                        online={wsConnected}
-                      />
-                    </span>
-                  </>
-                )}
+                <button
+                  type="button"
+                  onClick={toggleOverlay}
+                  className="cursor-pointer"
+                  title="Toggle overlay bounding box & kontur deteksi"
+                >
+                  <StatusPill
+                    text={showOverlay ? "Bounding Box: ON" : "Bounding Box: OFF"}
+                    online={showOverlay}
+                  />
+                </button>
+                <span className="hidden sm:inline-flex">
+                  <StatusPill
+                    text={wsConnected ? "WS Stream: Live" : "WS Stream: Standby"}
+                    online={wsConnected}
+                  />
+                </span>
               </div>
             ) : view === "evidence" ? (
               <div className="flex items-center gap-1.5">
@@ -896,6 +881,8 @@ function Header({
   view,
   apiStatus,
   wsConnected,
+  dbEnabled,
+  onToggleDb,
   theme,
   onToggleTheme,
   onOpenMobileMenu,
@@ -904,6 +891,8 @@ function Header({
   view: View;
   apiStatus: { status: string; database: string };
   wsConnected: boolean;
+  dbEnabled: boolean | null;
+  onToggleDb: () => void;
   theme: "light" | "dark";
   onToggleTheme: () => void;
   onOpenMobileMenu: () => void;
@@ -977,6 +966,43 @@ function Header({
             {timeStr || "15 Sep 2026 | 09:00 WIB"}
           </span>
         </div>
+
+        {/* DB Logging Toggle Switch (selalu tampil di Header kanan atas) */}
+        <button
+          type="button"
+          role="switch"
+          aria-checked={Boolean(dbEnabled)}
+          disabled={!wsConnected}
+          onClick={onToggleDb}
+          title={
+            wsConnected
+              ? "Aktifkan / Nonaktifkan pencatatan NG ke Database SQLite & Notifikasi Teams (setara tombol [D])"
+              : "Standby — jalankan runner Vision Engine (:8765) agar toggle DB dapat diaktifkan"
+          }
+          className={`flex items-center gap-2 rounded-xl border px-2.5 py-1.5 text-[10px] font-bold shadow-xs transition-all ${
+            !wsConnected
+              ? "border-border/60 bg-card/70 text-muted-foreground opacity-65 cursor-not-allowed"
+              : dbEnabled
+                ? "border-success/50 bg-success-soft text-success hover:bg-success-soft/80 cursor-pointer"
+                : "border-border/80 bg-card text-foreground hover:bg-muted/70 cursor-pointer"
+          }`}
+        >
+          <Database className="size-3.5 shrink-0" />
+          <span className="whitespace-nowrap">
+            DB {wsConnected ? (dbEnabled ? "ON" : "OFF") : "OFF"}
+          </span>
+          <span
+            className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
+              wsConnected && dbEnabled ? "bg-success" : "bg-muted-foreground/35"
+            }`}
+          >
+            <span
+              className={`inline-block size-3 rounded-full bg-white shadow-xs transition-transform ${
+                wsConnected && dbEnabled ? "translate-x-3.5" : "translate-x-0.5"
+              }`}
+            />
+          </span>
+        </button>
 
         {/* Theme Toggle Button */}
         <button
