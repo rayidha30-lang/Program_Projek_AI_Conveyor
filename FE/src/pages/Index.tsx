@@ -26,13 +26,18 @@ import {
   Layers,
   LayoutDashboard,
   LogOut,
+  Maximize2,
+  Minimize2,
+  Minus,
   Moon,
+  Plus,
   RotateCcw,
   Search,
   ShieldAlert,
   ShieldCheck,
   Sun,
   Wrench,
+  X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -245,6 +250,25 @@ export default function Index() {
     toggleOverlay,
     streams,
   } = useLiveCameraStream(view === "dashboard" || view === "live");
+  const [maximizedCam, setMaximizedCam] = useState<CameraId | null>(null);
+  const [minimizedCams, setMinimizedCams] = useState<Record<CameraId, boolean>>({
+    "CAM-01": false,
+    "CAM-02": false,
+    "CAM-03": false,
+  });
+
+  const toggleMinimizeCam = (cam: CameraId) => {
+    setMinimizedCams((prev) => ({ ...prev, [cam]: !prev[cam] }));
+  };
+
+  useEffect(() => {
+    if (!maximizedCam) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMaximizedCam(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [maximizedCam]);
 
   // Pengendali tema (Dark / Light) dengan persistensi localStorage
   const [theme, setTheme] = useState<"light" | "dark">(() => {
@@ -409,9 +433,20 @@ export default function Index() {
               recentRecords={recordsData}
               streams={streams}
               wsConnected={wsConnected}
+              minimizedCams={minimizedCams}
+              onToggleMinimize={toggleMinimizeCam}
+              onMaximize={setMaximizedCam}
             />
           )}
-          {view === "live" && <LiveCamera streams={streams} wsConnected={wsConnected} />}
+          {view === "live" && (
+            <LiveCamera
+              streams={streams}
+              wsConnected={wsConnected}
+              minimizedCams={minimizedCams}
+              onToggleMinimize={toggleMinimizeCam}
+              onMaximize={setMaximizedCam}
+            />
+          )}
           {view === "abnormality" && (
             <Abnormality
               allRecords={recordsData}
@@ -437,6 +472,21 @@ export default function Index() {
           {view === "settings" && <TuningSettings theme={theme} />}
         </main>
       </div>
+      {maximizedCam && (
+        <CameraSpotlightModal
+          camera={maximizedCam}
+          streamState={streams[maximizedCam]}
+          wsConnected={wsConnected}
+          showOverlay={showOverlay}
+          onToggleOverlay={toggleOverlay}
+          onMinimizeToGrid={() => {
+            const cam = maximizedCam;
+            setMaximizedCam(null);
+            setMinimizedCams((prev) => ({ ...prev, [cam]: false }));
+          }}
+          onClose={() => setMaximizedCam(null)}
+        />
+      )}
     </div>
   );
 }
@@ -935,6 +985,9 @@ function Dashboard({
   recentRecords,
   streams,
   wsConnected,
+  minimizedCams,
+  onToggleMinimize,
+  onMaximize,
 }: {
   onViewAll: () => void;
   onSelectRecord?: (record: RecordRow) => void;
@@ -942,6 +995,9 @@ function Dashboard({
   recentRecords: RecordRow[];
   streams: Record<CameraId, CameraStreamState>;
   wsConnected: boolean;
+  minimizedCams: Record<CameraId, boolean>;
+  onToggleMinimize: (cam: CameraId) => void;
+  onMaximize: (cam: CameraId) => void;
 }) {
   const statsMeta: Record<
     string,
@@ -1064,7 +1120,7 @@ function Dashboard({
             </span>
           }
         />
-        <div className="mt-4 grid gap-4 xl:grid-cols-3">
+        <div className="mt-4 grid gap-4 xl:grid-cols-3 items-start">
           <CameraFeed
             camera="CAM-01"
             area="Plate / Rib"
@@ -1073,6 +1129,9 @@ function Dashboard({
             conf="-"
             fps="--"
             streamState={streams["CAM-01"]}
+            isMinimized={minimizedCams["CAM-01"]}
+            onToggleMinimize={() => onToggleMinimize("CAM-01")}
+            onMaximize={() => onMaximize("CAM-01")}
           />
           <CameraFeed
             camera="CAM-02"
@@ -1082,6 +1141,9 @@ function Dashboard({
             conf="-"
             fps="--"
             streamState={streams["CAM-02"]}
+            isMinimized={minimizedCams["CAM-02"]}
+            onToggleMinimize={() => onToggleMinimize("CAM-02")}
+            onMaximize={() => onMaximize("CAM-02")}
           />
           <CameraFeed
             camera="CAM-03"
@@ -1091,6 +1153,9 @@ function Dashboard({
             conf="-"
             fps="--"
             streamState={streams["CAM-03"]}
+            isMinimized={minimizedCams["CAM-03"]}
+            onToggleMinimize={() => onToggleMinimize("CAM-03")}
+            onMaximize={() => onMaximize("CAM-03")}
           />
         </div>
       </Panel>
@@ -1121,6 +1186,72 @@ function Dashboard({
   );
 }
 
+const CAMERA_CATALOG: Record<
+  CameraId,
+  {
+    area: string;
+    station: string;
+    title: string;
+    desc: string;
+    fallbackObj: string;
+  }
+> = {
+  "CAM-01": {
+    area: "Plate / Rib",
+    station: "Station: ST-01 / Overhead",
+    title: "Plat / Rib Inspection Area",
+    desc: "Mendeteksi kelurusan celah plat slat & deformasi profil rib conveyor.",
+    fallbackObj: "Conveyor Plate / Rib",
+  },
+  "CAM-02": {
+    area: "Bolt / Pin RH Side",
+    station: "Station: ST-01 / Right Oblique",
+    title: "Bolt / Pin Right Side Area",
+    desc: "Inspeksi baut penahan samping kanan, pin, dan retakan bracket.",
+    fallbackObj: "Bolt / Pin RH",
+  },
+  "CAM-03": {
+    area: "Bolt / Pin LH Side",
+    station: "Station: ST-01 / Left Oblique",
+    title: "Bolt / Pin Left Side Area",
+    desc: "Inspeksi baut penahan samping kiri, pin, dan retakan bracket.",
+    fallbackObj: "Bolt / Pin LH",
+  },
+};
+
+function CameraWindowButtons({
+  camera,
+  isMinimized,
+  onToggleMinimize,
+  onMaximize,
+}: {
+  camera: string;
+  isMinimized: boolean;
+  onToggleMinimize: () => void;
+  onMaximize: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-1">
+      <button
+        type="button"
+        onClick={onToggleMinimize}
+        title={isMinimized ? `Tampilkan preview ${camera}` : `Minimize preview ${camera}`}
+        className="inline-flex size-6 items-center justify-center rounded border border-border/70 bg-background/70 text-muted-foreground transition hover:bg-accent hover:text-foreground"
+      >
+        {isMinimized ? <Plus className="size-3.5" /> : <Minus className="size-3.5" />}
+      </button>
+      <button
+        type="button"
+        onClick={onMaximize}
+        title={`Maximize ${camera} ke tampilan besar`}
+        className="inline-flex size-6 items-center justify-center rounded border border-border/70 bg-background/70 text-muted-foreground transition hover:bg-accent hover:text-foreground"
+      >
+        <Maximize2 className="size-3" />
+      </button>
+    </div>
+  );
+}
+
 function CameraFeed({
   camera,
   area,
@@ -1131,8 +1262,11 @@ function CameraFeed({
   sev,
   alert = false,
   streamState,
+  isMinimized = false,
+  onToggleMinimize,
+  onMaximize,
 }: {
-  camera: string;
+  camera: CameraId;
   area: string;
   object: string;
   objectType: string;
@@ -1141,6 +1275,9 @@ function CameraFeed({
   sev?: string;
   alert?: boolean;
   streamState?: CameraStreamState;
+  isMinimized?: boolean;
+  onToggleMinimize: () => void;
+  onMaximize: () => void;
 }) {
   const liveMeta = streamState?.meta;
   const frameUrl = streamState?.frameUrl;
@@ -1168,46 +1305,60 @@ function CameraFeed({
         isAlarm ? "border-danger/50" : "border-border"
       }`}
     >
-      <div className="flex items-center justify-between bg-secondary px-3 py-2 text-[10px]">
-        <span className="font-bold">
+      <div className="flex items-center justify-between gap-2 bg-secondary px-3 py-2 text-[10px]">
+        <span className="truncate font-bold">
           {camera}{" "}
           <span className="font-medium text-muted-foreground">({area})</span>
         </span>
-        <span
-          className={`font-bold ${
-            !hasLive
-              ? "text-muted-foreground"
-              : isAlarm
-                ? "text-danger"
-                : "text-success"
-          }`}
-        >
-          {statusText}
-        </span>
-      </div>
-      <div className="camera-grid relative flex aspect-video items-center justify-center overflow-hidden bg-black/90">
-        {frameUrl ? (
-          <img
-            src={frameUrl}
-            alt={`${camera} live stream`}
-            className="size-full object-cover"
+        <div className="flex items-center gap-2 shrink-0">
+          <span
+            className={`font-bold ${
+              !hasLive
+                ? "text-muted-foreground"
+                : isAlarm
+                  ? "text-danger"
+                  : "text-success"
+            }`}
+          >
+            {statusText}
+          </span>
+          <CameraWindowButtons
+            camera={camera}
+            isMinimized={isMinimized}
+            onToggleMinimize={onToggleMinimize}
+            onMaximize={onMaximize}
           />
-        ) : (
-          <>
-            <div
-              className={`absolute inset-x-0 top-0 h-px ${
-                isAlarm ? "bg-danger" : "bg-muted-foreground/40"
-              } scan-line`}
-            />
-            <div className="flex flex-col items-center gap-1.5 text-center px-4">
-              <Camera className="size-6 text-muted-foreground/70" />
-              <span className="font-mono text-[10px] text-muted-foreground">
-                Menunggu stream {camera} ({object})
-              </span>
-            </div>
-          </>
-        )}
+        </div>
       </div>
+      {!isMinimized && (
+        <div
+          onDoubleClick={onMaximize}
+          title="Double-click atau klik Maximize untuk memperbesar"
+          className="camera-grid relative flex aspect-video items-center justify-center overflow-hidden bg-black/90 cursor-pointer"
+        >
+          {frameUrl ? (
+            <img
+              src={frameUrl}
+              alt={`${camera} live stream`}
+              className="size-full object-cover"
+            />
+          ) : (
+            <>
+              <div
+                className={`absolute inset-x-0 top-0 h-px ${
+                  isAlarm ? "bg-danger" : "bg-muted-foreground/40"
+                } scan-line`}
+              />
+              <div className="flex flex-col items-center gap-1.5 text-center px-4">
+                <Camera className="size-6 text-muted-foreground/70" />
+                <span className="font-mono text-[10px] text-muted-foreground">
+                  Menunggu stream {camera} ({object})
+                </span>
+              </div>
+            </>
+          )}
+        </div>
+      )}
       <div className="flex flex-wrap items-center justify-between gap-1.5 bg-card px-3 py-2 font-mono text-[9px] text-muted-foreground border-t">
         <div className="flex items-center gap-1.5 sm:gap-2">
           <span>
@@ -1240,57 +1391,37 @@ function CameraFeed({
 function LiveCamera({
   streams,
   wsConnected,
+  minimizedCams,
+  onToggleMinimize,
+  onMaximize,
 }: {
   streams: Record<CameraId, CameraStreamState>;
   wsConnected: boolean;
+  minimizedCams: Record<CameraId, boolean>;
+  onToggleMinimize: (cam: CameraId) => void;
+  onMaximize: (cam: CameraId) => void;
 }) {
-  const cameras: {
-    cam: CameraId;
-    station: string;
-    title: string;
-    desc: string;
-    fallbackObj: string;
-  }[] = [
-    {
-      cam: "CAM-01",
-      station: "Station: ST-01 / Overhead",
-      title: "Plat / Rib Inspection Area",
-      desc: "Mendeteksi kelurusan celah plat slat & deformasi profil rib conveyor.",
-      fallbackObj: "Conveyor Plate / Rib",
-    },
-    {
-      cam: "CAM-02",
-      station: "Station: ST-01 / Right Oblique",
-      title: "Bolt / Pin Right Side Area",
-      desc: "Inspeksi baut penahan samping kanan, pin, dan retakan bracket.",
-      fallbackObj: "Bolt / Pin RH",
-    },
-    {
-      cam: "CAM-03",
-      station: "Station: ST-01 / Left Oblique",
-      title: "Bolt / Pin Left Side Area",
-      desc: "Inspeksi baut penahan samping kiri, pin, dan retakan bracket.",
-      fallbackObj: "Bolt / Pin LH",
-    },
-  ];
+  const camIds: CameraId[] = ["CAM-01", "CAM-02", "CAM-03"];
 
   return (
-    <div className="grid gap-5 xl:grid-cols-3">
-      {cameras.map((c) => {
-        const st = streams[c.cam];
+    <div className="grid gap-5 xl:grid-cols-3 items-start">
+      {camIds.map((cam) => {
+        const c = CAMERA_CATALOG[cam];
+        const st = streams[cam];
         const meta = st?.meta;
         const hasLive = Boolean(st?.frameUrl);
         const isAlert = hasLive && meta?.status === "NG";
         const statusLabel = hasLive ? (meta?.status || "ONLINE") : "STANDBY";
         const fpsLabel = hasLive && meta?.fps !== undefined ? meta.fps.toFixed(1) : "--";
         const objLabel = hasLive && meta?.object ? meta.object : c.fallbackObj;
+        const isMinimized = Boolean(minimizedCams[cam]);
 
         return (
-          <Panel key={c.cam} className="overflow-hidden">
-            <div className="flex justify-between p-4 pb-3">
+          <Panel key={cam} className="overflow-hidden">
+            <div className="flex items-start justify-between gap-2 p-4 pb-3">
               <div>
                 <p className="text-xs font-extrabold">
-                  {c.cam}{" "}
+                  {cam}{" "}
                   <span
                     className={
                       !hasLive
@@ -1307,45 +1438,64 @@ function LiveCamera({
                   {c.station}
                 </p>
               </div>
-              <Camera className="size-5 text-muted-foreground" />
+              <CameraWindowButtons
+                camera={cam}
+                isMinimized={isMinimized}
+                onToggleMinimize={() => onToggleMinimize(cam)}
+                onMaximize={() => onMaximize(cam)}
+              />
             </div>
-            <div className="camera-grid relative flex aspect-video items-center justify-center overflow-hidden bg-black/90">
-              {st?.frameUrl ? (
-                <img
-                  src={st.frameUrl}
-                  alt={`${c.cam} live view`}
-                  className="size-full object-cover"
-                />
-              ) : (
-                <div className="flex flex-col items-center gap-1.5 text-center px-4">
-                  <Camera className="size-7 text-muted-foreground/60" />
-                  <span className="font-mono text-[10px] text-muted-foreground">
-                    {wsConnected
-                      ? `Menunggu frame ${c.cam}...`
-                      : "Standby (jalankan runner dengan --ws-stream)"}
-                  </span>
+            {!isMinimized && (
+              <div
+                onDoubleClick={() => onMaximize(cam)}
+                title="Double-click atau klik Maximize untuk memperbesar"
+                className="camera-grid relative flex aspect-video items-center justify-center overflow-hidden bg-black/90 cursor-pointer"
+              >
+                {st?.frameUrl ? (
+                  <img
+                    src={st.frameUrl}
+                    alt={`${cam} live view`}
+                    className="size-full object-cover"
+                  />
+                ) : (
+                  <div className="flex flex-col items-center gap-1.5 text-center px-4">
+                    <Camera className="size-7 text-muted-foreground/60" />
+                    <span className="font-mono text-[10px] text-muted-foreground">
+                      {wsConnected
+                        ? `Menunggu frame ${cam}...`
+                        : "Standby (jalankan runner dengan --ws-stream)"}
+                    </span>
+                  </div>
+                )}
+                <div
+                  className={`absolute bottom-2.5 left-2.5 rounded px-2 py-0.5 font-mono text-[9px] font-bold ${
+                    !hasLive
+                      ? "bg-black/70 text-muted-foreground border border-white/10"
+                      : isAlert
+                        ? "bg-danger text-primary-foreground"
+                        : "bg-success text-primary-foreground"
+                  }`}
+                >
+                  {!hasLive
+                    ? "STREAM STANDBY"
+                    : isAlert
+                      ? "CRITICAL DEFECT DETECTED"
+                      : "STREAM VIEW • OK"}
                 </div>
+              </div>
+            )}
+            <div className="p-4">
+              {!isMinimized && (
+                <>
+                  <h3 className="text-sm font-bold">{c.title}</h3>
+                  <p className="mt-1 text-[10px] text-muted-foreground">{c.desc}</p>
+                </>
               )}
               <div
-                className={`absolute bottom-2.5 left-2.5 rounded px-2 py-0.5 font-mono text-[9px] font-bold ${
-                  !hasLive
-                    ? "bg-black/70 text-muted-foreground border border-white/10"
-                    : isAlert
-                      ? "bg-danger text-primary-foreground"
-                      : "bg-success text-primary-foreground"
-                }`}
+                className={`${
+                  isMinimized ? "" : "mt-4 border-t pt-3"
+                } flex justify-between text-[9px] font-mono`}
               >
-                {!hasLive
-                  ? "STREAM STANDBY"
-                  : isAlert
-                    ? "CRITICAL DEFECT DETECTED"
-                    : "STREAM VIEW • OK"}
-              </div>
-            </div>
-            <div className="p-4">
-              <h3 className="text-sm font-bold">{c.title}</h3>
-              <p className="mt-1 text-[10px] text-muted-foreground">{c.desc}</p>
-              <div className="mt-4 flex justify-between border-t pt-3 text-[9px] font-mono">
                 <span>
                   FPS: <b>{fpsLabel}</b> • 360p WS Live
                 </span>
@@ -1357,6 +1507,158 @@ function LiveCamera({
           </Panel>
         );
       })}
+    </div>
+  );
+}
+
+function CameraSpotlightModal({
+  camera,
+  streamState,
+  wsConnected,
+  showOverlay,
+  onToggleOverlay,
+  onMinimizeToGrid,
+  onClose,
+}: {
+  camera: CameraId;
+  streamState?: CameraStreamState;
+  wsConnected: boolean;
+  showOverlay: boolean;
+  onToggleOverlay: () => void;
+  onMinimizeToGrid: () => void;
+  onClose: () => void;
+}) {
+  const info = CAMERA_CATALOG[camera];
+  const meta = streamState?.meta;
+  const frameUrl = streamState?.frameUrl;
+  const hasLive = Boolean(frameUrl);
+  const isAlarm = hasLive && meta?.status === "NG";
+  const statusText = hasLive
+    ? isAlarm
+      ? "ALARM ACTIVE"
+      : meta?.status || "ONLINE"
+    : "STANDBY";
+  const displayFps = hasLive && meta?.fps !== undefined ? meta.fps.toFixed(1) : "--";
+  const displayObject = hasLive && meta?.object ? meta.object : info.fallbackObj;
+  const displayConf =
+    hasLive && meta?.conf !== null && meta?.conf !== undefined
+      ? `${(meta.conf * 100).toFixed(1)}%`
+      : "-";
+  const displaySev =
+    hasLive && meta?.severity && meta.severity !== "NONE" ? meta.severity : null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 sm:p-6 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className={`w-full max-w-5xl overflow-hidden rounded-xl border bg-card shadow-2xl ${
+          isAlarm ? "border-danger/60" : "border-border"
+        }`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b bg-secondary px-4 py-3">
+          <div className="flex items-center gap-2.5">
+            <span className="rounded bg-primary/15 px-2 py-0.5 text-xs font-extrabold text-primary">
+              {camera}
+            </span>
+            <div>
+              <p className="text-xs font-bold">
+                {info.title}{" "}
+                <span className="font-normal text-muted-foreground">({info.area})</span>
+              </p>
+              <p className="text-[10px] text-muted-foreground">{info.station}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <span
+              className={`rounded px-2 py-0.5 text-[10px] font-bold ${
+                !hasLive
+                  ? "bg-muted text-muted-foreground"
+                  : isAlarm
+                    ? "bg-danger-soft text-danger"
+                    : "bg-success-soft text-success"
+              }`}
+            >
+              {statusText}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onToggleOverlay}
+              className="h-7 px-2.5 text-[10px]"
+            >
+              <Eye className="size-3.5 mr-1" />
+              {showOverlay ? "Bounding Box: ON" : "Bounding Box: OFF"}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onMinimizeToGrid}
+              title="Kembalikan ke tampilan grid 3 kamera"
+              className="h-7 px-2.5 text-[10px]"
+            >
+              <Minimize2 className="size-3.5 mr-1" />
+              Minimize
+            </Button>
+            <button
+              type="button"
+              onClick={onClose}
+              title="Tutup (Esc)"
+              className="inline-flex size-7 items-center justify-center rounded-md border border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground"
+            >
+              <X className="size-4" />
+            </button>
+          </div>
+        </div>
+
+        <div className="relative flex aspect-video w-full items-center justify-center bg-black">
+          {frameUrl ? (
+            <img
+              src={frameUrl}
+              alt={`${camera} maximized live view`}
+              className="size-full object-contain"
+            />
+          ) : (
+            <div className="flex flex-col items-center gap-2 text-center px-6">
+              <Camera className="size-10 text-muted-foreground/60" />
+              <span className="font-mono text-xs text-muted-foreground">
+                {wsConnected
+                  ? `Menunggu frame ${camera}...`
+                  : "Standby — jalankan runner dengan WebSocket aktif (:8765)"}
+              </span>
+            </div>
+          )}
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t bg-card px-4 py-2.5 font-mono text-[11px] text-muted-foreground">
+          <div className="flex flex-wrap items-center gap-3">
+            <span>
+              Object: <strong className="text-foreground">{displayObject}</strong>
+            </span>
+            <span className="text-border">|</span>
+            <span>
+              Conf: <strong className="text-foreground">{displayConf}</strong>
+            </span>
+            <span className="text-border">|</span>
+            <span className="flex items-center gap-1.5 font-bold text-foreground">
+              <span
+                className={`size-2 rounded-full ${
+                  hasLive ? "bg-success animate-pulse" : "bg-muted-foreground/50"
+                }`}
+              />
+              FPS: <strong>{displayFps}</strong>
+            </span>
+            {displaySev && (
+              <span className="rounded border border-danger/30 bg-danger-soft px-1.5 py-0.5 text-[10px] font-bold text-danger">
+                Sev: {displaySev}
+              </span>
+            )}
+          </div>
+          <span className="text-[10px]">640×360 Binary WS • Tekan ESC untuk keluar</span>
+        </div>
+      </div>
     </div>
   );
 }
