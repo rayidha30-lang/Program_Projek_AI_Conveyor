@@ -616,9 +616,9 @@ class CombinedTopInspector:
         # Pre-allocated zero-copy canvas buffer (1000 x 820 px: 520 view + 300 HUD)
         self._screen_buf = np.zeros((820, 1000, 3), dtype=np.uint8)
 
-        # Fase 4: GPU Stage-0 Frame Health + cuFFT Auto-Direction & GPU/ArUco Camera Pose Watchdog
+        # Fase 4: GPU Stage-0 Frame Health + cuFFT Auto-Direction & GPU/ArUco Camera Pose Watchdog (async agar bebas spike)
         self.health_monitor = FrameHealthMonitor(device=device)
-        self.pose_watchdog = CameraPoseWatchdog(device=device)
+        self.pose_watchdog = CameraPoseWatchdog(device=device, async_eval=True)
         if cfg_to_load is not None and isinstance(cfg_to_load, dict):
             cp_init = cfg_to_load.get("calibration_profile", {}) or {}
             self.pose_watchdog.set_aruco_reference(
@@ -1696,6 +1696,11 @@ class CombinedTopInspector:
             self.flush_best_shot_if_needed(force_final=True)
         except Exception:
             pass
+        if hasattr(self, "pose_watchdog") and self.pose_watchdog is not None:
+            try:
+                self.pose_watchdog.close()
+            except Exception:
+                pass
         if hasattr(self, "db_bridge") and self.db_bridge is not None:
             self.db_bridge.close()
 

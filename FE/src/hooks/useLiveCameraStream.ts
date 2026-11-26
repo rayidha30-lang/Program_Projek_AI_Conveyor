@@ -63,11 +63,22 @@ export function useLiveCameraStream(enabled: boolean, port = 8765) {
     "CAM-02": null,
     "CAM-03": null,
   });
+  const pendingRef = useRef<Partial<Record<CameraId, CameraStreamState>>>({});
+  const rafRef = useRef<number | null>(null);
   const showOverlayRef = useRef(showOverlay);
   showOverlayRef.current = showOverlay;
 
   const revokeAllUrls = useCallback(() => {
+    if (rafRef.current !== null && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
     (["CAM-01", "CAM-02", "CAM-03"] as CameraId[]).forEach((camId) => {
+      const pend = pendingRef.current[camId];
+      if (pend?.frameUrl) {
+        URL.revokeObjectURL(pend.frameUrl);
+      }
+      delete pendingRef.current[camId];
       const prev = urlsRef.current[camId];
       if (prev) {
         URL.revokeObjectURL(prev);
@@ -115,21 +126,51 @@ export function useLiveCameraStream(enabled: boolean, port = 8765) {
         if (camId !== "CAM-01" && camId !== "CAM-02" && camId !== "CAM-03") return;
 
         const nextUrl = URL.createObjectURL(blob);
-        const prevUrl = urlsRef.current[camId];
-        urlsRef.current[camId] = nextUrl;
-        if (prevUrl) {
-          URL.revokeObjectURL(prevUrl);
+        const superseded = pendingRef.current[camId];
+        if (superseded?.frameUrl) {
+          URL.revokeObjectURL(superseded.frameUrl);
         }
+        pendingRef.current[camId] = {
+          frameUrl: nextUrl,
+          meta,
+          lastUpdatedAt: Date.now(),
+        };
 
-        const now = Date.now();
-        setStreams((prev) => ({
-          ...prev,
-          [camId]: {
-            frameUrl: nextUrl,
-            meta,
-            lastUpdatedAt: now,
-          },
-        }));
+        if (rafRef.current === null) {
+          const flush = () => {
+            rafRef.current = null;
+            if (disposed) return;
+            const batch = pendingRef.current;
+            const keys = Object.keys(batch) as CameraId[];
+            if (keys.length === 0) return;
+            pendingRef.current = {};
+
+            for (const k of keys) {
+              const entry = batch[k];
+              if (!entry) continue;
+              const prevCommitted = urlsRef.current[k];
+              urlsRef.current[k] = entry.frameUrl;
+              if (prevCommitted && prevCommitted !== entry.frameUrl) {
+                URL.revokeObjectURL(prevCommitted);
+              }
+            }
+
+            setStreams((prev) => {
+              const next = { ...prev };
+              for (const k of keys) {
+                const entry = batch[k];
+                if (entry) next[k] = entry;
+              }
+              return next;
+            });
+          };
+
+          if (typeof requestAnimationFrame === "function") {
+            rafRef.current = requestAnimationFrame(flush);
+          } else {
+            flush();
+          }
+        }
       };
 
       ws.onclose = () => {

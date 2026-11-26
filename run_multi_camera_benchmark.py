@@ -877,6 +877,190 @@ def _handle_isolated_gui_dialog():
             sys.exit(1)
 
 
+def configure_worker_thread_budget(cv2_threads=2, torch_threads=2):
+    """Batasi thread OpenCV & PyTorch per proses agar tidak terjadi oversubscription CPU antar-kamera."""
+    try:
+        import cv2
+        cv2.setNumThreads(max(1, int(cv2_threads)))
+    except Exception:
+        pass
+    try:
+        import torch
+        torch.set_num_threads(max(1, int(torch_threads)))
+    except Exception:
+        pass
+
+
+class _AsyncFramePrefetcher:
+    """
+    Background reader thread untuk overlap CPU video decode (cap.read) dengan GPU inference.
+    - Video file (is_cam=False): bounded FIFO queue (maxsize=2) agar 0 frame terlewat.
+    - Live camera (is_cam=True): single-slot latest-frame overwrite agar latensi minimum.
+    """
+
+    def __init__(self, cap, is_cam=False, maxsize=2):
+        import queue as _q
+        import threading as _th
+
+        self._cap = cap
+        self._is_cam = bool(is_cam)
+        self._stop = _th.Event()
+        self._q = _q.Queue(maxsize=max(1, int(maxsize)))
+        self._latest_lock = _th.Lock()
+        self._latest_ready = _th.Event()
+        self._latest_item = None
+        self._eof = False
+        self._thread = _th.Thread(target=self._loop, daemon=True, name="Thread-AsyncFramePrefetch")
+        self._thread.start()
+
+    def _loop(self):
+        import queue as _q
+
+        while not self._stop.is_set():
+            try:
+                ret, frame = self._cap.read()
+            except Exception:
+                ret, frame = False, None
+
+            if not ret or frame is None:
+                if self._is_cam:
+                    time.sleep(0.005)
+                    continue
+                self._eof = True
+                while not self._stop.is_set():
+                    try:
+                        self._q.put((False, None), timeout=0.05)
+                        break
+                    except _q.Full:
+                        continue
+                break
+
+            if self._is_cam:
+                with self._latest_lock:
+                    self._latest_item = (True, frame)
+                    self._latest_ready.set()
+            else:
+                while not self._stop.is_set():
+                    try:
+                        self._q.put((True, frame), timeout=0.05)
+                        break
+                    except _q.Full:
+                        continue
+
+    def read(self, timeout=1.0):
+        import queue as _q
+
+        if self._is_cam:
+            if not self._latest_ready.wait(timeout=timeout):
+                return False, None
+            with self._latest_lock:
+                item = self._latest_item
+                self._latest_item = None
+                self._latest_ready.clear()
+            return item if item is not None else (False, None)
+        try:
+            return self._q.get(timeout=timeout)
+        except _q.Empty:
+            return False, None
+
+    def stop(self):
+        self._stop.set()
+        self._latest_ready.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+
+class _AsyncTopWSEncoder:
+    """
+    Single-slot async encoder thread untuk CAM-01 WebSocket 360p clean stream.
+    Thread AI cukup menaruh referensi frame & hasil inspeksi (<0.05 ms), sementara
+    resize 360p + overlay + JPEG encode berjalan di background tanpa memblokir AI.
+    """
+
+    def __init__(self, ws_top_queue, ws_clients_val, ws_overlay_val, ws_hud_mode="clean", ws_fps=0.0, jpeg_quality=65):
+        import threading as _th
+
+        self._ws_top_queue = ws_top_queue
+        self._ws_clients_val = ws_clients_val
+        self._ws_overlay_val = ws_overlay_val
+        self._ws_hud_mode = str(ws_hud_mode or "clean").lower()
+        self._ws_interval = (1.0 / float(ws_fps)) if (ws_fps and float(ws_fps) > 0.0) else 0.0
+        self._jpeg_quality = int(max(30, min(95, int(jpeg_quality))))
+        self._lock = _th.Lock()
+        self._event = _th.Event()
+        self._stop = _th.Event()
+        self._pending = None
+        self._last_push = 0.0
+        self._thread = _th.Thread(target=self._loop, daemon=True, name="Thread-TopWSEncoder")
+        self._thread.start()
+
+    def submit(self, frame, inspect_res, avg_fps, slat_no=None, rib_no=None):
+        if self._ws_top_queue is None or self._ws_clients_val is None or self._ws_clients_val.value <= 0:
+            return
+        with self._lock:
+            self._pending = (frame, inspect_res, float(avg_fps), slat_no, rib_no)
+            self._event.set()
+
+    def _loop(self):
+        import cv2
+        from ws_stream_server import build_stream_metadata, render_clean_top_360p
+
+        while not self._stop.is_set():
+            if not self._event.wait(timeout=0.1):
+                continue
+            self._event.clear()
+            if self._stop.is_set():
+                break
+            if self._ws_clients_val is None or self._ws_clients_val.value <= 0:
+                with self._lock:
+                    self._pending = None
+                continue
+
+            now = time.perf_counter()
+            if self._ws_interval > 0.0 and (now - self._last_push) < self._ws_interval:
+                continue
+
+            with self._lock:
+                item = self._pending
+                self._pending = None
+            if item is None:
+                continue
+
+            frame, inspect_res, avg_fps, slat_no, rib_no = item
+            try:
+                show_ov = bool(self._ws_overlay_val.value if self._ws_overlay_val is not None else 1)
+                ws_img = render_clean_top_360p(frame, inspect_res, show_overlay=show_ov)
+                ok_j, jb = cv2.imencode(".jpg", ws_img, [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
+                if not ok_j:
+                    continue
+                self._last_push = time.perf_counter()
+                meta_t = build_stream_metadata(
+                    "CAM-01",
+                    {
+                        "result": inspect_res,
+                        "fps": avg_fps,
+                        "inspector_meta": {
+                            "slat_no": slat_no,
+                            "rib_no": rib_no,
+                        },
+                    },
+                )
+                if self._ws_top_queue.full():
+                    try:
+                        self._ws_top_queue.get_nowait()
+                    except Exception:
+                        pass
+                self._ws_top_queue.put_nowait((meta_t, jb.tobytes()))
+            except Exception:
+                pass
+
+    def stop(self):
+        self._stop.set()
+        self._event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.5)
+
+
 # ======================================================================================
 # WORKER 1: TOP INSPECTION PIPELINE (CAM-03 SLAT & RIB)
 # ======================================================================================
@@ -908,8 +1092,9 @@ def _run_top_worker(
     except Exception:
         pass
 
-    # Konfigurasi Anti-Throttling & Prioritas Realtime Windows
+    # Konfigurasi Anti-Throttling & Prioritas Realtime Windows + Budget Thread CPU
     configure_windows_process_performance()
+    configure_worker_thread_budget(cv2_threads=3, torch_threads=2)
 
     # 1. Pastikan path impor modul top inspector terdaftar di proses anak
     if TOP_SRC_DIR not in sys.path:
@@ -981,6 +1166,15 @@ def _run_top_worker(
 
     last_ws_push = 0.0
     ws_interval = (1.0 / ws_fps) if (ws_fps and ws_fps > 0) else 0.0
+    ws_encoder = None
+    if ws_top_queue is not None and str(ws_hud_mode).lower() != "legacy":
+        ws_encoder = _AsyncTopWSEncoder(
+            ws_top_queue=ws_top_queue,
+            ws_clients_val=ws_clients_val,
+            ws_overlay_val=ws_overlay_val,
+            ws_hud_mode=ws_hud_mode,
+            ws_fps=ws_fps,
+        )
 
     _torch = None
     try:
@@ -991,12 +1185,27 @@ def _run_top_worker(
     except Exception:
         _torch = None
 
+    prefetcher = _AsyncFramePrefetcher(cap, is_cam=is_cam, maxsize=2)
+
+    def _replace_top_capture(new_cap, new_is_cam):
+        nonlocal cap, is_cam, prefetcher, total_frames_top
+        if prefetcher is not None:
+            prefetcher.stop()
+        if cap is not None and cap.isOpened():
+            cap.release()
+        cap = new_cap
+        is_cam = bool(new_is_cam)
+        total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
+        prefetcher = _AsyncFramePrefetcher(cap, is_cam=is_cam, maxsize=2)
+
     print("[*] Worker CAM-01 Top Inspection AKTIF dan mulai memproses...")
 
     try:
         while not stop_event.is_set():
-            ret, frame = cap.read()
+            ret, frame = prefetcher.read(timeout=0.5)
             if not ret or frame is None:
+                if stop_event.is_set():
+                    break
                 # Jika file video habis, putar ulang (looping) dengan re-open agar FFmpeg tidak memory leak
                 if not is_cam:
                     finalize_pending_rib_dataset(dataset_recorder, dataset_previous)
@@ -1005,10 +1214,9 @@ def _run_top_worker(
                     dataset_last_rib_no = 0
                     dataset_previous = None
                     inspector.reset_counters()
-                    cap.release()
-                    cap = cv2.VideoCapture(cap_src)
-                    total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
-                    ret, frame = cap.read()
+                    new_cap = cv2.VideoCapture(cap_src)
+                    _replace_top_capture(new_cap, False)
+                    ret, frame = prefetcher.read(timeout=0.5)
                     if not ret or frame is None:
                         time.sleep(0.02)
                         continue
@@ -1031,10 +1239,11 @@ def _run_top_worker(
             t_prev = t_frame_end
 
             curr_fps = 1.0 / dt if dt > 0 else 30.0
-            fps_history.append(curr_fps)
-            if len(fps_history) > 30:
-                fps_history.pop(0)
-            avg_fps = sum(fps_history) / len(fps_history)
+            if frame_count > 1:
+                fps_history.append(curr_fps)
+                if len(fps_history) > 30:
+                    fps_history.pop(0)
+            avg_fps = (sum(fps_history) / len(fps_history)) if fps_history else curr_fps
 
             # Update Shared Memory
             fps_val.value = avg_fps
@@ -1044,25 +1253,29 @@ def _run_top_worker(
             status_buf.value = curr_stat.encode("utf-8")[:63]
 
             # Push encoded frame ke WebSocket relay HANYA jika ada client browser aktif (Zero-Client Sleep)
-            if ws_top_queue is not None and ws_clients_val is not None and ws_clients_val.value > 0:
+            if ws_encoder is not None:
+                ws_encoder.submit(
+                    frame=frame,
+                    inspect_res=inspect_res,
+                    avg_fps=avg_fps,
+                    slat_no=getattr(inspector.slat_inspector, "slat_count", None),
+                    rib_no=getattr(inspector.rib_inspector, "rib_count", None),
+                )
+            elif ws_top_queue is not None and ws_clients_val is not None and ws_clients_val.value > 0:
                 t_ws_now = time.perf_counter()
                 if ws_interval <= 0.0 or (t_ws_now - last_ws_push) >= ws_interval:
                     last_ws_push = t_ws_now
                     try:
-                        from ws_stream_server import build_stream_metadata, render_clean_top_360p
+                        from ws_stream_server import build_stream_metadata
 
-                        show_ov = bool(ws_overlay_val.value if ws_overlay_val is not None else 1)
-                        if str(ws_hud_mode).lower() == "legacy":
-                            leg_h = inspector.render_combined_dashboard(
-                                frame=frame,
-                                inspect_result=inspect_res,
-                                fps=avg_fps,
-                                frame_idx=frame_count,
-                                total_frames=total_frames_top,
-                            )
-                            ws_img = cv2.resize(leg_h, (640, 524), interpolation=cv2.INTER_AREA)
-                        else:
-                            ws_img = render_clean_top_360p(frame, inspect_res, show_overlay=show_ov)
+                        leg_h = inspector.render_combined_dashboard(
+                            frame=frame,
+                            inspect_result=inspect_res,
+                            fps=avg_fps,
+                            frame_idx=frame_count,
+                            total_frames=total_frames_top,
+                        )
+                        ws_img = cv2.resize(leg_h, (640, 524), interpolation=cv2.INTER_AREA)
                         ok_j, jb = cv2.imencode(".jpg", ws_img, [cv2.IMWRITE_JPEG_QUALITY, 65])
                         if ok_j:
                             meta_t = build_stream_metadata(
@@ -1170,24 +1383,18 @@ def _run_top_worker(
                 elif key in [ord("v"), ord("V")]:
                     new_src = cycle_next_video(cap_src)
                     if new_src and str(new_src) != str(cap_src):
-                        if cap is not None and cap.isOpened():
-                            cap.release()
-                        new_cap, is_cam, cap_src = create_capture(new_src)
+                        new_cap, new_is_cam, cap_src = create_capture(new_src)
                         if new_cap.isOpened():
-                            cap = new_cap
-                            total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
+                            _replace_top_capture(new_cap, new_is_cam)
                             frame_count = 0
                             fps_history.clear()
                             inspector.reset_counters()
                 elif key in [ord("c"), ord("C")]:
                     new_src = cycle_next_camera(cap_src)
                     if new_src and str(new_src) != str(cap_src):
-                        if cap is not None and cap.isOpened():
-                            cap.release()
-                        new_cap, is_cam, cap_src = create_capture(new_src)
+                        new_cap, new_is_cam, cap_src = create_capture(new_src)
                         if new_cap.isOpened():
-                            cap = new_cap
-                            total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
+                            _replace_top_capture(new_cap, new_is_cam)
                             frame_count = 0
                             fps_history.clear()
                             inspector.reset_counters()
@@ -1199,21 +1406,17 @@ def _run_top_worker(
                     )
                     cv2.waitKey(1)
                     if new_src is not None and str(new_src) != str(cap_src):
-                        if cap is not None and cap.isOpened():
-                            cap.release()
-                        new_cap, is_cam, cap_src = create_capture(new_src)
+                        new_cap, new_is_cam, new_cap_src = create_capture(new_src)
                         if new_cap.isOpened():
-                            cap = new_cap
-                            total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
+                            cap_src = new_cap_src
+                            _replace_top_capture(new_cap, new_is_cam)
                             frame_count = 0
                             fps_history.clear()
                             inspector.reset_counters()
                             s_desc = f"Webcam #{cap_src}" if is_cam else os.path.basename(str(cap_src))
                             print(f"[*] [CAM-01 TOP] Sumber input dialihkan ke: {s_desc}")
                         else:
-                            print(f"[!] [CAM-01 TOP] Gagal membuka sumber baru: {new_src}, kembali ke sumber sebelumnya.")
-                            cap, is_cam, cap_src = create_capture(cap_src)
-                            total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
+                            print(f"[!] [CAM-01 TOP] Gagal membuka sumber baru: {new_src}, tetap menggunakan sumber sebelumnya.")
                 elif key in [ord("t"), ord("T"), ord("e"), ord("E")]:
                     if hasattr(inspector, "rib_inspector"):
                         new_eng = inspector.rib_inspector.toggle_tracker_engine()
@@ -1227,12 +1430,9 @@ def _run_top_worker(
                     )
                     cv2.waitKey(1)  # Refresh window focus
                     if new_top and os.path.exists(new_top):
-                        if cap is not None and cap.isOpened():
-                            cap.release()
-                        new_cap, is_cam, cap_src = create_capture(new_top)
+                        new_cap, new_is_cam, cap_src = create_capture(new_top)
                         if new_cap.isOpened():
-                            cap = new_cap
-                            total_frames_top = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_cam else 0
+                            _replace_top_capture(new_cap, new_is_cam)
                             frame_count = 0
                             fps_history.clear()
                             inspector.reset_counters()
@@ -1250,6 +1450,10 @@ def _run_top_worker(
     except KeyboardInterrupt:
         stop_event.set()
     finally:
+        if ws_encoder is not None:
+            ws_encoder.stop()
+        if prefetcher is not None:
+            prefetcher.stop()
         finalize_pending_rib_dataset(dataset_recorder, dataset_previous)
         if dataset_recorder is not None:
             dataset_recorder.close()
@@ -1286,8 +1490,9 @@ def _run_side_worker(
     except Exception:
         pass
 
-    # Konfigurasi Anti-Throttling & Prioritas Realtime Windows
+    # Konfigurasi Anti-Throttling & Prioritas Realtime Windows + Budget Thread CPU
     configure_windows_process_performance()
+    configure_worker_thread_budget(cv2_threads=3, torch_threads=2)
 
     # 1. Pastikan path impor modul side inspector dan Database terdaftar di proses anak
     if SIDE_SRC_DIR not in sys.path:
@@ -2788,6 +2993,7 @@ def _run_hybrid_engine(args):
         InspectionDBBridge = None
 
     configure_windows_process_performance()
+    configure_worker_thread_budget(cv2_threads=2, torch_threads=2)
     try:
         import torch
         if torch.cuda.is_available():
@@ -2921,6 +3127,8 @@ def _run_hybrid_engine(args):
         cuda_streams = [None for _ in side_workers]
 
     gui_interval = (1.0 / args.gui_fps) if (args.gui_fps and args.gui_fps > 0) else 0.0
+    side_max_fps = float(getattr(args, "side_max_fps", 0.0) or 0.0)
+    side_interval = (1.0 / side_max_fps) if side_max_fps > 0.0 else 0.0
 
     def _side_thread(idx, w):
         cap = w["cap"]
@@ -2935,6 +3143,7 @@ def _run_hybrid_engine(args):
         last_disp = 0.0
 
         while not stop_event.is_set():
+            t_loop0 = time.perf_counter()
             try:
                 if cap is None or not cap.isOpened():
                     time.sleep(0.02)
@@ -3005,6 +3214,11 @@ def _run_hybrid_engine(args):
                         },
                         legacy_frame=disp if ws_legacy else None,
                     )
+
+                if side_interval > 0.0:
+                    rem = side_interval - (time.perf_counter() - t_loop0)
+                    if rem > 0.001:
+                        time.sleep(rem)
             except Exception as e_sw:
                 print(f"[WARN Hybrid-{cam_id}] {e_sw}")
                 time.sleep(0.01)
@@ -3249,6 +3463,10 @@ Shortcut Keyboard Saat Berjalan:
         env_ws_fps = float(os.environ.get("WS_MAX_FPS", "0"))
     except ValueError:
         env_ws_fps = 0.0
+    try:
+        env_side_max_fps = float(os.environ.get("SIDE_MAX_FPS", "0"))
+    except ValueError:
+        env_side_max_fps = 0.0
     env_ws_hud_mode = os.environ.get("WS_HUD_MODE", "clean").strip().lower()
     if env_ws_hud_mode not in ("clean", "legacy"):
         env_ws_hud_mode = "clean"
@@ -3391,6 +3609,12 @@ Shortcut Keyboard Saat Berjalan:
         help=f"Batas maksimal FPS stream WebSocket per kamera (0 = uncapped, default: {env_ws_fps})."
     )
     parser.add_argument(
+        "--side-max-fps",
+        type=float,
+        default=env_side_max_fps,
+        help=f"Batas maksimal FPS pemrosesan kamera samping CAM-02/03 agar CPU stabil untuk CAM-01 (0 = uncapped, default: {env_side_max_fps})."
+    )
+    parser.add_argument(
         "--ws-hud-mode",
         choices=["clean", "legacy"],
         default=env_ws_hud_mode,
@@ -3402,17 +3626,23 @@ Shortcut Keyboard Saat Berjalan:
 def resolve_mode_defaults(args, argv=None):
     """
     Menyesuaikan default otomatis untuk mode khusus:
-    - Mode 'web' otomatis mengaktifkan ws_stream=True dan memilih engine 'hybrid'
-      (CAM-01 terisolasi bebas GIL) kecuali user secara eksplisit menentukan --engine di CLI.
+    - Mode 'web' otomatis mengaktifkan ws_stream=True, engine 'hybrid' (CAM-01 bebas GIL),
+      serta pacing seimbang ws_fps=20 & side_max_fps=30 kecuali user menentukan flag CLI secara eksplisit.
     - Mode 'opencv' menonaktifkan WebSocket (ws_stream=False) agar murni menampilkan HUD OpenCV desktop.
     """
     raw_argv = list(argv) if argv is not None else []
     explicit_engine = any(a == "--engine" or a.startswith("--engine=") for a in raw_argv)
+    explicit_ws_fps = any(a == "--ws-fps" or a.startswith("--ws-fps=") for a in raw_argv)
+    explicit_side_fps = any(a == "--side-max-fps" or a.startswith("--side-max-fps=") for a in raw_argv)
     cur_mode = str(getattr(args, "mode", "")).lower()
     if cur_mode == "web":
         args.ws_stream = True
         if not explicit_engine:
             args.engine = "hybrid"
+        if not explicit_ws_fps and float(getattr(args, "ws_fps", 0.0) or 0.0) <= 0.0:
+            args.ws_fps = 20.0
+        if not explicit_side_fps and float(getattr(args, "side_max_fps", 0.0) or 0.0) <= 0.0:
+            args.side_max_fps = 30.0
     elif cur_mode == "opencv":
         args.ws_stream = False
     return args

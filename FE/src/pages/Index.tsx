@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQueryState, parseAsString, parseAsStringLiteral } from "nuqs";
 import {
@@ -257,9 +257,9 @@ export default function Index() {
     "CAM-03": false,
   });
 
-  const toggleMinimizeCam = (cam: CameraId) => {
+  const toggleMinimizeCam = useCallback((cam: CameraId) => {
     setMinimizedCams((prev) => ({ ...prev, [cam]: !prev[cam] }));
-  };
+  }, []);
 
   useEffect(() => {
     if (!maximizedCam) return;
@@ -1252,7 +1252,7 @@ function CameraWindowButtons({
   );
 }
 
-function CameraFeed({
+const CameraFeed = React.memo(function CameraFeed({
   camera,
   area,
   object,
@@ -1386,9 +1386,9 @@ function CameraFeed({
       </div>
     </div>
   );
-}
+});
 
-function LiveCamera({
+const LiveCamera = React.memo(function LiveCamera({
   streams,
   wsConnected,
   minimizedCams,
@@ -1509,7 +1509,7 @@ function LiveCamera({
       })}
     </div>
   );
-}
+});
 
 function CameraSpotlightModal({
   camera,

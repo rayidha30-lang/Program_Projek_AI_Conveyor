@@ -15,6 +15,7 @@ Priority 2: Markerless Stationary 4-Quadrant Side-Rail Structural Edge Registrat
 from __future__ import annotations
 
 import math
+import threading
 from typing import Any
 
 import cv2
@@ -90,12 +91,20 @@ class CameraPoseWatchdog:
         red_tilt_deg: float = 3.0,
         red_width_ratio: float = 0.12,
         min_ncc_conf: float = 0.34,
+        async_eval: bool = False,
     ):
         use_cuda = False
         if _HAS_TORCH and str(device or "auto").lower() != "cpu" and torch.cuda.is_available():
             use_cuda = True
         self.use_cuda = use_cuda
         self.torch_device = torch.device("cuda:0") if use_cuda else None
+        self.async_eval = bool(async_eval)
+        self._state_lock = threading.Lock()
+        self._ring_lock = threading.Lock()
+        self._generation = 0
+        self._eval_running = False
+        self._eval_thread: threading.Thread | None = None
+        self._closed = False
 
         self.sample_every = max(1, int(sample_every))
         self.eval_every = max(5, int(eval_every))
@@ -140,66 +149,84 @@ class CameraPoseWatchdog:
 
     def reset_reference(self) -> None:
         """Reset locked session baseline pose and corrective homography (e.g. after [K] recalibration)."""
-        self._frame_counter = 0
-        self._ring_write_idx = 0
-        self._ring_count = 0
-        self._ref_quad_fft = None
-        self._ref_quad_norms = None
-        self._session_aruco_ref: dict[int, list[float]] | None = (
-            dict(self.configured_aruco_ref) if len(self.configured_aruco_ref) >= 2 else None
-        )
-        self._session_aruco_size: tuple[int, int] = self.configured_aruco_size
-        self._amber_streak = 0
-        self._red_streak = 0
-        self.corrective_matrix: np.ndarray | None = None
-        self._corrective_size: tuple[int, int] | None = None
-        self.last_status: dict[str, Any] = {
-            "zone": "STANDBY",
-            "mode": "STANDBY",
-            "is_invalid": False,
-            "invalid_code": None,
-            "invalid_reason": "",
-            "dx_px_720": 0.0,
-            "dy_px_720": 0.0,
-            "d_theta_deg": 0.0,
-            "width_ratio_delta": 0.0,
-            "has_correction": False,
-        }
+        with self._state_lock:
+            self._generation += 1
+            self._frame_counter = 0
+            with self._ring_lock:
+                self._ring_write_idx = 0
+                self._ring_count = 0
+            self._ref_quad_fft = None
+            self._ref_quad_norms = None
+            self._session_aruco_ref: dict[int, list[float]] | None = (
+                dict(self.configured_aruco_ref) if len(self.configured_aruco_ref) >= 2 else None
+            )
+            self._session_aruco_size: tuple[int, int] = self.configured_aruco_size
+            self._amber_streak = 0
+            self._red_streak = 0
+            self.corrective_matrix: np.ndarray | None = None
+            self._corrective_size: tuple[int, int] | None = None
+            self.last_status: dict[str, Any] = {
+                "zone": "STANDBY",
+                "mode": "STANDBY",
+                "is_invalid": False,
+                "invalid_code": None,
+                "invalid_reason": "",
+                "dx_px_720": 0.0,
+                "dy_px_720": 0.0,
+                "d_theta_deg": 0.0,
+                "width_ratio_delta": 0.0,
+                "has_correction": False,
+            }
+
+    def wait_pending_eval(self, timeout: float = 2.0) -> None:
+        """Wait for an in-flight asynchronous pose evaluation thread if active."""
+        th = self._eval_thread
+        if th is not None and th.is_alive():
+            th.join(timeout=timeout)
+
+    def close(self) -> None:
+        """Stop accepting new async evaluations and wait briefly for any running check."""
+        self._closed = True
+        self.wait_pending_eval(timeout=1.0)
 
     def get_scaled_corrective_matrix(self, w_f: int, h_f: int) -> np.ndarray | None:
         """Return 3x3 corrective matrix scaled to (w_f, h_f) when MICRO_DRIFT compensation is active."""
-        if self.corrective_matrix is None or self._corrective_size is None:
+        with self._state_lock:
+            cmat = self.corrective_matrix
+            csize = self._corrective_size
+        if cmat is None or csize is None:
             return None
-        cw, ch = self._corrective_size
+        cw, ch = csize
         if int(w_f) == int(cw) and int(h_f) == int(ch):
-            return self.corrective_matrix
+            return cmat
         sx = float(w_f) / float(max(1, cw))
         sy = float(h_f) / float(max(1, ch))
         S = np.diag([sx, sy, 1.0])
         S_inv = np.diag([1.0 / sx, 1.0 / sy, 1.0])
-        return (S @ self.corrective_matrix.astype(np.float64) @ S_inv).astype(np.float32)
+        return (S @ cmat.astype(np.float64) @ S_inv).astype(np.float32)
 
     def _push_ring_sample(self, frame_bgr: np.ndarray, gpu_thumb=None) -> None:
-        slot = self._ring_write_idx % self.RING_SIZE
-        if self.use_cuda:
-            with torch.inference_mode():
-                if gpu_thumb is not None and getattr(gpu_thumb, "is_cuda", False):
-                    luma = 0.114 * gpu_thumb[0, 0] + 0.587 * gpu_thumb[0, 1] + 0.299 * gpu_thumb[0, 2]
-                else:
-                    h_f, w_f = frame_bgr.shape[:2]
-                    sy = max(1, h_f // 360)
-                    sx = max(1, w_f // 640)
-                    sub = np.ascontiguousarray(frame_bgr[::sy, ::sx])
-                    t = torch.from_numpy(sub).to(self.torch_device, non_blocking=True).permute(2, 0, 1).unsqueeze(0).float()
-                    th = F.interpolate(t, size=(self.THUMB_H, self.THUMB_W), mode="bilinear", align_corners=False)
-                    luma = 0.114 * th[0, 0] + 0.587 * th[0, 1] + 0.299 * th[0, 2]
-                self._ring_gpu[slot].copy_(luma)
-        else:
-            small = cv2.resize(frame_bgr, (self.THUMB_W, self.THUMB_H), interpolation=cv2.INTER_AREA)
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            self._ring_cpu[slot] = gray
-        self._ring_write_idx += 1
-        self._ring_count = min(self.RING_SIZE, self._ring_count + 1)
+        with self._ring_lock:
+            slot = self._ring_write_idx % self.RING_SIZE
+            if self.use_cuda:
+                with torch.inference_mode():
+                    if gpu_thumb is not None and getattr(gpu_thumb, "is_cuda", False):
+                        luma = 0.114 * gpu_thumb[0, 0] + 0.587 * gpu_thumb[0, 1] + 0.299 * gpu_thumb[0, 2]
+                    else:
+                        h_f, w_f = frame_bgr.shape[:2]
+                        sy = max(1, h_f // 360)
+                        sx = max(1, w_f // 640)
+                        sub = np.ascontiguousarray(frame_bgr[::sy, ::sx])
+                        t = torch.from_numpy(sub).to(self.torch_device, non_blocking=True).permute(2, 0, 1).unsqueeze(0).float()
+                        th = F.interpolate(t, size=(self.THUMB_H, self.THUMB_W), mode="bilinear", align_corners=False)
+                        luma = 0.114 * th[0, 0] + 0.587 * th[0, 1] + 0.299 * th[0, 2]
+                    self._ring_gpu[slot].copy_(luma)
+            else:
+                small = cv2.resize(frame_bgr, (self.THUMB_W, self.THUMB_H), interpolation=cv2.INTER_AREA)
+                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                self._ring_cpu[slot] = gray
+            self._ring_write_idx += 1
+            self._ring_count = min(self.RING_SIZE, self._ring_count + 1)
 
     @staticmethod
     def _subpixel_parabola(vm1: float, v0: float, vp1: float) -> float:
@@ -389,20 +416,51 @@ class CameraPoseWatchdog:
         if not force_eval and (self._frame_counter % self.eval_every) != 0:
             return self.last_status
 
+        if self.async_eval and not force_eval:
+            with self._state_lock:
+                if self._eval_running or self._closed:
+                    return self.last_status
+                self._eval_running = True
+                gen = self._generation
+            frame_snap = frame_bgr.copy()
+
+            def _bg_worker():
+                try:
+                    self._evaluate_pose_core(frame_snap, h_f, w_f, expected_gen=gen)
+                except Exception:
+                    pass
+                finally:
+                    with self._state_lock:
+                        self._eval_running = False
+
+            th = threading.Thread(target=_bg_worker, daemon=True, name="Thread-PoseWatchdog")
+            self._eval_thread = th
+            th.start()
+            return self.last_status
+
+        return self._evaluate_pose_core(frame_bgr, h_f, w_f, expected_gen=self._generation)
+
+    def _evaluate_pose_core(self, frame_bgr: np.ndarray, h_f: int, w_f: int, expected_gen: int) -> dict[str, Any]:
         # Priority 1: ArUco Fiducial Landmarks (when markers exist in frame or config)
         markers = detect_aruco_landmarks(frame_bgr)
+        with self._state_lock:
+            if expected_gen != self._generation:
+                return self.last_status
         if len(markers) >= 2:
             if self._session_aruco_ref is None:
-                self._session_aruco_ref = dict(markers)
-                self._session_aruco_size = (w_f, h_f)
-                self.last_status = {
-                    **self.last_status,
-                    "zone": "STABLE",
-                    "mode": "ARUCO_FIDUCIAL",
-                    "is_invalid": False,
-                    "invalid_code": None,
-                    "invalid_reason": "",
-                }
+                with self._state_lock:
+                    if expected_gen != self._generation:
+                        return self.last_status
+                    self._session_aruco_ref = dict(markers)
+                    self._session_aruco_size = (w_f, h_f)
+                    self.last_status = {
+                        **self.last_status,
+                        "zone": "STABLE",
+                        "mode": "ARUCO_FIDUCIAL",
+                        "is_invalid": False,
+                        "invalid_code": None,
+                        "invalid_reason": "",
+                    }
                 return self.last_status
 
             ref_w, ref_h = self._session_aruco_size
@@ -437,36 +495,43 @@ class CameraPoseWatchdog:
                     if M_aff is not None:
                         cand_H = np.eye(3, dtype=np.float32)
                         cand_H[:2, :] = M_aff.astype(np.float32)
-                return self._apply_3zone_policy(
-                    mode="ARUCO_FIDUCIAL",
-                    dx_720=dx_720,
-                    dy_720=dy_720,
-                    d_theta_deg=d_theta,
-                    width_ratio_delta=w_delta,
-                    cand_H_full=cand_H,
-                    w_f=w_f,
-                    h_f=h_f,
-                    immediate_red=True,
-                )
+                with self._state_lock:
+                    if expected_gen != self._generation:
+                        return self.last_status
+                    return self._apply_3zone_policy(
+                        mode="ARUCO_FIDUCIAL",
+                        dx_720=dx_720,
+                        dy_720=dy_720,
+                        d_theta_deg=d_theta,
+                        width_ratio_delta=w_delta,
+                        cand_H_full=cand_H,
+                        w_f=w_f,
+                        h_f=h_f,
+                        immediate_red=True,
+                    )
 
         # Priority 2: GPU VRAM 4-Quadrant Structural-Edge Registration
         mode_name = "GPU_RAIL_TRAPEZOID" if self.use_cuda else "CPU_RAIL_TRAPEZOID"
-        quad_pack = self._extract_quad_fft_and_norms()
+        with self._ring_lock:
+            quad_pack = self._extract_quad_fft_and_norms()
         if quad_pack is None:
             return self.last_status
 
         q_fft, q_norms = quad_pack
         if self._ref_quad_fft is None:
-            self._ref_quad_fft = q_fft
-            self._ref_quad_norms = q_norms
-            self.last_status = {
-                **self.last_status,
-                "zone": "STABLE",
-                "mode": mode_name,
-                "is_invalid": False,
-                "invalid_code": None,
-                "invalid_reason": "",
-            }
+            with self._state_lock:
+                if expected_gen != self._generation:
+                    return self.last_status
+                self._ref_quad_fft = q_fft
+                self._ref_quad_norms = q_norms
+                self.last_status = {
+                    **self.last_status,
+                    "zone": "STABLE",
+                    "mode": mode_name,
+                    "is_invalid": False,
+                    "invalid_code": None,
+                    "invalid_reason": "",
+                }
             return self.last_status
 
         matches = self._match_quadrants_to_reference(q_fft, q_norms)
@@ -517,14 +582,17 @@ class CameraPoseWatchdog:
         cand_H = np.eye(3, dtype=np.float32)
         cand_H[:2, :] = M_sim.astype(np.float32)
 
-        return self._apply_3zone_policy(
-            mode=mode_name,
-            dx_720=dx_720,
-            dy_720=dy_720,
-            d_theta_deg=d_theta,
-            width_ratio_delta=w_delta,
-            cand_H_full=cand_H,
-            w_f=w_f,
-            h_f=h_f,
-            immediate_red=False,
-        )
+        with self._state_lock:
+            if expected_gen != self._generation:
+                return self.last_status
+            return self._apply_3zone_policy(
+                mode=mode_name,
+                dx_720=dx_720,
+                dy_720=dy_720,
+                d_theta_deg=d_theta,
+                width_ratio_delta=w_delta,
+                cand_H_full=cand_H,
+                w_f=w_f,
+                h_f=h_f,
+                immediate_red=False,
+            )
