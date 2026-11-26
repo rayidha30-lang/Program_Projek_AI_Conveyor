@@ -27,6 +27,7 @@ import {
   LayoutDashboard,
   LogOut,
   Maximize2,
+  Menu,
   Minimize2,
   Minus,
   Moon,
@@ -227,8 +228,10 @@ export default function Index() {
 
   // Jika parameter trace atau cam terdeteksi di URL, utamakan tampilan evidence
   const view: View = (traceId || camId) ? "evidence" : viewQuery;
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const setView = (newView: View) => {
     setViewQuery(newView);
+    setMobileMenuOpen(false);
     if (newView !== "evidence") {
       setTraceId(null);
       setCamId(null);
@@ -236,6 +239,21 @@ export default function Index() {
   };
 
   const [isCollapsed, setIsCollapsed] = useState(false);
+
+  useEffect(() => {
+    const onResize = () => {
+      if (window.innerWidth >= 1024) setMobileMenuOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMobileMenuOpen(false);
+    };
+    window.addEventListener("resize", onResize);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
   const [apiStatus, setApiStatus] = useState<{ status: string; database: string }>({
     status: "checking",
     database: "checking",
@@ -360,17 +378,19 @@ export default function Index() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-background text-foreground lg:h-screen lg:overflow-hidden transition-colors duration-300">
+    <div className="min-h-screen overflow-x-hidden bg-background text-foreground lg:h-screen lg:overflow-hidden transition-colors duration-300">
       <Sidebar
         view={view}
         setView={setView}
         isCollapsed={isCollapsed}
         setIsCollapsed={setIsCollapsed}
+        mobileOpen={mobileMenuOpen}
+        onCloseMobile={() => setMobileMenuOpen(false)}
         theme={theme}
         onToggleTheme={toggleTheme}
       />
       <div
-        className={`transition-all duration-300 ease-in-out lg:flex lg:h-screen lg:flex-col ${
+        className={`min-w-0 transition-all duration-300 ease-in-out flex min-h-screen flex-col lg:h-screen ${
           isCollapsed ? "lg:ml-24" : "lg:ml-72"
         }`}
       >
@@ -380,9 +400,10 @@ export default function Index() {
           wsConnected={wsConnected}
           theme={theme}
           onToggleTheme={toggleTheme}
+          onOpenMobileMenu={() => setMobileMenuOpen(true)}
           contextActions={
             view === "live" ? (
-              <div className="hidden md:flex items-center gap-1.5">
+              <div className="flex items-center gap-1.5 flex-wrap">
                 <button
                   type="button"
                   onClick={toggleOverlay}
@@ -394,10 +415,12 @@ export default function Index() {
                     online={showOverlay}
                   />
                 </button>
-                <StatusPill
-                  text={wsConnected ? "WS Stream: Live" : "WS Stream: Standby"}
-                  online={wsConnected}
-                />
+                <span className="hidden sm:inline-flex">
+                  <StatusPill
+                    text={wsConnected ? "WS Stream: Live" : "WS Stream: Standby"}
+                    online={wsConnected}
+                  />
+                </span>
               </div>
             ) : view === "evidence" ? (
               <div className="flex items-center gap-1.5">
@@ -496,6 +519,8 @@ function Sidebar({
   setView,
   isCollapsed,
   setIsCollapsed,
+  mobileOpen,
+  onCloseMobile,
   theme,
   onToggleTheme,
 }: {
@@ -503,6 +528,8 @@ function Sidebar({
   setView: (view: View) => void;
   isCollapsed: boolean;
   setIsCollapsed: React.Dispatch<React.SetStateAction<boolean>>;
+  mobileOpen: boolean;
+  onCloseMobile: () => void;
   theme: "light" | "dark";
   onToggleTheme?: () => void;
 }) {
@@ -521,155 +548,174 @@ function Sidebar({
   };
 
   const isDark = theme === "dark";
+  // Di drawer mobile/tablet (< lg), tampilkan selalu expanded agar label mudah dibaca
+  const compactMode = isCollapsed && !mobileOpen;
 
   return (
-    <aside
-      className={`fixed inset-y-3 left-3 z-30 flex flex-col justify-between rounded-3xl transition-all duration-300 ease-in-out ${
-        isDark
-          ? "sidebar-gradient-emerald border border-emerald-400/40 text-white shadow-2xl shadow-emerald-950/60"
-          : "bg-linear-to-b from-[#7645f7] via-[#6a37eb] to-[#5a24e2] border border-white/20 text-white shadow-2xl shadow-purple-900/30"
-      } ${isCollapsed ? "w-20 py-5 px-2 items-center" : "w-64 py-5 px-4"}`}
-    >
-      <div>
-        {isCollapsed ? (
-          <div className="flex flex-col items-center gap-3">
-            {/* Logo Cloud / Vision icon */}
-            <button
-              onClick={() => setIsCollapsed(false)}
-              className={`flex size-11 items-center justify-center rounded-2xl shadow-sm transition-all cursor-pointer ${
-                isDark
-                  ? "bg-black/25 text-slate-950 border border-black/15 hover:bg-black/35"
-                  : "bg-white/20 text-white hover:bg-white/30"
-              }`}
-              title="Perbesar Side Bar"
-            >
-              <Cpu className={`size-6 ${isDark ? "text-slate-950" : "text-white"}`} />
-            </button>
-            <button
-              onClick={() => setIsCollapsed(false)}
-              className={`flex size-7 items-center justify-center rounded-lg transition-colors cursor-pointer ${
-                isDark
-                  ? "bg-black/15 text-slate-950 hover:bg-black/25"
-                  : "bg-white/10 text-white/80 hover:bg-white/25 hover:text-white"
-              }`}
-              title="Perbesar Side Bar"
-            >
-              <ChevronRight className="size-4" />
-            </button>
-          </div>
-        ) : (
-          <div className="mb-6 flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div
-                className={`flex size-10 items-center justify-center rounded-2xl shadow-sm ${
-                  isDark
-                    ? "bg-black/20 text-slate-950 border border-black/15"
-                    : "bg-white/20 text-white"
-                }`}
-              >
-                <Cpu className={`size-5 ${isDark ? "text-slate-950" : "text-white"}`} />
-              </div>
-              <div className="overflow-hidden">
-                <p
-                  className={`text-xs leading-tight truncate ${
-                    isDark ? "font-black text-slate-950" : "font-extrabold text-white"
-                  }`}
-                >
-                  Die Cast Machine #2
-                </p>
-                <p
-                  className={`mt-0.5 text-[8.5px] tracking-wider truncate ${
-                    isDark
-                      ? "font-black text-emerald-950/90"
-                      : "font-bold text-purple-200"
-                  }`}
-                >
-                  SLAT RIB VISION SYSTEM
-                </p>
-              </div>
-            </div>
-            <button
-              onClick={() => setIsCollapsed(true)}
-              className={`flex size-8 shrink-0 items-center justify-center rounded-lg transition-colors cursor-pointer ${
-                isDark
-                  ? "bg-black/15 text-slate-950 hover:bg-black/25"
-                  : "bg-white/10 text-white/80 hover:bg-white/20 hover:text-white"
-              }`}
-              title="Perkecil Side Bar"
-            >
-              <ChevronLeft className="size-4" />
-            </button>
-          </div>
-        )}
-
-        {/* Navigation Items */}
-        <nav
-          className={`mt-4 flex ${
-            isCollapsed
-              ? "flex-col items-center gap-2.5"
-              : "flex-col space-y-1.5"
-          }`}
-          aria-label="Main navigation"
-        >
-          {nav.map((item, idx) => {
-            const Icon = item.icon;
-            const active = view === item.id;
-
-            // Di tema gelap (gradient hijau):
-            // - Bagian atas (idx < 2): berlatar neon hijau -> teks gelap
-            // - Bagian bawah (idx >= 2): berlatar teal/charcoal -> teks terang / neon pill
-            const isUpper = idx < 2;
-
-            let activeClass = "";
-            let inactiveClass = "";
-
-            if (isDark) {
-              activeClass = isUpper
-                ? "bg-black/30 text-slate-950 font-black shadow-md ring-1 ring-black/20"
-                : "bg-[#00E599] text-slate-950 font-black shadow-lg shadow-emerald-500/35 ring-1 ring-emerald-300";
-              inactiveClass = isUpper
-                ? "text-slate-950 font-bold hover:bg-black/15 hover:text-black"
-                : "text-slate-100 font-semibold hover:bg-white/15 hover:text-white";
-            } else {
-              // Tema terang: ungu klasik seperti sebelumnya
-              activeClass = isCollapsed
-                ? "bg-black/25 text-white font-bold shadow-inner ring-1 ring-white/30"
-                : "bg-black/20 text-white font-bold shadow-inner ring-1 ring-white/30";
-              inactiveClass = "text-white/80 font-bold hover:bg-white/15 hover:text-white";
-            }
-
-            return (
+    <>
+      {mobileOpen && (
+        <div
+          className="fixed inset-0 z-40 bg-black/50 backdrop-blur-xs lg:hidden"
+          onClick={onCloseMobile}
+          aria-hidden="true"
+        />
+      )}
+      <aside
+        className={`fixed inset-y-3 left-3 z-50 lg:z-30 flex flex-col justify-between overflow-y-auto rounded-3xl transition-all duration-300 ease-in-out ${
+          mobileOpen ? "translate-x-0" : "-translate-x-[calc(100%+1.5rem)] lg:translate-x-0"
+        } ${
+          isDark
+            ? "sidebar-gradient-emerald border border-emerald-400/40 text-white shadow-2xl shadow-emerald-950/60"
+            : "bg-linear-to-b from-[#7645f7] via-[#6a37eb] to-[#5a24e2] border border-white/20 text-white shadow-2xl shadow-purple-900/30"
+        } ${compactMode ? "w-20 py-5 px-2 items-center" : "w-64 py-5 px-4"}`}
+      >
+        <div>
+          {compactMode ? (
+            <div className="flex flex-col items-center gap-3">
+              {/* Logo Cloud / Vision icon */}
               <button
-                key={item.id}
-                onClick={() => setView(item.id)}
-                title={item.label}
-                className={`group relative flex items-center transition-all duration-200 cursor-pointer ${
-                  isCollapsed
-                    ? `size-11 justify-center rounded-2xl ${
-                        active ? activeClass : inactiveClass
-                      }`
-                    : `h-11 w-full gap-3 rounded-xl px-3.5 text-xs ${
-                        active ? activeClass : inactiveClass
-                      }`
+                onClick={() => setIsCollapsed(false)}
+                className={`flex size-11 items-center justify-center rounded-2xl shadow-sm transition-all cursor-pointer ${
+                  isDark
+                    ? "bg-black/25 text-slate-950 border border-black/15 hover:bg-black/35"
+                    : "bg-white/20 text-white hover:bg-white/30"
                 }`}
+                title="Perbesar Side Bar"
               >
-                <Icon
-                  className={`${isCollapsed ? "size-5" : "size-4.5"} shrink-0`}
-                />
-                {!isCollapsed && <span className="truncate">{item.label}</span>}
-                {isCollapsed && (
-                  <span className="pointer-events-none absolute left-full ml-3 z-50 whitespace-nowrap rounded-lg bg-gray-900/95 backdrop-blur-sm px-2.5 py-1 text-[11px] font-semibold text-white opacity-0 shadow-xl transition-opacity group-hover:opacity-100">
-                    {item.label}
-                  </span>
-                )}
+                <Cpu className={`size-6 ${isDark ? "text-slate-950" : "text-white"}`} />
               </button>
-            );
-          })}
-        </nav>
-      </div>
+              <button
+                onClick={() => setIsCollapsed(false)}
+                className={`flex size-7 items-center justify-center rounded-lg transition-colors cursor-pointer ${
+                  isDark
+                    ? "bg-black/15 text-slate-950 hover:bg-black/25"
+                    : "bg-white/10 text-white/80 hover:bg-white/25 hover:text-white"
+                }`}
+                title="Perbesar Side Bar"
+              >
+                <ChevronRight className="size-4" />
+              </button>
+            </div>
+          ) : (
+            <div className="mb-6 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-3 min-w-0">
+                <div
+                  className={`flex size-10 shrink-0 items-center justify-center rounded-2xl shadow-sm ${
+                    isDark
+                      ? "bg-black/20 text-slate-950 border border-black/15"
+                      : "bg-white/20 text-white"
+                  }`}
+                >
+                  <Cpu className={`size-5 ${isDark ? "text-slate-950" : "text-white"}`} />
+                </div>
+                <div className="overflow-hidden">
+                  <p
+                    className={`text-xs leading-tight truncate ${
+                      isDark ? "font-black text-slate-950" : "font-extrabold text-white"
+                    }`}
+                  >
+                    Die Cast Machine #2
+                  </p>
+                  <p
+                    className={`mt-0.5 text-[8.5px] tracking-wider truncate ${
+                      isDark
+                        ? "font-black text-emerald-950/90"
+                        : "font-bold text-purple-200"
+                    }`}
+                  >
+                    SLAT RIB VISION SYSTEM
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsCollapsed(true)}
+                className={`hidden lg:flex size-8 shrink-0 items-center justify-center rounded-lg transition-colors cursor-pointer ${
+                  isDark
+                    ? "bg-black/15 text-slate-950 hover:bg-black/25"
+                    : "bg-white/10 text-white/80 hover:bg-white/20 hover:text-white"
+                }`}
+                title="Perkecil Side Bar"
+              >
+                <ChevronLeft className="size-4" />
+              </button>
+              <button
+                type="button"
+                onClick={onCloseMobile}
+                className={`flex lg:hidden size-8 shrink-0 items-center justify-center rounded-lg transition-colors cursor-pointer ${
+                  isDark
+                    ? "bg-black/15 text-slate-950 hover:bg-black/25"
+                    : "bg-white/10 text-white/80 hover:bg-white/20 hover:text-white"
+                }`}
+                title="Tutup Menu"
+              >
+                <X className="size-4" />
+              </button>
+            </div>
+          )}
 
-      {/* Bottom Footer Section */}
-      {isCollapsed ? (
+          {/* Navigation Items */}
+          <nav
+            className={`mt-4 flex ${
+              compactMode
+                ? "flex-col items-center gap-2.5"
+                : "flex-col space-y-1.5"
+            }`}
+            aria-label="Main navigation"
+          >
+            {nav.map((item, idx) => {
+              const Icon = item.icon;
+              const active = view === item.id;
+              const isUpper = idx < 2;
+
+              let activeClass = "";
+              let inactiveClass = "";
+
+              if (isDark) {
+                activeClass = isUpper
+                  ? "bg-black/30 text-slate-950 font-black shadow-md ring-1 ring-black/20"
+                  : "bg-[#00E599] text-slate-950 font-black shadow-lg shadow-emerald-500/35 ring-1 ring-emerald-300";
+                inactiveClass = isUpper
+                  ? "text-slate-950 font-bold hover:bg-black/15 hover:text-black"
+                  : "text-slate-100 font-semibold hover:bg-white/15 hover:text-white";
+              } else {
+                activeClass = compactMode
+                  ? "bg-black/25 text-white font-bold shadow-inner ring-1 ring-white/30"
+                  : "bg-black/20 text-white font-bold shadow-inner ring-1 ring-white/30";
+                inactiveClass = "text-white/80 font-bold hover:bg-white/15 hover:text-white";
+              }
+
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => setView(item.id)}
+                  title={item.label}
+                  className={`group relative flex items-center transition-all duration-200 cursor-pointer ${
+                    compactMode
+                      ? `size-11 justify-center rounded-2xl ${
+                          active ? activeClass : inactiveClass
+                        }`
+                      : `h-11 w-full gap-3 rounded-xl px-3.5 text-xs ${
+                          active ? activeClass : inactiveClass
+                        }`
+                  }`}
+                >
+                  <Icon
+                    className={`${compactMode ? "size-5" : "size-4.5"} shrink-0`}
+                  />
+                  {!compactMode && <span className="truncate">{item.label}</span>}
+                  {compactMode && (
+                    <span className="pointer-events-none absolute left-full ml-3 z-50 whitespace-nowrap rounded-lg bg-gray-900/95 backdrop-blur-sm px-2.5 py-1 text-[11px] font-semibold text-white opacity-0 shadow-xl transition-opacity group-hover:opacity-100">
+                      {item.label}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </nav>
+        </div>
+
+        {/* Bottom Footer Section */}
+        {compactMode ? (
         <div className="flex flex-col items-center gap-3">
           {/* Quick Theme Toggle in Collapsed */}
           {onToggleTheme && (
@@ -817,7 +863,8 @@ function Sidebar({
           </div>
         </div>
       )}
-    </aside>
+      </aside>
+    </>
   );
 }
 
@@ -827,6 +874,7 @@ function Header({
   wsConnected,
   theme,
   onToggleTheme,
+  onOpenMobileMenu,
   contextActions,
 }: {
   view: View;
@@ -834,6 +882,7 @@ function Header({
   wsConnected: boolean;
   theme: "light" | "dark";
   onToggleTheme: () => void;
+  onOpenMobileMenu: () => void;
   contextActions?: React.ReactNode;
 }) {
   const [timeStr, setTimeStr] = useState("");
@@ -865,28 +914,41 @@ function Header({
   const isDark = theme === "dark";
 
   return (
-    <header className="flex flex-wrap items-center justify-between gap-3 px-4 pt-5 pb-2 sm:px-6 lg:px-8 bg-transparent">
-      <div>
-        <h1 className="text-base font-extrabold sm:text-lg tracking-tight">
-          {titles[view][0]}
-        </h1>
-        <p className="hidden text-[10px] text-muted-foreground sm:block">
-          {titles[view][1]}
-        </p>
+    <header className="flex flex-wrap items-center justify-between gap-3 px-4 pt-4 pb-2 sm:px-6 sm:pt-5 lg:px-8 bg-transparent">
+      <div className="flex items-center gap-2.5 min-w-0">
+        <button
+          type="button"
+          onClick={onOpenMobileMenu}
+          aria-label="Buka menu navigasi"
+          title="Menu Navigasi"
+          className="inline-flex lg:hidden size-9 shrink-0 items-center justify-center rounded-xl border border-border bg-card text-foreground shadow-xs transition hover:bg-muted cursor-pointer"
+        >
+          <Menu className="size-4.5" />
+        </button>
+        <div className="min-w-0">
+          <h1 className="truncate text-base font-extrabold sm:text-lg tracking-tight">
+            {titles[view][0]}
+          </h1>
+          <p className="hidden truncate text-[10px] text-muted-foreground sm:block">
+            {titles[view][1]}
+          </p>
+        </div>
       </div>
-      <div className="flex items-center gap-2 sm:gap-2.5 flex-wrap">
+      <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
         {/* Contextual Badges / Actions per View */}
         {contextActions}
 
         {/* Global System Status Pills */}
-        <div className="hidden items-center gap-2 sm:flex">
+        <div className="hidden items-center gap-1.5 sm:flex sm:flex-wrap">
           <StatusPill text={isOnline ? "API: Online" : "API: Offline"} online={isOnline} />
-          <StatusPill text={isDb ? "SSMS: Connected" : "SSMS: Disconnected"} online={isDb} />
+          <span className="hidden md:inline-flex">
+            <StatusPill text={isDb ? "SSMS: Connected" : "SSMS: Disconnected"} online={isDb} />
+          </span>
           <StatusPill
             text={wsConnected ? "3 Cams: Live WS" : "3 Cams: Standby"}
             online={wsConnected}
           />
-          <span className="flex items-center gap-1.5 rounded-lg border border-border/60 bg-card px-2.5 py-1.5 font-mono text-[9px] font-semibold text-muted-foreground shadow-xs">
+          <span className="hidden xl:flex items-center gap-1.5 rounded-lg border border-border/60 bg-card px-2.5 py-1.5 font-mono text-[9px] font-semibold text-muted-foreground shadow-xs">
             <Clock3 className="size-3" />
             {timeStr || "15 Sep 2026 | 09:00 WIB"}
           </span>
@@ -1068,7 +1130,7 @@ function Dashboard({
 
   return (
     <div className="space-y-6">
-      <div className="grid gap-3.5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+      <div className="grid gap-3.5 grid-cols-1 sm:grid-cols-2 md:grid-cols-3 2xl:grid-cols-6">
         {displayStats.map((stat) => {
           const Icon = stat.Icon;
           return (
@@ -1120,7 +1182,7 @@ function Dashboard({
             </span>
           }
         />
-        <div className="mt-4 grid gap-4 xl:grid-cols-3 items-start">
+        <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3 items-start">
           <CameraFeed
             camera="CAM-01"
             area="Plate / Rib"
@@ -1404,7 +1466,7 @@ const LiveCamera = React.memo(function LiveCamera({
   const camIds: CameraId[] = ["CAM-01", "CAM-02", "CAM-03"];
 
   return (
-    <div className="grid gap-5 xl:grid-cols-3 items-start">
+    <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3 items-start">
       {camIds.map((cam) => {
         const c = CAMERA_CATALOG[cam];
         const st = streams[cam];
@@ -1553,7 +1615,7 @@ function CameraSpotlightModal({
       onClick={onClose}
     >
       <div
-        className={`w-full max-w-5xl overflow-hidden rounded-xl border bg-card shadow-2xl ${
+        className={`w-full max-w-5xl max-h-[95vh] flex flex-col overflow-y-auto rounded-xl border bg-card shadow-2xl ${
           isAlarm ? "border-danger/60" : "border-border"
         }`}
         onClick={(e) => e.stopPropagation()}
