@@ -304,6 +304,8 @@ class WebSocketStreamServer:
         jpeg_quality: int = 65,
         on_client_count_change: Callable[[int], None] | None = None,
         on_overlay_change: Callable[[bool], None] | None = None,
+        initial_db_enabled: bool = False,
+        on_db_enabled_change: Callable[[bool], None] | None = None,
     ) -> None:
         self.hub = hub
         self.host = host
@@ -314,9 +316,11 @@ class WebSocketStreamServer:
         self.jpeg_quality = int(max(30, min(95, int(jpeg_quality))))
         self._on_client_count_change = on_client_count_change
         self._on_overlay_change = on_overlay_change
+        self._on_db_enabled_change = on_db_enabled_change
 
         self._overlay_lock = threading.Lock()
         self._show_overlay = True
+        self._db_enabled = bool(initial_db_enabled)
         self._clients: set[Any] = set()
         self._encoded_frame_count = 0
 
@@ -354,6 +358,51 @@ class WebSocketStreamServer:
                 self._on_overlay_change(val)
             except Exception:
                 pass
+        self._schedule_state_broadcast()
+
+    @property
+    def db_enabled(self) -> bool:
+        with self._overlay_lock:
+            return self._db_enabled
+
+    def set_db_enabled(self, value: bool, notify_callback: bool = True) -> None:
+        with self._overlay_lock:
+            self._db_enabled = bool(value)
+            val = self._db_enabled
+        if notify_callback and self._on_db_enabled_change is not None:
+            try:
+                self._on_db_enabled_change(val)
+            except Exception:
+                pass
+        self._schedule_state_broadcast()
+
+    def _build_state_payload(self) -> str:
+        with self._overlay_lock:
+            payload = {
+                "type": "state",
+                "show_overlay": self._show_overlay,
+                "db_enabled": self._db_enabled,
+            }
+        return json.dumps(payload, separators=(",", ":"))
+
+    def _schedule_state_broadcast(self) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        msg = self._build_state_payload()
+
+        async def _broadcast() -> None:
+            clients_snapshot = list(self._clients)
+            if clients_snapshot:
+                await asyncio.gather(
+                    *(self._send_safe(ws, msg) for ws in clients_snapshot),
+                    return_exceptions=True,
+                )
+
+        try:
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(_broadcast()))
+        except Exception:
+            pass
 
     def start(self) -> bool:
         """Start the WebSocket server thread. Returns False without raising on error."""
@@ -426,12 +475,16 @@ class WebSocketStreamServer:
         except Exception:
             pass
         try:
+            await self._send_safe(websocket, self._build_state_payload())
             async for msg in websocket:
                 if isinstance(msg, str):
                     try:
                         cmd = json.loads(msg)
-                        if isinstance(cmd, dict) and "show_overlay" in cmd:
-                            self.show_overlay = bool(cmd["show_overlay"])
+                        if isinstance(cmd, dict):
+                            if "show_overlay" in cmd:
+                                self.show_overlay = bool(cmd["show_overlay"])
+                            if "db_enabled" in cmd:
+                                self.set_db_enabled(bool(cmd["db_enabled"]), notify_callback=True)
                     except Exception:
                         pass
         except Exception:
@@ -484,7 +537,7 @@ class WebSocketStreamServer:
         meta = build_stream_metadata(cam_id, slot)
         return encode_ws_binary_packet(meta, jb.tobytes())
 
-    async def _send_safe(self, ws: Any, packet: bytes) -> None:
+    async def _send_safe(self, ws: Any, packet: bytes | str) -> None:
         try:
             await asyncio.wait_for(ws.send(packet), timeout=0.25)
         except Exception:

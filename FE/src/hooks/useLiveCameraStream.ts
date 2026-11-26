@@ -51,6 +51,7 @@ export function parseWsBinaryPacket(
 export function useLiveCameraStream(enabled: boolean, port = 8765) {
   const [connected, setConnected] = useState(false);
   const [showOverlay, setShowOverlay] = useState(true);
+  const [dbEnabled, setDbEnabled] = useState<boolean | null>(null);
   const [streams, setStreams] = useState<Record<CameraId, CameraStreamState>>({
     "CAM-01": EMPTY_STREAM,
     "CAM-02": EMPTY_STREAM,
@@ -117,7 +118,28 @@ export function useLiveCameraStream(enabled: boolean, port = 8765) {
       };
 
       ws.onmessage = (event) => {
-        if (disposed || !(event.data instanceof ArrayBuffer)) return;
+        if (disposed) return;
+        if (typeof event.data === "string") {
+          try {
+            const msg = JSON.parse(event.data) as {
+              type?: string;
+              show_overlay?: boolean;
+              db_enabled?: boolean;
+            };
+            if (msg?.type === "state") {
+              if (typeof msg.show_overlay === "boolean") {
+                setShowOverlay(msg.show_overlay);
+              }
+              if (typeof msg.db_enabled === "boolean") {
+                setDbEnabled(msg.db_enabled);
+              }
+            }
+          } catch {
+            // ignore malformed control JSON
+          }
+          return;
+        }
+        if (!(event.data instanceof ArrayBuffer)) return;
         const parsed = parseWsBinaryPacket(event.data);
         if (!parsed) return;
 
@@ -178,6 +200,7 @@ export function useLiveCameraStream(enabled: boolean, port = 8765) {
           wsRef.current = null;
         }
         setConnected(false);
+        setDbEnabled(null);
         if (!disposed && !document.hidden) {
           reconnectTimer = setTimeout(connect, 2000);
         }
@@ -212,6 +235,7 @@ export function useLiveCameraStream(enabled: boolean, port = 8765) {
       wsRef.current?.close();
       wsRef.current = null;
       setConnected(false);
+      setDbEnabled(null);
       revokeAllUrls();
       setStreams({
         "CAM-01": EMPTY_STREAM,
@@ -232,10 +256,23 @@ export function useLiveCameraStream(enabled: boolean, port = 8765) {
     });
   }, []);
 
+  const toggleDb = useCallback(() => {
+    setDbEnabled((prev) => {
+      const next = !(prev ?? false);
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ db_enabled: next }));
+      }
+      return next;
+    });
+  }, []);
+
   return {
     connected,
     showOverlay,
     toggleOverlay,
+    dbEnabled,
+    toggleDb,
     streams,
   };
 }

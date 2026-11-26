@@ -1080,6 +1080,7 @@ def _run_top_worker(
     ws_top_queue=None,
     ws_clients_val=None,
     ws_overlay_val=None,
+    ws_db_val=None,
     ws_hud_mode="clean",
     ws_fps=0.0,
 ):
@@ -1199,9 +1200,18 @@ def _run_top_worker(
         prefetcher = _AsyncFramePrefetcher(cap, is_cam=is_cam, maxsize=2)
 
     print("[*] Worker CAM-01 Top Inspection AKTIF dan mulai memproses...")
+    last_ws_db = int(ws_db_val.value) if ws_db_val is not None else None
 
     try:
         while not stop_event.is_set():
+            if ws_db_val is not None:
+                cur_ws_db = int(ws_db_val.value)
+                if cur_ws_db != last_ws_db:
+                    last_ws_db = cur_ws_db
+                    if hasattr(inspector, "db_bridge") and inspector.db_bridge is not None:
+                        inspector.db_bridge.set_enabled(bool(cur_ws_db))
+                        st_lbl = "AKTIF (RECORDING & NOTIFIKASI TEAMS)" if cur_ws_db else "MATI (DRY-RUN)"
+                        print(f"\n[*] [CAM-01 TOP] SAKLAR DATABASE (via Web FE): {st_lbl}\n")
             ret, frame = prefetcher.read(timeout=0.5)
             if not ret or frame is None:
                 if stop_event.is_set():
@@ -1909,6 +1919,20 @@ def _run_threaded_engine(args):
     # Optional Opt-In Binary WebSocket Stream Server (Port 8765) + 3rd Camera (CAM-03)
     ws_hub = None
     ws_server = None
+    side_left_inspector = None
+    side_left_db_bridge = None
+
+    def _apply_threaded_db_state(val: bool):
+        args.enable_db = bool(val)
+        if top_inspector is not None and getattr(top_inspector, "db_bridge", None) is not None:
+            top_inspector.db_bridge.set_enabled(bool(val))
+        if side_db_bridge is not None:
+            side_db_bridge.set_enabled(bool(val))
+        if side_left_db_bridge is not None:
+            side_left_db_bridge.set_enabled(bool(val))
+        st_lbl = "AKTIF (RECORDING & NOTIFIKASI TEAMS)" if val else "MATI (DRY-RUN BENCHMARK)"
+        print(f"\n[DB SWITCH via Web FE] Status Database Logging seluruh kamera: {st_lbl}\n")
+
     if getattr(args, "ws_stream", False):
         try:
             from ws_stream_server import CameraFrameHub, WebSocketStreamServer
@@ -1919,6 +1943,8 @@ def _run_threaded_engine(args):
                 port=int(getattr(args, "ws_port", 8765) or 8765),
                 max_fps=float(getattr(args, "ws_fps", 0.0) or 0.0),
                 hud_mode=str(getattr(args, "ws_hud_mode", "clean") or "clean"),
+                initial_db_enabled=bool(args.enable_db),
+                on_db_enabled_change=_apply_threaded_db_state,
             )
             if not ws_server.start():
                 ws_server = None
@@ -1927,8 +1953,6 @@ def _run_threaded_engine(args):
             ws_hub = None
             ws_server = None
 
-    side_left_inspector = None
-    side_left_db_bridge = None
     cap_side_left = None
     is_cam_side_left = False
     side_left_source_path = getattr(args, "side_left_source", None)
@@ -2645,7 +2669,13 @@ def _run_threaded_engine(args):
             elif key in [ord("d"), ord("D")]:
                 top_st = top_inspector.toggle_db() if top_inspector else False
                 side_st = side_db_bridge.toggle() if side_db_bridge else False
-                st_text = "AKTIF (RECORDING & NOTIFIKASI TEAMS)" if (top_st or side_st) else "MATI (DRY-RUN BENCHMARK)"
+                new_db_val = bool(top_st or side_st)
+                if side_left_db_bridge is not None:
+                    side_left_db_bridge.set_enabled(new_db_val)
+                args.enable_db = new_db_val
+                if ws_server is not None:
+                    ws_server.set_db_enabled(new_db_val, notify_callback=False)
+                st_text = "AKTIF (RECORDING & NOTIFIKASI TEAMS)" if new_db_val else "MATI (DRY-RUN BENCHMARK)"
                 print(f"\n[DB SWITCH] Status Database Logging beralih ke: {st_text}")
                 print(f"[*] [CAM-01 TOP] SAKLAR DATABASE & TEAMS: {st_text}")
                 print(f"[*] [{args.side_cam_id} SIDE] SAKLAR DATABASE & TEAMS: {st_text}\n")
@@ -3014,7 +3044,9 @@ def _run_hybrid_engine(args):
 
     ws_clients_val = mp.Value("i", 0)
     ws_overlay_val = mp.Value("i", 1)
+    ws_db_val = mp.Value("i", 1 if args.enable_db else 0)
     ws_top_queue = mp.Queue(maxsize=2) if getattr(args, "ws_stream", False) else None
+    side_workers = []
 
     ws_hub = None
     ws_server = None
@@ -3030,6 +3062,16 @@ def _run_hybrid_engine(args):
             def _on_overlay(val):
                 ws_overlay_val.value = 1 if val else 0
 
+            def _on_db_change(val):
+                flag = bool(val)
+                args.enable_db = flag
+                ws_db_val.value = 1 if flag else 0
+                for sw in side_workers:
+                    if sw.get("dbb") is not None:
+                        sw["dbb"].set_enabled(flag)
+                st_lbl = "AKTIF (RECORDING & NOTIFIKASI TEAMS)" if flag else "MATI (DRY-RUN)"
+                print(f"\n[DB SWITCH via Web FE] Status Database Logging (Hybrid 3-Kam): {st_lbl}\n")
+
             ws_server = WebSocketStreamServer(
                 ws_hub,
                 port=int(getattr(args, "ws_port", 8765) or 8765),
@@ -3037,6 +3079,8 @@ def _run_hybrid_engine(args):
                 hud_mode=str(getattr(args, "ws_hud_mode", "clean") or "clean"),
                 on_client_count_change=_on_clients,
                 on_overlay_change=_on_overlay,
+                initial_db_enabled=bool(args.enable_db),
+                on_db_enabled_change=_on_db_change,
             )
             if not ws_server.start():
                 ws_server = None
@@ -3067,6 +3111,7 @@ def _run_hybrid_engine(args):
                 "ws_top_queue": ws_top_queue,
                 "ws_clients_val": ws_clients_val,
                 "ws_overlay_val": ws_overlay_val,
+                "ws_db_val": ws_db_val,
                 "ws_hud_mode": getattr(args, "ws_hud_mode", "clean"),
                 "ws_fps": float(getattr(args, "ws_fps", 0.0) or 0.0),
             },
@@ -3076,7 +3121,6 @@ def _run_hybrid_engine(args):
         print(f"[*] Sub-proses [TOP CAM-01] terisolasi di-spawn | PID: {p_top.pid}")
 
     # Inisialisasi CAM-02 & CAM-03 di proses Koordinator
-    side_workers = []
     side_lock = threading.Lock()
     side_state = {"fps": 0.0, "latency": 0.0, "status": "STARTING", "frames": 0, "display": None, "has_new": False}
 

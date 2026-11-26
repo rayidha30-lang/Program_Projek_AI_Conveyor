@@ -16,6 +16,7 @@ import {
   ChevronsRight,
   Clock3,
   Cpu,
+  Database,
   Download,
   ExternalLink,
   Eye,
@@ -266,6 +267,8 @@ export default function Index() {
     connected: wsConnected,
     showOverlay,
     toggleOverlay,
+    dbEnabled,
+    toggleDb,
     streams,
   } = useLiveCameraStream(view === "dashboard" || view === "live");
   const [maximizedCam, setMaximizedCam] = useState<CameraId | null>(null);
@@ -402,25 +405,42 @@ export default function Index() {
           onToggleTheme={toggleTheme}
           onOpenMobileMenu={() => setMobileMenuOpen(true)}
           contextActions={
-            view === "live" ? (
+            view === "dashboard" || view === "live" ? (
               <div className="flex items-center gap-1.5 flex-wrap">
-                <button
-                  type="button"
-                  onClick={toggleOverlay}
-                  className="cursor-pointer"
-                  title="Toggle overlay bounding box & kontur deteksi"
-                >
-                  <StatusPill
-                    text={showOverlay ? "Bounding Box: ON" : "Bounding Box: OFF"}
-                    online={showOverlay}
-                  />
-                </button>
-                <span className="hidden sm:inline-flex">
-                  <StatusPill
-                    text={wsConnected ? "WS Stream: Live" : "WS Stream: Standby"}
-                    online={wsConnected}
-                  />
-                </span>
+                {wsConnected && (
+                  <button
+                    type="button"
+                    onClick={toggleDb}
+                    className="cursor-pointer"
+                    title="Aktifkan / Nonaktifkan pencatatan NG ke Database SQLite & Notifikasi Teams (setara tombol [D])"
+                  >
+                    <StatusPill
+                      text={dbEnabled ? "DB Record: ON" : "DB Record: OFF"}
+                      online={Boolean(dbEnabled)}
+                    />
+                  </button>
+                )}
+                {view === "live" && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={toggleOverlay}
+                      className="cursor-pointer"
+                      title="Toggle overlay bounding box & kontur deteksi"
+                    >
+                      <StatusPill
+                        text={showOverlay ? "Bounding Box: ON" : "Bounding Box: OFF"}
+                        online={showOverlay}
+                      />
+                    </button>
+                    <span className="hidden sm:inline-flex">
+                      <StatusPill
+                        text={wsConnected ? "WS Stream: Live" : "WS Stream: Standby"}
+                        online={wsConnected}
+                      />
+                    </span>
+                  </>
+                )}
               </div>
             ) : view === "evidence" ? (
               <div className="flex items-center gap-1.5">
@@ -459,6 +479,7 @@ export default function Index() {
               minimizedCams={minimizedCams}
               onToggleMinimize={toggleMinimizeCam}
               onMaximize={setMaximizedCam}
+              pauseBackgroundVideo={maximizedCam !== null}
             />
           )}
           {view === "live" && (
@@ -468,6 +489,7 @@ export default function Index() {
               minimizedCams={minimizedCams}
               onToggleMinimize={toggleMinimizeCam}
               onMaximize={setMaximizedCam}
+              pauseBackgroundVideo={maximizedCam !== null}
             />
           )}
           {view === "abnormality" && (
@@ -502,6 +524,8 @@ export default function Index() {
           wsConnected={wsConnected}
           showOverlay={showOverlay}
           onToggleOverlay={toggleOverlay}
+          dbEnabled={dbEnabled}
+          onToggleDb={toggleDb}
           onMinimizeToGrid={() => {
             const cam = maximizedCam;
             setMaximizedCam(null);
@@ -1050,6 +1074,7 @@ function Dashboard({
   minimizedCams,
   onToggleMinimize,
   onMaximize,
+  pauseBackgroundVideo = false,
 }: {
   onViewAll: () => void;
   onSelectRecord?: (record: RecordRow) => void;
@@ -1060,6 +1085,7 @@ function Dashboard({
   minimizedCams: Record<CameraId, boolean>;
   onToggleMinimize: (cam: CameraId) => void;
   onMaximize: (cam: CameraId) => void;
+  pauseBackgroundVideo?: boolean;
 }) {
   const statsMeta: Record<
     string,
@@ -1192,6 +1218,7 @@ function Dashboard({
             fps="--"
             streamState={streams["CAM-01"]}
             isMinimized={minimizedCams["CAM-01"]}
+            pauseVideo={pauseBackgroundVideo}
             onToggleMinimize={() => onToggleMinimize("CAM-01")}
             onMaximize={() => onMaximize("CAM-01")}
           />
@@ -1204,6 +1231,7 @@ function Dashboard({
             fps="--"
             streamState={streams["CAM-02"]}
             isMinimized={minimizedCams["CAM-02"]}
+            pauseVideo={pauseBackgroundVideo}
             onToggleMinimize={() => onToggleMinimize("CAM-02")}
             onMaximize={() => onMaximize("CAM-02")}
           />
@@ -1216,6 +1244,7 @@ function Dashboard({
             fps="--"
             streamState={streams["CAM-03"]}
             isMinimized={minimizedCams["CAM-03"]}
+            pauseVideo={pauseBackgroundVideo}
             onToggleMinimize={() => onToggleMinimize("CAM-03")}
             onMaximize={() => onMaximize("CAM-03")}
           />
@@ -1325,6 +1354,7 @@ const CameraFeed = React.memo(function CameraFeed({
   alert = false,
   streamState,
   isMinimized = false,
+  pauseVideo = false,
   onToggleMinimize,
   onMaximize,
 }: {
@@ -1338,6 +1368,7 @@ const CameraFeed = React.memo(function CameraFeed({
   alert?: boolean;
   streamState?: CameraStreamState;
   isMinimized?: boolean;
+  pauseVideo?: boolean;
   onToggleMinimize: () => void;
   onMaximize: () => void;
 }) {
@@ -1398,7 +1429,7 @@ const CameraFeed = React.memo(function CameraFeed({
           title="Double-click atau klik Maximize untuk memperbesar"
           className="camera-grid relative flex aspect-video items-center justify-center overflow-hidden bg-black/90 cursor-pointer"
         >
-          {frameUrl ? (
+          {frameUrl && !pauseVideo ? (
             <img
               src={frameUrl}
               alt={`${camera} live stream`}
@@ -1456,12 +1487,14 @@ const LiveCamera = React.memo(function LiveCamera({
   minimizedCams,
   onToggleMinimize,
   onMaximize,
+  pauseBackgroundVideo = false,
 }: {
   streams: Record<CameraId, CameraStreamState>;
   wsConnected: boolean;
   minimizedCams: Record<CameraId, boolean>;
   onToggleMinimize: (cam: CameraId) => void;
   onMaximize: (cam: CameraId) => void;
+  pauseBackgroundVideo?: boolean;
 }) {
   const camIds: CameraId[] = ["CAM-01", "CAM-02", "CAM-03"];
 
@@ -1513,7 +1546,7 @@ const LiveCamera = React.memo(function LiveCamera({
                 title="Double-click atau klik Maximize untuk memperbesar"
                 className="camera-grid relative flex aspect-video items-center justify-center overflow-hidden bg-black/90 cursor-pointer"
               >
-                {st?.frameUrl ? (
+                {st?.frameUrl && !pauseBackgroundVideo ? (
                   <img
                     src={st.frameUrl}
                     alt={`${cam} live view`}
@@ -1579,6 +1612,8 @@ function CameraSpotlightModal({
   wsConnected,
   showOverlay,
   onToggleOverlay,
+  dbEnabled,
+  onToggleDb,
   onMinimizeToGrid,
   onClose,
 }: {
@@ -1587,6 +1622,8 @@ function CameraSpotlightModal({
   wsConnected: boolean;
   showOverlay: boolean;
   onToggleOverlay: () => void;
+  dbEnabled: boolean | null;
+  onToggleDb: () => void;
   onMinimizeToGrid: () => void;
   onClose: () => void;
 }) {
@@ -1611,7 +1648,7 @@ function CameraSpotlightModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 sm:p-6 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-3 sm:p-6"
       onClick={onClose}
     >
       <div
@@ -1645,6 +1682,22 @@ function CameraSpotlightModal({
             >
               {statusText}
             </span>
+            {wsConnected && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onToggleDb}
+                title="Aktifkan / Nonaktifkan pencatatan NG ke Database SQLite & Notifikasi Teams"
+                className={`h-7 px-2.5 text-[10px] ${
+                  dbEnabled
+                    ? "border-success/50 bg-success-soft text-success hover:bg-success-soft/80"
+                    : ""
+                }`}
+              >
+                <Database className="size-3.5 mr-1" />
+                {dbEnabled ? "DB Record: ON" : "DB Record: OFF"}
+              </Button>
+            )}
             <Button
               variant="outline"
               size="sm"
