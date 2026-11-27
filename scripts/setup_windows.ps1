@@ -39,11 +39,39 @@ function Invoke-Checked {
     }
 }
 
+function Set-VscodeInterpreter {
+    param([string]$InterpreterPath)
+    $vscodeDir = Join-Path $ProjectRoot ".vscode"
+    $settingsPath = Join-Path $vscodeDir "settings.json"
+    if (-not (Test-Path $vscodeDir)) {
+        New-Item -ItemType Directory -Path $vscodeDir -Force | Out-Null
+    }
+    $settings = [ordered]@{}
+    if (Test-Path $settingsPath) {
+        try {
+            $raw = Get-Content -Path $settingsPath -Raw -Encoding UTF8
+            if ($raw.Trim()) {
+                $parsed = $raw | ConvertFrom-Json
+                foreach ($prop in $parsed.PSObject.Properties) {
+                    $settings[$prop.Name] = $prop.Value
+                }
+            }
+        } catch {
+            Write-Host "    [WARN] .vscode/settings.json lama tidak valid JSON, membuat ulang." -ForegroundColor DarkYellow
+        }
+    }
+    $settings["python.defaultInterpreterPath"] = $InterpreterPath
+    $settings["python.terminal.activateEnvironment"] = $true
+    $settings | ConvertTo-Json -Depth 10 | Set-Content -Path $settingsPath -Encoding UTF8
+    Write-Host "    [OK] .vscode/settings.json diperbarui -> $InterpreterPath" -ForegroundColor Green
+}
+
 $PythonExe = "python"
+$VscodeInterpreter = $null
 
 if (-not $CheckOnly) {
     if ($UseConda) {
-        Write-Host "`n[1/5] Menyiapkan Conda environment 'ai-conveyor'..." -ForegroundColor Yellow
+        Write-Host "`n[1/5] Menyiapkan Conda environment 'ai-conveyor' (Python 3.11 + Node.js 22)..." -ForegroundColor Yellow
         if (-not (Get-Command conda -ErrorAction SilentlyContinue)) {
             throw "Conda tidak ditemukan di PATH. Jalankan tanpa -UseConda untuk memakai .venv."
         }
@@ -56,6 +84,7 @@ if (-not $CheckOnly) {
         $condaPython = (& conda run -n ai-conveyor python -c "import sys; print(sys.executable)" | Select-Object -Last 1).Trim()
         if ($condaPython -and (Test-Path $condaPython)) {
             $PythonExe = $condaPython
+            $VscodeInterpreter = $condaPython -replace "\\", "/"
         }
     } else {
         Write-Host "`n[1/5] Menyiapkan Python Virtual Environment ($VenvDir)..." -ForegroundColor Yellow
@@ -64,6 +93,7 @@ if (-not $CheckOnly) {
             Invoke-Checked "python" @("-m", "venv", $VenvDir)
         }
         $PythonExe = $venvPython
+        $VscodeInterpreter = "`${workspaceFolder}/$($VenvDir -replace '\\', '/')/Scripts/python.exe"
 
         Write-Host "`n[2/5] Memperbarui pip & menginstal dependensi Python..." -ForegroundColor Yellow
         Invoke-Checked $PythonExe @("-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel")
@@ -73,6 +103,10 @@ if (-not $CheckOnly) {
             Invoke-Checked $PythonExe @("-m", "pip", "install", "torch", "torchvision", "--index-url", "https://download.pytorch.org/whl/cu124")
         }
         Invoke-Checked $PythonExe @("-m", "pip", "install", "-r", "requirements-windows.txt")
+    }
+
+    if ($VscodeInterpreter) {
+        Set-VscodeInterpreter -InterpreterPath $VscodeInterpreter
     }
 
     Write-Host "`n[3/5] Memeriksa file .env lokal..." -ForegroundColor Yellow
@@ -85,17 +119,33 @@ if (-not $CheckOnly) {
 
     if (-not $SkipFrontend) {
         Write-Host "`n[4/5] Menyiapkan Frontend Dashboard (FE/)..." -ForegroundColor Yellow
-        if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+        $useCondaNpm = $false
+        if ($UseConda) {
+            $condaDir = Split-Path -Parent $PythonExe
+            if (Test-Path (Join-Path $condaDir "npm.cmd")) {
+                $useCondaNpm = $true
+            }
+        }
+        if (-not $useCondaNpm -and -not (Get-Command npm -ErrorAction SilentlyContinue)) {
             Write-Host "    [WARN] npm/Node.js tidak ditemukan di PATH. Lewati setup FE." -ForegroundColor DarkYellow
         } else {
             Push-Location (Join-Path $ProjectRoot "FE")
             try {
-                if (Test-Path "package-lock.json") {
-                    Invoke-Checked "npm" @("ci")
+                if ($useCondaNpm) {
+                    if (Test-Path "package-lock.json") {
+                        Invoke-Checked "conda" @("run", "-n", "ai-conveyor", "npm", "ci")
+                    } else {
+                        Invoke-Checked "conda" @("run", "-n", "ai-conveyor", "npm", "install")
+                    }
+                    Invoke-Checked "conda" @("run", "-n", "ai-conveyor", "npm", "run", "build")
                 } else {
-                    Invoke-Checked "npm" @("install")
+                    if (Test-Path "package-lock.json") {
+                        Invoke-Checked "npm" @("ci")
+                    } else {
+                        Invoke-Checked "npm" @("install")
+                    }
+                    Invoke-Checked "npm" @("run", "build")
                 }
-                Invoke-Checked "npm" @("run", "build")
             } finally {
                 Pop-Location
             }

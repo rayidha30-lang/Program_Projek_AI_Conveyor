@@ -18,6 +18,7 @@ channels:
   - defaults
 dependencies:
   - python=3.11
+  - nodejs=22
   - pip
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu124
