@@ -11,6 +11,20 @@ export interface CameraStreamMeta {
   severity?: string;
   slatNo?: number | null;
   ts?: number;
+  scheduleState?: "ACTIVE" | "PRE_WARMUP" | "STANDBY" | string;
+}
+
+export type ScheduleOverrideMode = "auto" | "force_active" | "force_standby";
+
+export interface DetectionScheduleState {
+  mode: "continuous" | "periodic" | "slots" | string;
+  state: "ACTIVE" | "PRE_WARMUP" | "STANDBY" | string;
+  override: ScheduleOverrideMode;
+  remaining_sec: number;
+  next_start: string;
+  active_min: number;
+  interval_min: number;
+  window_id?: string;
 }
 
 export interface CameraStreamState {
@@ -52,6 +66,7 @@ export function useLiveCameraStream(enabled: boolean, port = 8765) {
   const [connected, setConnected] = useState(false);
   const [showOverlay, setShowOverlay] = useState(true);
   const [dbEnabled, setDbEnabled] = useState<boolean | null>(null);
+  const [schedule, setSchedule] = useState<DetectionScheduleState | null>(null);
   const [streams, setStreams] = useState<Record<CameraId, CameraStreamState>>({
     "CAM-01": EMPTY_STREAM,
     "CAM-02": EMPTY_STREAM,
@@ -125,6 +140,7 @@ export function useLiveCameraStream(enabled: boolean, port = 8765) {
               type?: string;
               show_overlay?: boolean;
               db_enabled?: boolean;
+              schedule?: DetectionScheduleState;
             };
             if (msg?.type === "state") {
               if (typeof msg.show_overlay === "boolean") {
@@ -132,6 +148,9 @@ export function useLiveCameraStream(enabled: boolean, port = 8765) {
               }
               if (typeof msg.db_enabled === "boolean") {
                 setDbEnabled(msg.db_enabled);
+              }
+              if (msg.schedule && typeof msg.schedule === "object") {
+                setSchedule(msg.schedule);
               }
             }
           } catch {
@@ -201,6 +220,7 @@ export function useLiveCameraStream(enabled: boolean, port = 8765) {
         }
         setConnected(false);
         setDbEnabled(null);
+        setSchedule(null);
         if (!disposed && !document.hidden) {
           reconnectTimer = setTimeout(connect, 2000);
         }
@@ -236,6 +256,7 @@ export function useLiveCameraStream(enabled: boolean, port = 8765) {
       wsRef.current = null;
       setConnected(false);
       setDbEnabled(null);
+      setSchedule(null);
       revokeAllUrls();
       setStreams({
         "CAM-01": EMPTY_STREAM,
@@ -267,12 +288,21 @@ export function useLiveCameraStream(enabled: boolean, port = 8765) {
     });
   }, []);
 
+  const setScheduleOverride = useCallback((override: ScheduleOverrideMode) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ schedule_override: override }));
+    }
+  }, []);
+
   return {
     connected,
     showOverlay,
     toggleOverlay,
     dbEnabled,
     toggleDb,
+    schedule,
+    setScheduleOverride,
     streams,
   };
 }

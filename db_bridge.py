@@ -50,7 +50,8 @@ class InspectionDBBridge:
         captures_dir=None,
         enabled=False,
         cooldown_sec=2.0,
-        camera_id="CAM-01"  # CAM-01 (Overhead Plat/Rib di FE) atau CAM-03 di Jetson
+        camera_id="CAM-01",  # CAM-01 (Overhead Plat/Rib di FE) atau CAM-03 di Jetson
+        unresolved_alert_cooldown_sec=None,
     ):
         # 1. Tentukan lokasi database file
         if db_path is None:
@@ -67,6 +68,12 @@ class InspectionDBBridge:
         self.enabled = bool(enabled or env_enable_db)
         self.cooldown_sec = float(cooldown_sec)
         self.invalid_cooldown_sec = float(os.environ.get("INVALID_ALERT_COOLDOWN_SEC", "300.0"))
+        if unresolved_alert_cooldown_sec is None:
+            try:
+                unresolved_alert_cooldown_sec = float(os.environ.get("UNRESOLVED_ALERT_COOLDOWN_SEC", "0.0") or 0.0)
+            except ValueError:
+                unresolved_alert_cooldown_sec = 0.0
+        self.unresolved_alert_cooldown_sec = max(0.0, float(unresolved_alert_cooldown_sec))
         env_top_cam = os.environ.get("TOP_CAMERA_ID", "").strip().upper()
         if camera_id == "CAM-01" and env_top_cam in ("CAM-01", "CAM-02", "CAM-03"):
             camera_id = env_top_cam
@@ -213,6 +220,54 @@ class InspectionDBBridge:
         except Exception:
             pass
         return conn
+
+    def _has_recent_unresolved_alert(
+        self,
+        camera_id: str,
+        component_types: list,
+        side: str = "NONE",
+        exclude_inspection_id=None,
+    ) -> bool:
+        """
+        Cek apakah sudah ada tiket NG belum RESOLVED (UNACKNOWLEDGED/ACKNOWLEDGED)
+        untuk kamera + komponen + sisi yang sama dalam rentang unresolved_alert_cooldown_sec.
+        """
+        if self.unresolved_alert_cooldown_sec <= 0.0 or not component_types:
+            return False
+        conn = None
+        try:
+            from datetime import timedelta
+            cutoff_str = (datetime.now() - timedelta(seconds=self.unresolved_alert_cooldown_sec)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            placeholders = ",".join(["?"] * len(component_types))
+            sql = f"""
+                SELECT 1
+                FROM Inspections i
+                INNER JOIN Inspection_Detections d ON d.InspectionID = i.InspectionID
+                WHERE d.CameraID = ?
+                  AND d.ComponentType IN ({placeholders})
+                  AND d.Side = ?
+                  AND d.Result = 'NG'
+                  AND i.StatusLifecycle IN ('UNACKNOWLEDGED', 'ACKNOWLEDGED')
+                  AND i.InspectionTime >= ?
+            """
+            params = [camera_id, *component_types, side, cutoff_str]
+            if exclude_inspection_id is not None:
+                sql += " AND i.InspectionID != ?"
+                params.append(int(exclude_inspection_id))
+            sql += " LIMIT 1"
+            conn = self._get_connection()
+            row = conn.execute(sql, params).fetchone()
+            return row is not None
+        except Exception:
+            return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def reset_entity_cache(self):
         """Mereset riwayat deduplikasi entitas (misal saat video di-loop atau counter di-reset)."""
@@ -700,21 +755,39 @@ class InspectionDBBridge:
                 if str(c.get("result", "")).upper() == "NG":
                     print(f"  -> {c.get('name')}: NG")
 
-            # Memicu notifikasi MS Teams via Node-RED
+            # Memicu notifikasi MS Teams via Node-RED (suppress jika tiket belum RESOLVED dalam cooldown)
             if hasattr(self, "teams_notifier") and self.teams_notifier and self.teams_notifier.is_enabled():
-                try:
-                    self.teams_notifier.send_side_inspection_ng(
-                        camera_id=cam_id,
-                        side=db_side,
-                        components=components,
-                        bracket_details=bracket_details,
-                        inspection_id=trace_code,
-                        evidence_url=f"http://localhost:5173/?trace={trace_code}",
-                        image_url=f"http://localhost:5000/api/image?path={ann_path}" if ann_path else None,
-                        force=True
-                    )
-                except Exception as e_teams:
-                    print(f"[TEAMS NOTICE WARN] Gagal mengirim side ke Teams: {e_teams}")
+                side_ng_comps = []
+                for c in components:
+                    if str(c.get("result", "")).upper().strip() == "NG":
+                        cn = str(c.get("name", "")).upper().strip()
+                        if "BOLT" in cn:
+                            side_ng_comps.append("BOLT")
+                        elif "PIN" in cn:
+                            side_ng_comps.append("PIN")
+                        else:
+                            side_ng_comps.append("LEKUKAN")
+                if self._has_recent_unresolved_alert(
+                    camera_id=cam_id,
+                    component_types=side_ng_comps,
+                    side=db_side,
+                    exclude_inspection_id=inspection_id,
+                ):
+                    print(f"[TEAMS SUPPRESSED] Tiket {cam_id} ({db_side}) {side_ng_comps} masih belum RESOLVED dalam cooldown {self.unresolved_alert_cooldown_sec:.0f}s.")
+                else:
+                    try:
+                        self.teams_notifier.send_side_inspection_ng(
+                            camera_id=cam_id,
+                            side=db_side,
+                            components=components,
+                            bracket_details=bracket_details,
+                            inspection_id=trace_code,
+                            evidence_url=f"http://localhost:5173/?trace={trace_code}",
+                            image_url=f"http://localhost:5000/api/image?path={ann_path}" if ann_path else None,
+                            force=True
+                        )
+                    except Exception as e_teams:
+                        print(f"[TEAMS NOTICE WARN] Gagal mengirim side ke Teams: {e_teams}")
             return
 
         # ------------------------------------------------------------------
@@ -848,23 +921,36 @@ class InspectionDBBridge:
             slat_pv_val = float(slat_res.get("pv_flatness", slat_res.get("pv", max_dev_val)) or max_dev_val)
             print(f"  -> PLAT BENDING (PV: {slat_pv_val * scale_k:.1f}mm [{slat_pv_val:.1f}px])")
 
-        # 3. Memicu notifikasi MS Teams via Node-RED
+        # 3. Memicu notifikasi MS Teams via Node-RED (suppress jika tiket belum RESOLVED dalam cooldown)
         if hasattr(self, "teams_notifier") and self.teams_notifier and self.teams_notifier.is_enabled():
-            try:
-                evidence_url = f"http://localhost:5173/?trace={trace_code}"
-                image_url = f"http://localhost:5000/api/image?path={ann_path}" if ann_path else None
-                self.teams_notifier.send_top_inspection_ng(
-                    slat_res=slat_res,
-                    rib_res=rib_res,
-                    slat_number=slat_no,
-                    rib_number=item.get("rib_number"),
-                    inspection_id=trace_code,
-                    evidence_url=evidence_url,
-                    image_url=image_url,
-                    force=True
-                )
-            except Exception as e_teams:
-                print(f"[TEAMS NOTICE WARN] Gagal mengirim ke Teams: {e_teams}")
+            top_ng_comps = []
+            if is_rib_ng:
+                top_ng_comps.append("RIB")
+            if is_plat_ng:
+                top_ng_comps.append("PLAT")
+            if self._has_recent_unresolved_alert(
+                camera_id=top_cam_id,
+                component_types=top_ng_comps,
+                side="NONE",
+                exclude_inspection_id=inspection_id,
+            ):
+                print(f"[TEAMS SUPPRESSED] Tiket {top_cam_id} {top_ng_comps} masih belum RESOLVED dalam cooldown {self.unresolved_alert_cooldown_sec:.0f}s.")
+            else:
+                try:
+                    evidence_url = f"http://localhost:5173/?trace={trace_code}"
+                    image_url = f"http://localhost:5000/api/image?path={ann_path}" if ann_path else None
+                    self.teams_notifier.send_top_inspection_ng(
+                        slat_res=slat_res,
+                        rib_res=rib_res,
+                        slat_number=slat_no,
+                        rib_number=item.get("rib_number"),
+                        inspection_id=trace_code,
+                        evidence_url=evidence_url,
+                        image_url=image_url,
+                        force=True
+                    )
+                except Exception as e_teams:
+                    print(f"[TEAMS NOTICE WARN] Gagal mengirim ke Teams: {e_teams}")
 
     def close(self):
         """Menutup background worker thread secara bersih."""

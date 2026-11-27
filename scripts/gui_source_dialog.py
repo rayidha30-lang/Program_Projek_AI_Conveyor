@@ -164,10 +164,20 @@ def run_zenity_source(title="Pilih Sumber Kamera / Video", default_source=None):
     return False
 
 
-def run_zenity_dual(default_top=None, default_side=None, side_id="CAM-02", default_mode="dual"):
+def run_zenity_dual(
+    default_top=None,
+    default_side=None,
+    side_id="CAM-02",
+    default_mode="dual",
+    default_sched_mode="continuous",
+    default_sched_interval=60.0,
+    default_sched_active=15.0,
+    default_sched_anchor=0.0,
+    default_sched_slots="",
+):
     """
     Membuka pengaturan dual camera terpadu menggunakan Zenity --forms.
-    Menampilkan pilihan CAM-01 Top, CAM-02 Side, dan Mode Operasional dalam SATU dialog GTK.
+    Menampilkan pilihan CAM-01 Top, CAM-02 Side, Mode Operasional, dan Jadwal Deteksi dalam SATU dialog GTK.
     """
     cams = get_available_cameras()
 
@@ -197,11 +207,22 @@ def run_zenity_dual(default_top=None, default_side=None, side_id="CAM-02", defau
     ordered_modes = [cur_mode] + [m for m in ("dual", "opencv", "web", "headless") if m != cur_mode]
     mode_combo_str = "|".join(mode_map[m] for m in ordered_modes)
 
+    cur_smode = str(default_sched_mode or "continuous").strip().lower()
+    if cur_smode not in ("continuous", "periodic", "slots"):
+        cur_smode = "continuous"
+    smode_map = {
+        "continuous": "continuous (Terus-Menerus 24/7)",
+        "periodic": f"periodic (Berdurasi {default_sched_active:g}m tiap {default_sched_interval:g}m)",
+        "slots": "slots (Slot Jam Khusus HH:MM-HH:MM)",
+    }
+    ordered_smodes = [cur_smode] + [m for m in ("continuous", "periodic", "slots") if m != cur_smode]
+    smode_combo_str = "|".join(smode_map[m] for m in ordered_smodes)
+
     cmd = [
         "zenity",
         "--forms",
-        f"--title=🎥 Pengaturan Dual Kamera & Mode (CAM-01 Top & {side_id} Side)",
-        "--text=Atur sumber input dan mode operasional secara bersamaan:",
+        f"--title=🎥 Pengaturan Dual Kamera, Mode & Jadwal (CAM-01 Top & {side_id} Side)",
+        "--text=Atur sumber input, mode operasional, dan jadwal durasi deteksi AI:",
         "--separator=:::",
         f"--add-combo=[CAM-01 TOP] Plat & Sirip Rib",
         f"--combo-values={top_combo_str}",
@@ -209,7 +230,11 @@ def run_zenity_dual(default_top=None, default_side=None, side_id="CAM-02", defau
         f"--combo-values={side_combo_str}",
         "--add-combo=[MODE] Mode Operasional",
         f"--combo-values={mode_combo_str}",
-        "--width=580"
+        "--add-combo=[JADWAL AI] Mode Deteksi",
+        f"--combo-values={smode_combo_str}",
+        f"--add-entry=[JADWAL] Interval/Aktif/Menit (ex: {default_sched_interval:g}/{default_sched_active:g}/{default_sched_anchor:g})",
+        f"--add-entry=[JADWAL SLOTS] Daftar Jam (ex: {default_sched_slots or '08:00-08:15,09:00-09:15'})",
+        "--width=620"
     ]
 
     try:
@@ -220,6 +245,9 @@ def run_zenity_dual(default_top=None, default_side=None, side_id="CAM-02", defau
             ch_top = parts[0].strip() if len(parts) > 0 else ""
             ch_side = parts[1].strip() if len(parts) > 1 else ""
             ch_mode = parts[2].strip() if len(parts) > 2 else ""
+            ch_smode = parts[3].strip() if len(parts) > 3 else ""
+            ch_periodic = parts[4].strip() if len(parts) > 4 else ""
+            ch_slots = parts[5].strip() if len(parts) > 5 else ""
 
             # 1. Resolusi Sumber CAM-01 Top
             final_top = str(default_top) if default_top else "0"
@@ -249,11 +277,38 @@ def run_zenity_dual(default_top=None, default_side=None, side_id="CAM-02", defau
                 if final_mode not in ("dual", "opencv", "web", "headless"):
                     final_mode = cur_mode
 
+            final_smode = cur_smode
+            if ch_smode:
+                cand_sm = ch_smode.split(" ", 1)[0].strip().lower()
+                if cand_sm in ("continuous", "periodic", "slots"):
+                    final_smode = cand_sm
+
+            final_interval = float(default_sched_interval)
+            final_active = float(default_sched_active)
+            final_anchor = float(default_sched_anchor)
+            if ch_periodic:
+                p_nums = [x.strip() for x in ch_periodic.replace(",", "/").split("/") if x.strip()]
+                try:
+                    if len(p_nums) >= 1:
+                        final_interval = float(p_nums[0])
+                    if len(p_nums) >= 2:
+                        final_active = float(p_nums[1])
+                    if len(p_nums) >= 3:
+                        final_anchor = float(p_nums[2])
+                except ValueError:
+                    pass
+            final_slots = ch_slots if ch_slots else str(default_sched_slots or "")
+
             if final_top:
                 print(f"RESULT_DUAL_TOP:{final_top}")
             if final_side:
                 print(f"RESULT_DUAL_SIDE:{final_side}")
             print(f"RESULT_DUAL_MODE:{final_mode}")
+            print(f"RESULT_SCHED_MODE:{final_smode}")
+            print(f"RESULT_SCHED_INTERVAL:{final_interval:g}")
+            print(f"RESULT_SCHED_ACTIVE:{final_active:g}")
+            print(f"RESULT_SCHED_ANCHOR:{final_anchor:g}")
+            print(f"RESULT_SCHED_SLOTS:{final_slots}")
             return True
     except Exception as e:
         sys.stderr.write(f"[Zenity Dual] Error: {e}\n")
@@ -404,9 +459,19 @@ def run_tkinter_source(title="Pilih Sumber Kamera / Video", default_source=None)
     return False
 
 
-def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02", default_mode="dual"):
+def run_tkinter_dual(
+    default_top=None,
+    default_side=None,
+    side_id="CAM-02",
+    default_mode="dual",
+    default_sched_mode="continuous",
+    default_sched_interval=60.0,
+    default_sched_active=15.0,
+    default_sched_anchor=0.0,
+    default_sched_slots="",
+):
     """
-    Dialog visual pengaturan dual camera terpadu (CAM-01 Top, CAM-02 Side & Mode Operasional).
+    Dialog visual pengaturan dual camera terpadu (CAM-01 Top, CAM-02 Side, Mode Operasional & Jadwal Deteksi AI).
     Tampilan bawaan untuk Windows.
     """
     import tkinter as tk
@@ -414,7 +479,7 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02", defa
 
     cams = get_available_cameras()
     root = tk.Tk()
-    root.title(f"Pengaturan Dual Kamera & Mode (CAM-01 Top & {side_id} Side)")
+    root.title(f"Pengaturan Dual Kamera, Mode & Jadwal (CAM-01 Top & {side_id} Side)")
 
     if sys.platform.startswith("win"):
         try:
@@ -422,19 +487,32 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02", defa
         except Exception:
             pass
 
-    root.geometry("650x690")
-    root.minsize(580, 600)
+    root.geometry("680x715")
+    root.minsize(610, 680)
 
     f_fam = "Segoe UI" if sys.platform.startswith("win") else "DejaVu Sans"
     f_title = (f_fam, 11, "bold")
-    f_sec = (f_fam, 10, "bold")
+    f_sec = (f_fam, 9, "bold")
     f_reg = (f_fam, 9)
     f_sm = (f_fam, 8)
 
     init_mode = default_mode if default_mode in ("dual", "opencv", "web", "headless") else "dual"
-    res = {"top": default_top, "side": default_side, "mode": init_mode}
+    init_smode = str(default_sched_mode or "continuous").strip().lower()
+    if init_smode not in ("continuous", "periodic", "slots"):
+        init_smode = "continuous"
 
-    lbl_t = tk.Label(root, text="🎥 PENGATURAN SUMBER DUAL KAMERA", font=f_title, pady=8)
+    res = {
+        "top": default_top,
+        "side": default_side,
+        "mode": init_mode,
+        "sched_mode": init_smode,
+        "sched_interval": float(default_sched_interval if default_sched_interval is not None else 60.0),
+        "sched_active": float(default_sched_active if default_sched_active is not None else 15.0),
+        "sched_anchor": float(default_sched_anchor if default_sched_anchor is not None else 0.0),
+        "sched_slots": str(default_sched_slots or ""),
+    }
+
+    lbl_t = tk.Label(root, text="🎥 PENGATURAN KAMERA, MODE & JADWAL DETEKSI", font=f_title, pady=4)
     lbl_t.pack()
     lbl_sub = tk.Label(
         root,
@@ -442,11 +520,11 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02", defa
         font=(f_fam, 8, "italic"),
         fg="#444444"
     )
-    lbl_sub.pack(pady=(0, 8))
+    lbl_sub.pack(pady=(0, 4))
 
     # --- PANEL TOP ---
-    f_top = tk.LabelFrame(root, text="[CAM-01 TOP] Deteksi Plat Slat & Bilah Rib", font=f_sec, padx=12, pady=6)
-    f_top.pack(fill="x", padx=15, pady=5)
+    f_top = tk.LabelFrame(root, text="[CAM-01 TOP] Deteksi Plat Slat & Bilah Rib", font=f_sec, padx=10, pady=4)
+    f_top.pack(fill="x", padx=14, pady=3)
 
     is_top_cam = str(default_top).strip().isdigit() if default_top else False
     var_top_choice = tk.StringVar(master=root, value="webcam" if (is_top_cam or (cams and not default_top)) else "file")
@@ -460,7 +538,7 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02", defa
     for c_idx in candidate_cams:
         tk.Radiobutton(f_top_cams, text=f"Cam #{c_idx}", variable=var_top_cam, value=c_idx, command=lambda: var_top_choice.set("webcam"), font=f_reg).pack(side="left", padx=6)
 
-    f_top_file = tk.Frame(f_top, pady=4)
+    f_top_file = tk.Frame(f_top, pady=2)
     f_top_file.pack(fill="x")
     tk.Radiobutton(f_top_file, text="File Video:", variable=var_top_choice, value="file", font=(f_fam, 9, "bold")).pack(side="left")
     lbl_top_fname = tk.Label(f_top_file, text=os.path.basename(str(top_file_path["path"])) if top_file_path["path"] else "(Default Video)", font=f_sm, fg="#0055aa")
@@ -476,8 +554,8 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02", defa
     tk.Button(f_top_file, text="Pilih...", command=browse_top, font=f_sm).pack(side="right")
 
     # --- PANEL SIDE ---
-    f_side = tk.LabelFrame(root, text=f"[{side_id} SIDE] Deteksi Baut, Pin & Bracket Lekukan", font=f_sec, padx=12, pady=6)
-    f_side.pack(fill="x", padx=15, pady=8)
+    f_side = tk.LabelFrame(root, text=f"[{side_id} SIDE] Deteksi Baut, Pin & Bracket Lekukan", font=f_sec, padx=10, pady=4)
+    f_side.pack(fill="x", padx=14, pady=3)
 
     is_side_cam = str(default_side).strip().isdigit() if default_side else False
     var_side_choice = tk.StringVar(master=root, value="webcam" if (is_side_cam or (len(cams) >= 2 and not default_side)) else "file")
@@ -491,7 +569,7 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02", defa
     for c_idx in candidate_cams:
         tk.Radiobutton(f_side_cams, text=f"Cam #{c_idx}", variable=var_side_cam, value=c_idx, command=lambda: var_side_choice.set("webcam"), font=f_reg).pack(side="left", padx=6)
 
-    f_side_file = tk.Frame(f_side, pady=4)
+    f_side_file = tk.Frame(f_side, pady=2)
     f_side_file.pack(fill="x")
     tk.Radiobutton(f_side_file, text="File Video:", variable=var_side_choice, value="file", font=(f_fam, 9, "bold")).pack(side="left")
     lbl_side_fname = tk.Label(f_side_file, text=os.path.basename(str(side_file_path["path"])) if side_file_path["path"] else "(Default Video)", font=f_sm, fg="#0055aa")
@@ -507,48 +585,100 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02", defa
     tk.Button(f_side_file, text="Pilih...", command=browse_side, font=f_sm).pack(side="right")
 
     # --- PANEL MODE OPERASIONAL ---
-    f_mode = tk.LabelFrame(root, text="[MODE OPERASIONAL] Tampilan & Arsitektur Streaming", font=f_sec, padx=12, pady=6)
-    f_mode.pack(fill="x", padx=15, pady=6)
+    f_mode = tk.LabelFrame(root, text="[MODE OPERASIONAL] Tampilan & Arsitektur Streaming", font=f_sec, padx=10, pady=4)
+    f_mode.pack(fill="x", padx=14, pady=3)
 
     var_mode = tk.StringVar(master=root, value=init_mode)
-    tk.Radiobutton(
-        f_mode,
-        text="Dual GUI + Web (dual) — 2 Jendela OpenCV + WebSocket",
-        variable=var_mode,
-        value="dual",
-        font=f_reg,
-        anchor="w",
-    ).pack(fill="x", pady=1)
-    tk.Radiobutton(
-        f_mode,
-        text="OpenCV HUD Only (opencv) — Hanya 2 Jendela OpenCV (Tanpa WebSocket)",
-        variable=var_mode,
-        value="opencv",
-        font=f_reg,
-        anchor="w",
-    ).pack(fill="x", pady=1)
-    tk.Radiobutton(
-        f_mode,
-        text="Web Dashboard Only (web) — Tanpa GUI Desktop (Hybrid + WebSocket 3-Kamera)",
-        variable=var_mode,
-        value="web",
-        font=f_reg,
-        anchor="w",
-    ).pack(fill="x", pady=1)
-    tk.Radiobutton(
-        f_mode,
-        text="Headless (headless) — Tanpa GUI Desktop (Murni Inferensi)",
-        variable=var_mode,
-        value="headless",
-        font=f_reg,
-        anchor="w",
-    ).pack(fill="x", pady=1)
+    tk.Radiobutton(f_mode, text="Dual GUI + Web (dual) — 2 Jendela OpenCV + WebSocket", variable=var_mode, value="dual", font=f_reg, anchor="w").pack(fill="x")
+    tk.Radiobutton(f_mode, text="OpenCV HUD Only (opencv) — Hanya 2 Jendela OpenCV (Tanpa WebSocket)", variable=var_mode, value="opencv", font=f_reg, anchor="w").pack(fill="x")
+    tk.Radiobutton(f_mode, text="Web Dashboard Only (web) — Tanpa GUI Desktop (Hybrid + WebSocket 3-Kamera)", variable=var_mode, value="web", font=f_reg, anchor="w").pack(fill="x")
+    tk.Radiobutton(f_mode, text="Headless (headless) — Tanpa GUI Desktop (Murni Inferensi)", variable=var_mode, value="headless", font=f_reg, anchor="w").pack(fill="x")
+
+    # --- PANEL JADWAL DETEKSI AI (DURASI & SIKLUS) ---
+    f_sched = tk.LabelFrame(root, text="[JADWAL DETEKSI AI] Pengaturan Durasi & Waktu Aktif", font=f_sec, padx=10, pady=5)
+    f_sched.pack(fill="x", padx=14, pady=3)
+
+    var_sched_mode = tk.StringVar(master=root, value=init_smode)
+    var_sched_interval = tk.StringVar(master=root, value=f"{res['sched_interval']:g}")
+    var_sched_active = tk.StringVar(master=root, value=f"{res['sched_active']:g}")
+    var_sched_anchor = tk.StringVar(master=root, value=f"{res['sched_anchor']:g}")
+    var_sched_slots = tk.StringVar(master=root, value=res["sched_slots"] or "08:00-08:15,09:00-09:15")
+
+    f_smode_row = tk.Frame(f_sched)
+    f_smode_row.pack(fill="x")
+    tk.Radiobutton(f_smode_row, text="Terus 24/7", variable=var_sched_mode, value="continuous", font=f_reg).pack(side="left", padx=(0, 10))
+    tk.Radiobutton(f_smode_row, text="Berdurasi Periodik (Rekomendasi)", variable=var_sched_mode, value="periodic", font=(f_fam, 9, "bold")).pack(side="left", padx=(0, 10))
+    tk.Radiobutton(f_smode_row, text="Slot Jam Khusus", variable=var_sched_mode, value="slots", font=f_reg).pack(side="left")
+
+    f_per_row = tk.Frame(f_sched, pady=3)
+    f_per_row.pack(fill="x")
+    tk.Label(f_per_row, text="Setiap (menit):", font=f_sm).pack(side="left")
+    ent_interval = tk.Entry(f_per_row, textvariable=var_sched_interval, width=6, font=f_reg, justify="center")
+    ent_interval.pack(side="left", padx=(4, 12))
+
+    tk.Label(f_per_row, text="Aktif Deteksi (menit):", font=f_sm).pack(side="left")
+    ent_active = tk.Entry(f_per_row, textvariable=var_sched_active, width=6, font=f_reg, justify="center")
+    ent_active.pack(side="left", padx=(4, 12))
+
+    tk.Label(f_per_row, text="Mulai Menit (0-59):", font=f_sm).pack(side="left")
+    ent_anchor = tk.Entry(f_per_row, textvariable=var_sched_anchor, width=5, font=f_reg, justify="center")
+    ent_anchor.pack(side="left", padx=(4, 0))
+
+    f_slot_row = tk.Frame(f_sched, pady=2)
+    f_slot_row.pack(fill="x")
+    tk.Label(f_slot_row, text="Slot Jam (HH:MM-HH:MM):", font=f_sm).pack(side="left")
+    ent_slots = tk.Entry(f_slot_row, textvariable=var_sched_slots, font=f_sm)
+    ent_slots.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+    lbl_sched_preview = tk.Label(f_sched, text="", font=(f_fam, 8, "italic"), fg="#0055aa", anchor="w")
+    lbl_sched_preview.pack(fill="x", pady=(2, 0))
+
+    def _update_sched_preview(*_args):
+        sm = var_sched_mode.get()
+        if sm == "continuous":
+            ent_interval.config(state="disabled")
+            ent_active.config(state="disabled")
+            ent_anchor.config(state="disabled")
+            ent_slots.config(state="disabled")
+            lbl_sched_preview.config(text="Preview: AI mendeteksi terus-menerus 24/7 tanpa jeda standby.")
+        elif sm == "periodic":
+            ent_interval.config(state="normal")
+            ent_active.config(state="normal")
+            ent_anchor.config(state="normal")
+            ent_slots.config(state="disabled")
+            try:
+                iv = max(1.0, float(var_sched_interval.get()))
+                ac = max(0.1, float(var_sched_active.get()))
+                an = max(0.0, float(var_sched_anchor.get())) % 60.0
+                an_i = int(round(an))
+                end_m = int(round((an + ac) % 60))
+                end_h_add = int((an + ac) // 60)
+                stby_m = max(0.0, iv - ac)
+                lbl_sched_preview.config(
+                    text=f"Preview: Aktif {ac:g}m tiap {iv:g}m (Standby {stby_m:g}m) — mis. 08:{an_i:02d}-{8+end_h_add:02d}:{end_m:02d}, 09:{an_i:02d}-..."
+                )
+            except ValueError:
+                lbl_sched_preview.config(text="Preview: Masukkan angka menit yang valid (contoh: 60 / 15 / 0).")
+        else:
+            ent_interval.config(state="disabled")
+            ent_active.config(state="disabled")
+            ent_anchor.config(state="disabled")
+            ent_slots.config(state="normal")
+            lbl_sched_preview.config(text=f"Preview Slot: {var_sched_slots.get().strip() or '(kosong -> fallback 24/7)'}")
+
+    var_sched_mode.trace_add("write", _update_sched_preview)
+    var_sched_interval.trace_add("write", _update_sched_preview)
+    var_sched_active.trace_add("write", _update_sched_preview)
+    var_sched_anchor.trace_add("write", _update_sched_preview)
+    var_sched_slots.trace_add("write", _update_sched_preview)
+    _update_sched_preview()
 
     root.var_top_choice = var_top_choice
     root.var_top_cam = var_top_cam
     root.var_side_choice = var_side_choice
     root.var_side_cam = var_side_cam
     root.var_mode = var_mode
+    root.var_sched_mode = var_sched_mode
 
     def on_confirm_all():
         if var_top_choice.get() == "webcam":
@@ -562,12 +692,26 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02", defa
             res["side"] = str(side_file_path["path"])
 
         res["mode"] = var_mode.get()
+        res["sched_mode"] = var_sched_mode.get()
+        try:
+            res["sched_interval"] = max(0.1, float(var_sched_interval.get()))
+        except ValueError:
+            pass
+        try:
+            res["sched_active"] = max(0.05, float(var_sched_active.get()))
+        except ValueError:
+            pass
+        try:
+            res["sched_anchor"] = max(0.0, float(var_sched_anchor.get()))
+        except ValueError:
+            pass
+        res["sched_slots"] = var_sched_slots.get().strip()
         root.destroy()
 
-    f_bottom = tk.Frame(root, pady=12)
-    f_bottom.pack(side="bottom", fill="x", padx=15)
+    f_bottom = tk.Frame(root, pady=8)
+    f_bottom.pack(side="bottom", fill="x", padx=14)
     tk.Button(f_bottom, text="Terapkan & Mulai", bg="#007acc", fg="white", font=(f_fam, 10, "bold"), width=18, command=on_confirm_all).pack(side="right", padx=5)
-    tk.Button(f_bottom, text="Gunakan Bawaan", font=f_reg, width=15, command=root.destroy).pack(side="right")
+    tk.Button(f_bottom, text="Batal / Bawaan", font=f_reg, width=15, command=root.destroy).pack(side="right")
 
     root.mainloop()
     if res.get("top"):
@@ -576,6 +720,11 @@ def run_tkinter_dual(default_top=None, default_side=None, side_id="CAM-02", defa
         print(f"RESULT_DUAL_SIDE:{res['side']}")
     if res.get("mode"):
         print(f"RESULT_DUAL_MODE:{res['mode']}")
+    print(f"RESULT_SCHED_MODE:{res['sched_mode']}")
+    print(f"RESULT_SCHED_INTERVAL:{res['sched_interval']:g}")
+    print(f"RESULT_SCHED_ACTIVE:{res['sched_active']:g}")
+    print(f"RESULT_SCHED_ANCHOR:{res['sched_anchor']:g}")
+    print(f"RESULT_SCHED_SLOTS:{res['sched_slots']}")
     return True
 
 
@@ -593,12 +742,27 @@ def main():
     parser.add_argument("--side", type=str, default="")
     parser.add_argument("--side-id", type=str, default="CAM-02")
     parser.add_argument("--mode", type=str, default="dual")
+    parser.add_argument("--schedule-mode", type=str, default="continuous")
+    parser.add_argument("--schedule-interval-min", type=float, default=60.0)
+    parser.add_argument("--schedule-active-min", type=float, default=15.0)
+    parser.add_argument("--schedule-anchor-min", type=float, default=0.0)
+    parser.add_argument("--schedule-slots", type=str, default="")
     args = parser.parse_args()
 
     # Prioritas Linux: Gunakan Zenity 100% native GTK untuk garansi kebal stack smashing Tkinter
     if sys.platform.startswith("linux") and has_zenity():
         if args.dialog == "dual":
-            ok = run_zenity_dual(default_top=args.top, default_side=args.side, side_id=args.side_id, default_mode=args.mode)
+            ok = run_zenity_dual(
+                default_top=args.top,
+                default_side=args.side,
+                side_id=args.side_id,
+                default_mode=args.mode,
+                default_sched_mode=args.schedule_mode,
+                default_sched_interval=args.schedule_interval_min,
+                default_sched_active=args.schedule_active_min,
+                default_sched_anchor=args.schedule_anchor_min,
+                default_sched_slots=args.schedule_slots,
+            )
             if ok:
                 sys.exit(0)
         elif args.dialog == "source":
@@ -612,7 +776,17 @@ def main():
 
     # Windows / Fallback Non-Zenity: Gunakan Tkinter
     if args.dialog == "dual":
-        ok = run_tkinter_dual(default_top=args.top, default_side=args.side, side_id=args.side_id, default_mode=args.mode)
+        ok = run_tkinter_dual(
+            default_top=args.top,
+            default_side=args.side,
+            side_id=args.side_id,
+            default_mode=args.mode,
+            default_sched_mode=args.schedule_mode,
+            default_sched_interval=args.schedule_interval_min,
+            default_sched_active=args.schedule_active_min,
+            default_sched_anchor=args.schedule_anchor_min,
+            default_sched_slots=args.schedule_slots,
+        )
         sys.exit(0 if ok else 1)
     elif args.dialog == "source":
         ok = run_tkinter_source(title=args.title or "Pilih Sumber Kamera / Video", default_source=args.default)

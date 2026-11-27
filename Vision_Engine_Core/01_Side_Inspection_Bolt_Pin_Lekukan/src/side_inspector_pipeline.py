@@ -342,6 +342,31 @@ class SideConveyorInspector:
         self._pin_ng_count = 0
         self._crack_ng_count = 0
 
+    def reset_active_tracking(self):
+        """Mereset state transit in-flight (photocell/bracket) tanpa menghapus counter QC kumulatif."""
+        self.photocell_state = False
+        self.consecutive_gap_frames = 0
+        self.consecutive_plat_frames = 0
+        self.slat_settling_countdown = 0
+        self.slat_audit_countdown = 0
+        self.current_slat_scores = []
+        self.current_slat_samples = []
+        self.slat_evaluated = False
+        self.sweet_spot_sample = None
+        self.last_slat_verdict = "WAIT"
+        self.last_slat_score = 0.0
+        self.has_seen_gap = False
+        self.last_frame_time = None
+        self.last_bracket_info = None
+        self.latched_ng_info = None
+        self.current_slat_has_bolt_ng = False
+        self.current_slat_has_pin_ng = False
+        self.current_slat_has_crack_ng = False
+        self.current_slat_bolt_seen = False
+        self.current_slat_pin_seen = False
+        self.last_slat_bolt_status = "WAIT"
+        self.last_slat_pin_status = "WAIT"
+
     def _finalize_slat_qc(self):
         """
         Finalisasi evaluasi kualitas untuk 1 entitas plat slat fisik secara tunggal (Single Entity Slat Latch).

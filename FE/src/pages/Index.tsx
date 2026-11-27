@@ -68,6 +68,8 @@ import {
   useLiveCameraStream,
   type CameraId,
   type CameraStreamState,
+  type DetectionScheduleState,
+  type ScheduleOverrideMode,
 } from "@/hooks/useLiveCameraStream";
 
 type View = "dashboard" | "live" | "abnormality" | "evidence" | "analytics" | "settings";
@@ -269,6 +271,8 @@ export default function Index() {
     toggleOverlay,
     dbEnabled,
     toggleDb,
+    schedule,
+    setScheduleOverride,
     streams,
   } = useLiveCameraStream(view === "dashboard" || view === "live");
   const [maximizedCam, setMaximizedCam] = useState<CameraId | null>(null);
@@ -403,6 +407,8 @@ export default function Index() {
           wsConnected={wsConnected}
           dbEnabled={dbEnabled}
           onToggleDb={toggleDb}
+          schedule={schedule}
+          onScheduleOverride={setScheduleOverride}
           theme={theme}
           onToggleTheme={toggleTheme}
           onOpenMobileMenu={() => setMobileMenuOpen(true)}
@@ -883,6 +889,8 @@ function Header({
   wsConnected,
   dbEnabled,
   onToggleDb,
+  schedule,
+  onScheduleOverride,
   theme,
   onToggleTheme,
   onOpenMobileMenu,
@@ -893,6 +901,8 @@ function Header({
   wsConnected: boolean;
   dbEnabled: boolean | null;
   onToggleDb: () => void;
+  schedule: DetectionScheduleState | null;
+  onScheduleOverride: (override: ScheduleOverrideMode) => void;
   theme: "light" | "dark";
   onToggleTheme: () => void;
   onOpenMobileMenu: () => void;
@@ -966,6 +976,45 @@ function Header({
             {timeStr || "15 Sep 2026 | 09:00 WIB"}
           </span>
         </div>
+
+        {/* Detection Schedule Status & Override Button */}
+        {wsConnected && schedule && (
+          <button
+            type="button"
+            onClick={() => {
+              const next: ScheduleOverrideMode =
+                schedule.override === "auto"
+                  ? "force_active"
+                  : schedule.override === "force_active"
+                    ? "force_standby"
+                    : "auto";
+              onScheduleOverride(next);
+            }}
+            title={`Jadwal AI: ${schedule.mode.toUpperCase()} (${schedule.active_min}m / ${schedule.interval_min}m) • Override: ${schedule.override} — Klik untuk ganti mode (Auto / Force Detect / Force Standby)`}
+            className={`flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-[10px] font-bold shadow-xs transition-all cursor-pointer ${
+              schedule.state === "ACTIVE"
+                ? "border-success/50 bg-success-soft text-success hover:bg-success-soft/80"
+                : schedule.state === "PRE_WARMUP"
+                  ? "border-warning/50 bg-warning-soft text-warning hover:bg-warning-soft/80"
+                  : "border-border/80 bg-card text-muted-foreground hover:bg-muted/70"
+            }`}
+          >
+            <Clock3 className="size-3.5 shrink-0" />
+            <span className="whitespace-nowrap">
+              {schedule.state === "ACTIVE"
+                ? schedule.override === "force_active"
+                  ? "AI ON (MANUAL)"
+                  : schedule.mode === "continuous"
+                    ? "AI 24/7"
+                    : `AI ACTIVE ${Math.floor(schedule.remaining_sec / 60)}:${String(schedule.remaining_sec % 60).padStart(2, "0")}`
+                : schedule.state === "PRE_WARMUP"
+                  ? `AI WARMUP ${schedule.remaining_sec}s`
+                  : schedule.override === "force_standby"
+                    ? "AI STANDBY (MANUAL)"
+                    : `AI STANDBY -> ${schedule.next_start}`}
+            </span>
+          </button>
+        )}
 
         {/* DB Logging Toggle Switch (selalu tampil di Header kanan atas) */}
         <button
@@ -1532,6 +1581,8 @@ const LiveCamera = React.memo(function LiveCamera({
         const meta = st?.meta;
         const hasLive = Boolean(st?.frameUrl);
         const isAlert = hasLive && meta?.status === "NG";
+        const isSchedStandby = hasLive && meta?.status === "STANDBY";
+        const isSchedWarmup = hasLive && meta?.status === "PRE_WARMUP";
         const statusLabel = hasLive ? (meta?.status || "ONLINE") : "STANDBY";
         const fpsLabel = hasLive && meta?.fps !== undefined ? meta.fps.toFixed(1) : "--";
         const objLabel = hasLive && meta?.object ? meta.object : c.fallbackObj;
@@ -1545,11 +1596,13 @@ const LiveCamera = React.memo(function LiveCamera({
                   {cam}{" "}
                   <span
                     className={
-                      !hasLive
+                      !hasLive || isSchedStandby
                         ? "text-muted-foreground"
-                        : isAlert
-                          ? "text-danger"
-                          : "text-success"
+                        : isSchedWarmup
+                          ? "text-warning"
+                          : isAlert
+                            ? "text-danger"
+                            : "text-success"
                     }
                   >
                     {statusLabel}
@@ -1592,16 +1645,24 @@ const LiveCamera = React.memo(function LiveCamera({
                   className={`absolute bottom-2.5 left-2.5 rounded px-2 py-0.5 font-mono text-[9px] font-bold ${
                     !hasLive
                       ? "bg-black/70 text-muted-foreground border border-white/10"
-                      : isAlert
-                        ? "bg-danger text-primary-foreground"
-                        : "bg-success text-primary-foreground"
+                      : isSchedStandby
+                        ? "bg-slate-800/90 text-slate-200 border border-slate-500/40"
+                        : isSchedWarmup
+                          ? "bg-warning text-primary-foreground"
+                          : isAlert
+                            ? "bg-danger text-primary-foreground"
+                            : "bg-success text-primary-foreground"
                   }`}
                 >
                   {!hasLive
                     ? "STREAM STANDBY"
-                    : isAlert
-                      ? "CRITICAL DEFECT DETECTED"
-                      : "STREAM VIEW • OK"}
+                    : isSchedStandby
+                      ? "SCHEDULED STANDBY • LIVE VIEW"
+                      : isSchedWarmup
+                        ? "GPU PRE-WARMUP..."
+                        : isAlert
+                          ? "CRITICAL DEFECT DETECTED"
+                          : "STREAM VIEW • OK"}
                 </div>
               </div>
             )}

@@ -523,6 +523,25 @@ def _run_isolated_dialog(dialog_mode, **kwargs):
                 res["side"] = line.split(":", 1)[1].strip()
             elif line.startswith("RESULT_DUAL_MODE:"):
                 res["mode"] = line.split(":", 1)[1].strip()
+            elif line.startswith("RESULT_SCHED_MODE:"):
+                res.setdefault("schedule", {})["mode"] = line.split(":", 1)[1].strip()
+            elif line.startswith("RESULT_SCHED_INTERVAL:"):
+                try:
+                    res.setdefault("schedule", {})["interval_min"] = float(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif line.startswith("RESULT_SCHED_ACTIVE:"):
+                try:
+                    res.setdefault("schedule", {})["active_min"] = float(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif line.startswith("RESULT_SCHED_ANCHOR:"):
+                try:
+                    res.setdefault("schedule", {})["anchor_min"] = float(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif line.startswith("RESULT_SCHED_SLOTS:"):
+                res.setdefault("schedule", {})["slots"] = line.split(":", 1)[1].strip()
         return res
     except Exception as e:
         print(f"[!] Gagal mengeksekusi dialog subprocess ({dialog_mode}): {e}")
@@ -557,23 +576,82 @@ def select_dual_camera_setup_dialog(
     side_cam_id="CAM-02",
     default_mode=None,
     include_mode=False,
+    default_schedule=None,
+    include_schedule=False,
 ):
     """
-    Dialog visual terpadu untuk mengatur sumber CAM-01 Top, CAM-02 Side, dan opsional Mode Operasional.
+    Dialog visual terpadu untuk mengatur sumber CAM-01 Top, CAM-02 Side, Mode Operasional,
+    dan opsional Jadwal Deteksi AI (Durasi & Siklus).
     """
+    extra_kwargs = {}
+    if isinstance(default_schedule, dict):
+        if "mode" in default_schedule:
+            extra_kwargs["schedule_mode"] = default_schedule["mode"]
+        if "interval_min" in default_schedule:
+            extra_kwargs["schedule_interval_min"] = default_schedule["interval_min"]
+        if "active_min" in default_schedule:
+            extra_kwargs["schedule_active_min"] = default_schedule["active_min"]
+        if "anchor_min" in default_schedule:
+            extra_kwargs["schedule_anchor_min"] = default_schedule["anchor_min"]
+        if "slots" in default_schedule:
+            extra_kwargs["schedule_slots"] = default_schedule["slots"]
+
     res = _run_isolated_dialog(
         "dual",
         top=default_top,
         side=default_side,
         side_id=side_cam_id,
         mode=default_mode,
+        **extra_kwargs,
     )
     new_top = res.get("top", default_top)
     new_side = res.get("side", default_side)
     new_mode = res.get("mode", default_mode)
+    new_sched = res.get("schedule") if "schedule" in res else (dict(default_schedule) if isinstance(default_schedule, dict) else None)
+    if include_schedule:
+        return new_top, new_side, new_mode, new_sched
     if include_mode:
         return new_top, new_side, new_mode
     return new_top, new_side
+
+
+def build_schedule_dict_from_args(args):
+    """Ekstrak ringkasan konfigurasi jadwal dari Namespace args untuk dikirim ke dialog [W]."""
+    return {
+        "mode": getattr(args, "schedule_mode", "continuous"),
+        "interval_min": float(getattr(args, "schedule_interval_min", 60.0) or 60.0),
+        "active_min": float(getattr(args, "schedule_active_min", 15.0) or 15.0),
+        "anchor_min": float(getattr(args, "schedule_anchor_min", 0.0) or 0.0),
+        "slots": str(getattr(args, "schedule_slots", "") or ""),
+    }
+
+
+def apply_schedule_dict_to_args(args, sched_dict):
+    """Terapkan hasil pengaturan jadwal dari dialog [W] ke args dan bangun DetectionScheduleConfig baru."""
+    from detection_scheduler import DetectionScheduleConfig, parse_schedule_slots
+
+    if isinstance(sched_dict, dict):
+        if sched_dict.get("mode") in ("continuous", "periodic", "slots"):
+            args.schedule_mode = sched_dict["mode"]
+        if sched_dict.get("interval_min") is not None:
+            args.schedule_interval_min = float(sched_dict["interval_min"])
+        if sched_dict.get("active_min") is not None:
+            args.schedule_active_min = float(sched_dict["active_min"])
+        if sched_dict.get("anchor_min") is not None:
+            args.schedule_anchor_min = float(sched_dict["anchor_min"])
+        if "slots" in sched_dict and sched_dict["slots"] is not None:
+            args.schedule_slots = str(sched_dict["slots"])
+
+    return DetectionScheduleConfig(
+        mode=getattr(args, "schedule_mode", "continuous"),
+        interval_min=float(getattr(args, "schedule_interval_min", 60.0) or 60.0),
+        active_min=float(getattr(args, "schedule_active_min", 15.0) or 15.0),
+        anchor_minute=float(getattr(args, "schedule_anchor_min", 0.0) or 0.0),
+        slots=parse_schedule_slots(getattr(args, "schedule_slots", "")),
+        prewarm_sec=float(getattr(args, "schedule_prewarm_sec", 2.0) or 2.0),
+        standby_fps=float(getattr(args, "schedule_standby_fps", 20.0) or 20.0),
+        motion_quota=bool(getattr(args, "schedule_motion_quota", False)),
+    )
 
 
 from video_nav_utils import (
@@ -587,6 +665,60 @@ from video_nav_utils import (
     parse_time_to_seconds,
     prompt_jump_time_dialog,
 )
+from detection_scheduler import (
+    CODE_TO_STATE as SCHED_CODE_TO_STATE,
+    STATE_TO_CODE as SCHED_STATE_TO_CODE,
+    DetectionScheduler,
+)
+
+
+def make_standby_top_result(schedule_state="STANDBY", badge=""):
+    """Build lightweight stub result for CAM-01 when AI is bypassed in STANDBY/PRE_WARMUP."""
+    st = str(schedule_state or "STANDBY").upper()
+    msg = badge or ("Scheduled Standby (Live View)" if st == "STANDBY" else "GPU Pre-Warmup...")
+    return {
+        "status": st,
+        "schedule_state": st,
+        "slat_res": {"display_status": st, "eval_mode": msg, "is_ng": False},
+        "rib_res": {"status": st, "is_rib_present": False, "is_ng": False, "message": msg},
+        "elapsed_ms": 0.0,
+        "is_conveyor_moving": False,
+    }
+
+
+def make_standby_side_payload(camera_id, side, schedule_state="STANDBY"):
+    """Build lightweight stub payload for CAM-02/03 when AI is bypassed in STANDBY/PRE_WARMUP."""
+    st = str(schedule_state or "STANDBY").upper()
+    return {
+        "camera_id": camera_id,
+        "side": side,
+        "overall_result": st,
+        "schedule_state": st,
+        "should_emit": False,
+        "components": [],
+        "bolts": [],
+        "pins": [],
+    }
+
+
+def draw_schedule_standby_overlay(frame_bgr, badge_text):
+    """Draw a minimal standby status banner onto a copy of a live passthrough frame for OpenCV GUI."""
+    import cv2
+    out = frame_bgr.copy()
+    h_f, w_f = out.shape[:2]
+    cv2.rectangle(out, (12, 12), (min(w_f - 12, 680), 56), (24, 24, 28), -1)
+    cv2.rectangle(out, (12, 12), (min(w_f - 12, 680), 56), (0, 210, 255), 2, cv2.LINE_AA)
+    cv2.putText(
+        out,
+        f"{badge_text} | [W]: Setup | [S]: Override | [Q]: Keluar",
+        (24, 41),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (0, 235, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return out
 
 
 def _handle_isolated_gui_dialog():
@@ -1083,6 +1215,8 @@ def _run_top_worker(
     ws_db_val=None,
     ws_hud_mode="clean",
     ws_fps=0.0,
+    ws_sched_state_val=None,
+    standby_fps=20.0,
 ):
     """Worker proses terisolasi untuk CAM-01 Top Inspection (Plat & Rib)."""
     # Bersihkan cache VRAM PyTorch sebelum proses inferensi dimulai
@@ -1201,9 +1335,13 @@ def _run_top_worker(
 
     print("[*] Worker CAM-01 Top Inspection AKTIF dan mulai memproses...")
     last_ws_db = int(ws_db_val.value) if ws_db_val is not None else None
+    prev_sched_state = "ACTIVE"
+    prewarm_frames_done = 0
+    standby_interval = (1.0 / max(1.0, float(standby_fps or 20.0)))
 
     try:
         while not stop_event.is_set():
+            t_loop_top0 = time.perf_counter()
             if ws_db_val is not None:
                 cur_ws_db = int(ws_db_val.value)
                 if cur_ws_db != last_ws_db:
@@ -1233,6 +1371,68 @@ def _run_top_worker(
                 else:
                     time.sleep(0.01)
                     continue
+
+            sched_state = (
+                SCHED_CODE_TO_STATE.get(int(ws_sched_state_val.value), "ACTIVE")
+                if ws_sched_state_val is not None
+                else "ACTIVE"
+            )
+            if sched_state != prev_sched_state:
+                if prev_sched_state == "ACTIVE":
+                    finalize_pending_rib_dataset(dataset_recorder, dataset_previous)
+                    dataset_previous = None
+                    inspector.reset_active_tracking()
+                elif sched_state == "ACTIVE":
+                    inspector.reset_active_tracking()
+                if sched_state != "PRE_WARMUP":
+                    prewarm_frames_done = 0
+                prev_sched_state = sched_state
+
+            if sched_state != "ACTIVE":
+                if sched_state == "PRE_WARMUP" and prewarm_frames_done < 2:
+                    if _torch is not None:
+                        with _torch.inference_mode():
+                            inspector.inspect(frame)
+                    else:
+                        inspector.inspect(frame)
+                    inspector.reset_active_tracking()
+                    prewarm_frames_done += 1
+
+                inspect_res = make_standby_top_result(sched_state)
+                t_frame_end = time.time()
+                dt = t_frame_end - t_prev
+                t_prev = t_frame_end
+                curr_fps = 1.0 / dt if dt > 0 else float(standby_fps or 20.0)
+                fps_history.append(curr_fps)
+                if len(fps_history) > 30:
+                    fps_history.pop(0)
+                avg_fps = sum(fps_history) / len(fps_history)
+                frame_count += 1
+                fps_val.value = avg_fps
+                frames_val.value = frame_count
+                latency_val.value = 0.0
+                status_buf.value = sched_state.encode("utf-8")[:63]
+                if ws_encoder is not None:
+                    ws_encoder.submit(
+                        frame=frame,
+                        inspect_res=inspect_res,
+                        avg_fps=avg_fps,
+                        slat_no=getattr(inspector.slat_inspector, "slat_count", None),
+                        rib_no=getattr(inspector.rib_inspector, "rib_count", None),
+                    )
+                if mode == "dual":
+                    t_now = time.time()
+                    if (t_now - last_gui_render) >= gui_interval:
+                        cv2.imshow(win_name, draw_schedule_standby_overlay(frame, f"SCHED: {sched_state} (LIVE VIEW)"))
+                        last_gui_render = t_now
+                    key_st = cv2.waitKey(1) & 0xFF
+                    if key_st in [ord("q"), ord("Q"), 27]:
+                        stop_event.set()
+                        break
+                rem_stby = standby_interval - (time.perf_counter() - t_loop_top0)
+                if rem_stby > 0.001:
+                    time.sleep(rem_stby)
+                continue
 
             # Jalankan inspeksi terpadu plat slat & rib (ukur latensi murni pipeline AI)
             t_infer_start = time.time()
@@ -1489,7 +1689,9 @@ def _run_side_worker(
     frames_val,
     latency_val,
     status_buf,
-    gui_fps=22.0
+    gui_fps=22.0,
+    ws_sched_state_val=None,
+    standby_fps=20.0,
 ):
     """Worker proses terisolasi untuk Side Inspection (Bolt, Pin, & Bracket)."""
     # Bersihkan cache VRAM PyTorch sebelum proses inferensi dimulai
@@ -1577,9 +1779,13 @@ def _run_side_worker(
     last_gui_render_side = 0.0
 
     print(f"[*] Worker {camera_id} Side Inspection [{side}] AKTIF dan mulai memproses...")
+    prev_sched_state = "ACTIVE"
+    prewarm_frames_done = 0
+    standby_interval = (1.0 / max(1.0, float(standby_fps or 20.0)))
 
     try:
         while not stop_event.is_set():
+            t_loop_side0 = time.perf_counter()
             if cap is not None and cap.isOpened():
                 ret, frame = cap.read()
                 if not ret or frame is None:
@@ -1614,6 +1820,50 @@ def _run_side_worker(
                 cv2.rectangle(frame, (offset, 250), (offset + 180, 450), (120, 120, 130), -1)
                 cv2.circle(frame, (offset + 90, 350), 22, (200, 200, 210), -1)
                 time.sleep(0.015)
+
+            sched_state = (
+                SCHED_CODE_TO_STATE.get(int(ws_sched_state_val.value), "ACTIVE")
+                if ws_sched_state_val is not None
+                else "ACTIVE"
+            )
+            if sched_state != prev_sched_state:
+                if hasattr(inspector, "reset_active_tracking"):
+                    inspector.reset_active_tracking()
+                if sched_state != "PRE_WARMUP":
+                    prewarm_frames_done = 0
+                prev_sched_state = sched_state
+
+            if sched_state != "ACTIVE":
+                if sched_state == "PRE_WARMUP" and prewarm_frames_done < 2:
+                    inspector.process_frame(frame, render_display=False)
+                    if hasattr(inspector, "reset_active_tracking"):
+                        inspector.reset_active_tracking()
+                    prewarm_frames_done += 1
+                t_frame_end = time.time()
+                dt = t_frame_end - t_prev
+                t_prev = t_frame_end
+                fps_history.append(1.0 / dt if dt > 0 else float(standby_fps or 20.0))
+                if len(fps_history) > 30:
+                    fps_history.pop(0)
+                avg_fps = sum(fps_history) / len(fps_history)
+                frame_count += 1
+                fps_val.value = avg_fps
+                frames_val.value = frame_count
+                latency_val.value = 0.0
+                status_buf.value = sched_state.encode("utf-8")[:63]
+                if mode == "dual":
+                    t_now = time.time()
+                    if (t_now - last_gui_render_side) >= gui_interval:
+                        cv2.imshow(win_name, draw_schedule_standby_overlay(frame, f"SCHED: {sched_state} (LIVE VIEW)"))
+                        last_gui_render_side = t_now
+                    key_st = cv2.waitKey(1) & 0xFF
+                    if key_st in [ord("q"), ord("Q"), 27]:
+                        stop_event.set()
+                        break
+                rem_stby = standby_interval - (time.perf_counter() - t_loop_side0)
+                if rem_stby > 0.001:
+                    time.sleep(rem_stby)
+                continue
 
             # Jalankan inspeksi komponen samping (YOLO Bolt/Pin + PatchCore Bracket)
             t_infer_start = time.time()
@@ -1915,6 +2165,8 @@ def _run_threaded_engine(args):
     stop_event = threading.Event()
     top_lock = threading.Lock()
     side_lock = threading.Lock()
+    scheduler = DetectionScheduler.from_env_and_args(args)
+    standby_interval = 1.0 / max(1.0, float(scheduler.config.standby_fps or 20.0))
 
     # Optional Opt-In Binary WebSocket Stream Server (Port 8765) + 3rd Camera (CAM-03)
     ws_hub = None
@@ -1933,6 +2185,11 @@ def _run_threaded_engine(args):
         st_lbl = "AKTIF (RECORDING & NOTIFIKASI TEAMS)" if val else "MATI (DRY-RUN BENCHMARK)"
         print(f"\n[DB SWITCH via Web FE] Status Database Logging seluruh kamera: {st_lbl}\n")
 
+    def _apply_threaded_schedule_override(ovr: str):
+        snap_o = scheduler.set_override(ovr)
+        print(f"\n[SCHEDULE via Web FE] Override diubah ke '{snap_o.override}' -> {snap_o.hud_badge()}\n")
+        return snap_o.to_ws_dict()
+
     if getattr(args, "ws_stream", False):
         try:
             from ws_stream_server import CameraFrameHub, WebSocketStreamServer
@@ -1945,6 +2202,8 @@ def _run_threaded_engine(args):
                 hud_mode=str(getattr(args, "ws_hud_mode", "clean") or "clean"),
                 initial_db_enabled=bool(args.enable_db),
                 on_db_enabled_change=_apply_threaded_db_state,
+                initial_schedule=scheduler.evaluate().to_ws_dict(),
+                on_schedule_override=_apply_threaded_schedule_override,
             )
             if not ws_server.start():
                 ws_server = None
@@ -2114,8 +2373,11 @@ def _run_threaded_engine(args):
         dataset_last_rib_no = 0
         dataset_previous = None
         idle_skipper = IdleConveyorSkipper(enabled=bool(getattr(args, "skip_idle", False)))
+        prev_sched_state = "ACTIVE"
+        prewarm_frames_done = 0
 
         while not stop_event.is_set():
+            t_loop_top0 = time.perf_counter()
             try:
                 if cap_top is None or not cap_top.isOpened():
                     time.sleep(0.02)
@@ -2208,6 +2470,66 @@ def _run_threaded_engine(args):
                         with nav_lock:
                             nav_state["motion_energy"] = skip_info["motion_energy"]
 
+                sched_snap = scheduler.evaluate()
+                sched_state = sched_snap.state
+                if sched_state != prev_sched_state:
+                    if prev_sched_state == "ACTIVE":
+                        finalize_pending_rib_dataset(top_dataset_recorder, dataset_previous)
+                        dataset_previous = None
+                        top_inspector.reset_active_tracking()
+                    elif sched_state == "ACTIVE":
+                        top_inspector.reset_active_tracking()
+                    if sched_state != "PRE_WARMUP":
+                        prewarm_frames_done = 0
+                    prev_sched_state = sched_state
+
+                if sched_state != "ACTIVE":
+                    if sched_state == "PRE_WARMUP" and prewarm_frames_done < 2:
+                        if top_stream is not None:
+                            with torch.cuda.stream(top_stream), torch.inference_mode():
+                                top_inspector.inspect(frame)
+                        else:
+                            top_inspector.inspect(frame)
+                        top_inspector.reset_active_tracking()
+                        prewarm_frames_done += 1
+
+                    stub_res = make_standby_top_result(sched_state, sched_snap.hud_badge())
+                    t_end = time.time()
+                    dt = t_end - t_prev
+                    t_prev = t_end
+                    fps_hist.append(1.0 / dt if dt > 0 else float(scheduler.config.standby_fps))
+                    if len(fps_hist) > 30:
+                        fps_hist.pop(0)
+                    avg_f = sum(fps_hist) / len(fps_hist)
+                    with nav_lock:
+                        nav_state["cur_pos_frame"] = cur_pos_f
+                    with top_lock:
+                        top_state["frames"] += 1
+                        top_state["pos_frame"] = cur_pos_f
+                        top_state["fps"] = avg_f
+                        top_state["latency"] = 0.0
+                        top_state["status"] = sched_state
+                        top_state["raw_frame"] = frame
+                        top_state["inspect_res"] = stub_res
+                        top_state["disp_id"] += 1
+                        top_state["has_new"] = True
+                    if ws_hub is not None:
+                        ws_hub.publish(
+                            "CAM-01",
+                            frame,
+                            stub_res,
+                            avg_f,
+                            inspector_meta={
+                                "slat_no": getattr(top_inspector.slat_inspector, "slat_count", None),
+                                "rib_no": getattr(top_inspector.rib_inspector, "rib_count", None),
+                                "schedule_state": sched_state,
+                            },
+                        )
+                    rem_stby = standby_interval - (time.perf_counter() - t_loop_top0)
+                    if rem_stby > 0.001:
+                        time.sleep(rem_stby)
+                    continue
+
                 t_infer_start = time.time()
                 if top_stream is not None:
                     with torch.cuda.stream(top_stream):
@@ -2217,6 +2539,8 @@ def _run_threaded_engine(args):
                     inspect_res = top_inspector.inspect(frame)
                 t_end = time.time()
                 lat = (t_end - t_infer_start) * 1000.0
+                if scheduler.config.motion_quota:
+                    scheduler.record_motion_sample(bool(inspect_res.get("is_conveyor_moving", True)))
 
                 dt = t_end - t_prev
                 t_prev = t_end
@@ -2304,8 +2628,11 @@ def _run_threaded_engine(args):
         t_prev = time.time()
         fps_hist = []
         last_render_side = 0.0
+        prev_sched_state = "ACTIVE"
+        prewarm_frames_done = 0
 
         while not stop_event.is_set():
+            t_loop_side0 = time.perf_counter()
             try:
                 if cap_side is None or not cap_side.isOpened():
                     time.sleep(0.02)
@@ -2338,6 +2665,57 @@ def _run_threaded_engine(args):
                     else:
                         time.sleep(0.01)
                         continue
+
+                sched_snap_s = scheduler.evaluate()
+                sched_state_s = sched_snap_s.state
+                if sched_state_s != prev_sched_state:
+                    if hasattr(side_inspector, "reset_active_tracking"):
+                        side_inspector.reset_active_tracking()
+                    if sched_state_s != "PRE_WARMUP":
+                        prewarm_frames_done = 0
+                    prev_sched_state = sched_state_s
+
+                if sched_state_s != "ACTIVE":
+                    if sched_state_s == "PRE_WARMUP" and prewarm_frames_done < 2:
+                        if side_stream is not None:
+                            with torch.cuda.stream(side_stream), torch.inference_mode():
+                                side_inspector.process_frame(frame, render_display=False)
+                        else:
+                            side_inspector.process_frame(frame, render_display=False)
+                        if hasattr(side_inspector, "reset_active_tracking"):
+                            side_inspector.reset_active_tracking()
+                        prewarm_frames_done += 1
+
+                    stub_side = make_standby_side_payload(args.side_cam_id, args.side_name, sched_state_s)
+                    t_end = time.time()
+                    dt = t_end - t_prev
+                    t_prev = t_end
+                    fps_hist.append(1.0 / dt if dt > 0 else float(scheduler.config.standby_fps))
+                    if len(fps_hist) > 30:
+                        fps_hist.pop(0)
+                    avg_f = sum(fps_hist) / len(fps_hist)
+                    with side_lock:
+                        side_state["frames"] += 1
+                        side_state["fps"] = avg_f
+                        side_state["latency"] = 0.0
+                        side_state["status"] = sched_state_s
+                        if args.mode not in ("headless", "web") and (t_end - last_render_side) >= gui_interval:
+                            side_state["display"] = draw_schedule_standby_overlay(frame, sched_snap_s.hud_badge())
+                            side_state["disp_id"] += 1
+                            side_state["has_new"] = True
+                            last_render_side = t_end
+                    if ws_hub is not None:
+                        ws_hub.publish(
+                            args.side_cam_id,
+                            frame,
+                            stub_side,
+                            avg_f,
+                            inspector_meta={"schedule_state": sched_state_s},
+                        )
+                    rem_stby = standby_interval - (time.perf_counter() - t_loop_side0)
+                    if rem_stby > 0.001:
+                        time.sleep(rem_stby)
+                    continue
 
                 t_infer_start = time.time()
                 ws_needs_legacy = bool(
@@ -2412,7 +2790,10 @@ def _run_threaded_engine(args):
     def _side_left_loop():
         t_prev = time.time()
         fps_hist = []
+        prev_sched_state = "ACTIVE"
+        prewarm_frames_done = 0
         while not stop_event.is_set():
+            t_loop_sl0 = time.perf_counter()
             try:
                 if cap_side_left is None or not cap_side_left.isOpened():
                     time.sleep(0.02)
@@ -2434,6 +2815,46 @@ def _run_threaded_engine(args):
                     else:
                         time.sleep(0.01)
                         continue
+
+                sched_snap_l = scheduler.evaluate()
+                sched_state_l = sched_snap_l.state
+                if sched_state_l != prev_sched_state:
+                    if hasattr(side_left_inspector, "reset_active_tracking"):
+                        side_left_inspector.reset_active_tracking()
+                    if sched_state_l != "PRE_WARMUP":
+                        prewarm_frames_done = 0
+                    prev_sched_state = sched_state_l
+
+                if sched_state_l != "ACTIVE":
+                    if sched_state_l == "PRE_WARMUP" and prewarm_frames_done < 2:
+                        if side_left_stream is not None:
+                            with torch.cuda.stream(side_left_stream), torch.inference_mode():
+                                side_left_inspector.process_frame(frame, render_display=False)
+                        else:
+                            side_left_inspector.process_frame(frame, render_display=False)
+                        if hasattr(side_left_inspector, "reset_active_tracking"):
+                            side_left_inspector.reset_active_tracking()
+                        prewarm_frames_done += 1
+                    stub_l = make_standby_side_payload(side_left_cam_id, side_left_side_name, sched_state_l)
+                    t_end = time.time()
+                    dt = t_end - t_prev
+                    t_prev = t_end
+                    fps_hist.append(1.0 / dt if dt > 0 else float(scheduler.config.standby_fps))
+                    if len(fps_hist) > 30:
+                        fps_hist.pop(0)
+                    avg_f = sum(fps_hist) / len(fps_hist)
+                    if ws_hub is not None:
+                        ws_hub.publish(
+                            side_left_cam_id,
+                            frame,
+                            stub_l,
+                            avg_f,
+                            inspector_meta={"schedule_state": sched_state_l},
+                        )
+                    rem_stby = standby_interval - (time.perf_counter() - t_loop_sl0)
+                    if rem_stby > 0.001:
+                        time.sleep(rem_stby)
+                    continue
 
                 ws_needs_legacy = bool(
                     ws_server is not None and ws_server.hud_mode == "legacy" and ws_server.client_count > 0
@@ -2614,16 +3035,20 @@ def _run_threaded_engine(args):
                                     f"{format_seconds_mmss(f_pos_top / top_video_fps)}/"
                                     f"{format_seconds_mmss(total_f_top / top_video_fps)}"
                                 )
-                            hud_top = top_inspector.render_combined_dashboard(
-                                frame=raw_top,
-                                inspect_result=res_top,
-                                fps=fps_top,
-                                is_paused=nav_paused,
-                                frame_idx=f_pos_top if (not is_cam_top and total_f_top > 0) else top_state.get("frames", 0),
-                                total_frames=total_f_top,
-                                video_time_str=time_str,
-                                speed_label=format_speed_label(nav_speed, nav_skip_idle, nav_scanning),
-                            )
+                            if str(res_top.get("status", "")).upper() in ("STANDBY", "PRE_WARMUP"):
+                                sched_badge_top = (res_top.get("slat_res") or {}).get("eval_mode") or f"SCHED: {res_top.get('status')}"
+                                hud_top = draw_schedule_standby_overlay(raw_top, sched_badge_top)
+                            else:
+                                hud_top = top_inspector.render_combined_dashboard(
+                                    frame=raw_top,
+                                    inspect_result=res_top,
+                                    fps=fps_top,
+                                    is_paused=nav_paused,
+                                    frame_idx=f_pos_top if (not is_cam_top and total_f_top > 0) else top_state.get("frames", 0),
+                                    total_frames=total_f_top,
+                                    video_time_str=time_str,
+                                    speed_label=format_speed_label(nav_speed, nav_skip_idle, nav_scanning),
+                                )
                             cv2.imshow(win_top, hud_top)
                             if getattr(top_inspector, "show_rib_unwarp_window", False):
                                 rib_unwarp = getattr(top_inspector.rib_inspector, "last_rib_unwarped_annotated", None)
@@ -2685,6 +3110,11 @@ def _run_threaded_engine(args):
                 if side_inspector:
                     side_inspector.reset_session()
                 print("\n[*] Counter QC & Cache Deduplikasi kedua kamera di-reset ke 0.\n")
+            elif key in [ord("s"), ord("S")]:
+                snap_cyc = scheduler.cycle_override()
+                if ws_server is not None:
+                    ws_server.set_schedule_state(snap_cyc.to_ws_dict(), broadcast=True)
+                print(f"\n[*] [SCHEDULE OVERRIDE] Mode -> {snap_cyc.override.upper()} | {snap_cyc.hud_badge()}\n")
             elif key in [ord("p"), ord("P")]:
                 if top_inspector and hasattr(top_inspector, "toggle_profile"):
                     with top_lock:
@@ -2841,20 +3271,31 @@ def _run_threaded_engine(args):
                         side_inspector.reset_session()
                     print(f"[*] {args.side_cam_id} Side berhasil beralih ke video: {os.path.basename(str(side_source_path))}")
             elif key in [ord("w"), ord("W")]:
-                print("\n[*] Membuka Dialog Pengaturan Sumber Dual Kamera & Mode...")
-                new_top, new_side, new_mode = select_dual_camera_setup_dialog(
+                print("\n[*] Membuka Dialog Pengaturan Sumber Dual Kamera, Mode & Jadwal...")
+                new_top, new_side, new_mode, new_sched = select_dual_camera_setup_dialog(
                     default_top=top_source_path,
                     default_side=side_source_path,
                     side_cam_id=args.side_cam_id,
                     default_mode=args.mode,
                     include_mode=True,
+                    default_schedule=build_schedule_dict_from_args(args),
+                    include_schedule=True,
                 )
+                if new_sched:
+                    new_cfg = apply_schedule_dict_to_args(args, new_sched)
+                    snap_new = scheduler.reconfigure(new_cfg)
+                    standby_interval = 1.0 / max(1.0, float(scheduler.config.standby_fps or 20.0))
+                    if ws_server is not None:
+                        ws_server.set_schedule_state(snap_new.to_ws_dict(), broadcast=True)
+                    print(f"[*] [JADWAL DETEKSI] Diperbarui langsung via [W] -> {snap_new.hud_badge()}")
+
                 norm_mode = str(new_mode).strip().lower() if new_mode else args.mode
                 if norm_mode in ("dual", "opencv", "web", "headless") and norm_mode != args.mode:
                     restart_request = {
                         "top_source": new_top or top_source_path,
                         "side_source": new_side or side_source_path,
                         "mode": norm_mode,
+                        "schedule": new_sched,
                     }
                     print(f"[*] Mempersiapkan peralihan mode '{args.mode}' -> '{norm_mode}'...")
                     stop_event.set()
@@ -2887,6 +3328,9 @@ def _run_threaded_engine(args):
             # Cetak Telemetri Terminal Setiap 1 Detik
             if now - last_print >= 1.0:
                 last_print = now
+                cur_sched_snap = scheduler.evaluate(force_refresh=True)
+                if ws_server is not None:
+                    ws_server.set_schedule_state(cur_sched_snap.to_ws_dict(), broadcast=True)
                 with top_lock:
                     v_top_fps = top_state["fps"]
                     v_top_lat = top_state["latency"]
@@ -3045,6 +3489,10 @@ def _run_hybrid_engine(args):
     ws_clients_val = mp.Value("i", 0)
     ws_overlay_val = mp.Value("i", 1)
     ws_db_val = mp.Value("i", 1 if args.enable_db else 0)
+    scheduler = DetectionScheduler.from_env_and_args(args)
+    init_sched_snap = scheduler.evaluate(force_refresh=True)
+    ws_sched_state_val = mp.Value("i", SCHED_STATE_TO_CODE[init_sched_snap.state])
+    standby_interval = 1.0 / max(1.0, float(scheduler.config.standby_fps or 20.0))
     ws_top_queue = mp.Queue(maxsize=2) if getattr(args, "ws_stream", False) else None
     side_workers = []
 
@@ -3072,6 +3520,12 @@ def _run_hybrid_engine(args):
                 st_lbl = "AKTIF (RECORDING & NOTIFIKASI TEAMS)" if flag else "MATI (DRY-RUN)"
                 print(f"\n[DB SWITCH via Web FE] Status Database Logging (Hybrid 3-Kam): {st_lbl}\n")
 
+            def _on_sched_override_hybrid(ovr: str):
+                snap_o = scheduler.set_override(ovr)
+                ws_sched_state_val.value = SCHED_STATE_TO_CODE[snap_o.state]
+                print(f"\n[SCHEDULE via Web FE] Hybrid Override -> '{snap_o.override}' | {snap_o.hud_badge()}\n")
+                return snap_o.to_ws_dict()
+
             ws_server = WebSocketStreamServer(
                 ws_hub,
                 port=int(getattr(args, "ws_port", 8765) or 8765),
@@ -3081,6 +3535,8 @@ def _run_hybrid_engine(args):
                 on_overlay_change=_on_overlay,
                 initial_db_enabled=bool(args.enable_db),
                 on_db_enabled_change=_on_db_change,
+                initial_schedule=init_sched_snap.to_ws_dict(),
+                on_schedule_override=_on_sched_override_hybrid,
             )
             if not ws_server.start():
                 ws_server = None
@@ -3114,6 +3570,8 @@ def _run_hybrid_engine(args):
                 "ws_db_val": ws_db_val,
                 "ws_hud_mode": getattr(args, "ws_hud_mode", "clean"),
                 "ws_fps": float(getattr(args, "ws_fps", 0.0) or 0.0),
+                "ws_sched_state_val": ws_sched_state_val,
+                "standby_fps": float(scheduler.config.standby_fps),
             },
             name="Worker-TopInspector-Hybrid",
         )
@@ -3185,6 +3643,8 @@ def _run_hybrid_engine(args):
         t_prev = time.time()
         fps_hist = []
         last_disp = 0.0
+        prev_sched_state = "ACTIVE"
+        prewarm_frames_done = 0
 
         while not stop_event.is_set():
             t_loop0 = time.perf_counter()
@@ -3204,6 +3664,57 @@ def _run_hybrid_engine(args):
                     else:
                         time.sleep(0.01)
                         continue
+
+                sched_snap_h = scheduler.evaluate()
+                sched_state_h = sched_snap_h.state
+                if sched_state_h != prev_sched_state:
+                    if hasattr(ins, "reset_active_tracking"):
+                        ins.reset_active_tracking()
+                    if sched_state_h != "PRE_WARMUP":
+                        prewarm_frames_done = 0
+                    prev_sched_state = sched_state_h
+
+                if sched_state_h != "ACTIVE":
+                    if sched_state_h == "PRE_WARMUP" and prewarm_frames_done < 2:
+                        if cstream is not None:
+                            import torch
+                            with torch.cuda.stream(cstream), torch.inference_mode():
+                                ins.process_frame(frame, render_display=False)
+                        else:
+                            ins.process_frame(frame, render_display=False)
+                        if hasattr(ins, "reset_active_tracking"):
+                            ins.reset_active_tracking()
+                        prewarm_frames_done += 1
+                    stub_h = make_standby_side_payload(cam_id, getattr(ins, "side", "RIGHT"), sched_state_h)
+                    t_end = time.time()
+                    dt = t_end - t_prev
+                    t_prev = t_end
+                    fps_hist.append(1.0 / dt if dt > 0 else float(scheduler.config.standby_fps))
+                    if len(fps_hist) > 30:
+                        fps_hist.pop(0)
+                    avg_f = sum(fps_hist) / len(fps_hist)
+                    if is_primary:
+                        with side_lock:
+                            side_state["frames"] += 1
+                            side_state["fps"] = avg_f
+                            side_state["latency"] = 0.0
+                            side_state["status"] = sched_state_h
+                            if args.mode in ("dual", "opencv") and (t_end - last_disp) >= gui_interval:
+                                side_state["display"] = draw_schedule_standby_overlay(frame, sched_snap_h.hud_badge())
+                                side_state["has_new"] = True
+                                last_disp = t_end
+                    if ws_hub is not None:
+                        ws_hub.publish(
+                            cam_id,
+                            frame,
+                            stub_h,
+                            avg_f,
+                            inspector_meta={"schedule_state": sched_state_h},
+                        )
+                    rem_stby = standby_interval - (time.perf_counter() - t_loop0)
+                    if rem_stby > 0.001:
+                        time.sleep(rem_stby)
+                    continue
 
                 t_inf0 = time.time()
                 ws_legacy = bool(ws_server is not None and ws_server.hud_mode == "legacy" and ws_server.client_count > 0)
@@ -3347,14 +3858,30 @@ def _run_hybrid_engine(args):
                 if k_hyb in [ord("q"), ord("Q"), 27]:
                     stop_event.set()
                     break
+                elif k_hyb in [ord("s"), ord("S")]:
+                    snap_cyc = scheduler.cycle_override()
+                    ws_sched_state_val.value = SCHED_STATE_TO_CODE[snap_cyc.state]
+                    if ws_server is not None:
+                        ws_server.set_schedule_state(snap_cyc.to_ws_dict(), broadcast=True)
+                    print(f"\n[*] [SCHEDULE OVERRIDE] Hybrid -> {snap_cyc.override.upper()} | {snap_cyc.hud_badge()}\n")
                 elif k_hyb in [ord("w"), ord("W")]:
-                    new_top, new_side, new_mode = select_dual_camera_setup_dialog(
+                    new_top, new_side, new_mode, new_sched = select_dual_camera_setup_dialog(
                         default_top=args.top_source,
                         default_side=args.side_source,
                         side_cam_id=args.side_cam_id,
                         default_mode=args.mode,
                         include_mode=True,
+                        default_schedule=build_schedule_dict_from_args(args),
+                        include_schedule=True,
                     )
+                    if new_sched:
+                        new_cfg = apply_schedule_dict_to_args(args, new_sched)
+                        snap_new = scheduler.reconfigure(new_cfg)
+                        ws_sched_state_val.value = SCHED_STATE_TO_CODE[snap_new.state]
+                        standby_interval = 1.0 / max(1.0, float(scheduler.config.standby_fps or 20.0))
+                        if ws_server is not None:
+                            ws_server.set_schedule_state(snap_new.to_ws_dict(), broadcast=True)
+                        print(f"[*] [JADWAL DETEKSI] Hybrid diperbarui langsung via [W] -> {snap_new.hud_badge()}")
                     norm_mode = str(new_mode).strip().lower() if new_mode else args.mode
                     if (
                         (norm_mode in ("dual", "opencv", "web", "headless") and norm_mode != args.mode)
@@ -3365,6 +3892,7 @@ def _run_hybrid_engine(args):
                             "top_source": new_top or args.top_source,
                             "side_source": new_side or args.side_source,
                             "mode": norm_mode if norm_mode in ("dual", "opencv", "web", "headless") else args.mode,
+                            "schedule": new_sched,
                         }
                         stop_event.set()
                         break
@@ -3373,6 +3901,10 @@ def _run_hybrid_engine(args):
 
             if now - last_print >= 1.0:
                 last_print = now
+                cur_sched_h = scheduler.evaluate(force_refresh=True)
+                ws_sched_state_val.value = SCHED_STATE_TO_CODE[cur_sched_h.state]
+                if ws_server is not None:
+                    ws_server.set_schedule_state(cur_sched_h.to_ws_dict(), broadcast=True)
                 v_top_fps = fps_top.value
                 v_top_lat = lat_top.value
                 f_top_cnt = frames_top.value
@@ -3664,6 +4196,80 @@ Shortcut Keyboard Saat Berjalan:
         default=env_ws_hud_mode,
         help=f"Mode visual stream WebSocket: 'clean' (16:9 penuh) atau 'legacy' (HUD OpenCV lama). Default: {env_ws_hud_mode}."
     )
+    env_sched_mode = os.environ.get("DETECTION_SCHEDULE_MODE", "continuous").strip().lower()
+    if env_sched_mode not in ("continuous", "periodic", "slots"):
+        env_sched_mode = "continuous"
+    try:
+        env_sched_interval = float(os.environ.get("SCHEDULE_INTERVAL_MIN", "60"))
+    except ValueError:
+        env_sched_interval = 60.0
+    try:
+        env_sched_active = float(os.environ.get("SCHEDULE_ACTIVE_MIN", "15"))
+    except ValueError:
+        env_sched_active = 15.0
+    try:
+        env_sched_anchor = float(os.environ.get("SCHEDULE_ANCHOR_MINUTE", "0"))
+    except ValueError:
+        env_sched_anchor = 0.0
+    env_sched_slots = os.environ.get("SCHEDULE_SLOTS", "")
+    try:
+        env_sched_prewarm = float(os.environ.get("SCHEDULE_PREWARM_SEC", "2.0"))
+    except ValueError:
+        env_sched_prewarm = 2.0
+    try:
+        env_sched_stby_fps = float(os.environ.get("SCHEDULE_STANDBY_FPS", "20.0"))
+    except ValueError:
+        env_sched_stby_fps = 20.0
+    env_sched_motion_quota = os.environ.get("SCHEDULE_MOTION_QUOTA", "false").lower() in ("true", "1", "yes")
+
+    parser.add_argument(
+        "--schedule-mode",
+        choices=["continuous", "periodic", "slots"],
+        default=env_sched_mode,
+        help=f"Mode jadwal deteksi AI: 'continuous' (24/7), 'periodic' (mis. 15m tiap 60m), atau 'slots'. Default: {env_sched_mode}."
+    )
+    parser.add_argument(
+        "--schedule-interval-min",
+        type=float,
+        default=env_sched_interval,
+        help=f"Interval siklus periodik dalam menit (default: {env_sched_interval})."
+    )
+    parser.add_argument(
+        "--schedule-active-min",
+        type=float,
+        default=env_sched_active,
+        help=f"Durasi aktif deteksi AI per siklus dalam menit (default: {env_sched_active})."
+    )
+    parser.add_argument(
+        "--schedule-anchor-min",
+        type=float,
+        default=env_sched_anchor,
+        help=f"Menit jangkar dimulainya siklus periodik (0 = awal jam :00, default: {env_sched_anchor})."
+    )
+    parser.add_argument(
+        "--schedule-slots",
+        type=str,
+        default=env_sched_slots,
+        help="Daftar slot jam harian untuk --schedule-mode slots (contoh: '08:00-08:15,09:00-09:15')."
+    )
+    parser.add_argument(
+        "--schedule-prewarm-sec",
+        type=float,
+        default=env_sched_prewarm,
+        help=f"Durasi pre-warmup GPU sebelum jendela aktif dimulai dalam detik (default: {env_sched_prewarm})."
+    )
+    parser.add_argument(
+        "--schedule-standby-fps",
+        type=float,
+        default=env_sched_stby_fps,
+        help=f"Batas FPS live passthrough saat fase STANDBY (default: {env_sched_stby_fps})."
+    )
+    parser.add_argument(
+        "--schedule-motion-quota",
+        action="store_true",
+        default=env_sched_motion_quota,
+        help="Hitung durasi aktif hanya saat conveyor bergerak (opsional untuk mode periodic)."
+    )
     return parser
 
 
@@ -3785,14 +4391,18 @@ def main():
     missing_side_source = side_is_active and not is_usable_source(args.side_source)
 
     if args.select_webcam or args.browse or str(args.top_source).lower() == "browse" or str(args.side_source).lower() == "browse" or (missing_top_source and missing_side_source):
-        print("\n[*] Menampilkan dialog pengaturan sumber kamera & mode...")
-        ch_top, ch_side, ch_mode = select_dual_camera_setup_dialog(
+        print("\n[*] Menampilkan dialog pengaturan sumber kamera, mode & jadwal...")
+        ch_top, ch_side, ch_mode, ch_sched = select_dual_camera_setup_dialog(
             default_top=args.top_source,
             default_side=args.side_source,
             side_cam_id=args.side_cam_id,
             default_mode=args.mode,
             include_mode=True,
+            default_schedule=build_schedule_dict_from_args(args),
+            include_schedule=True,
         )
+        if ch_sched:
+            apply_schedule_dict_to_args(args, ch_sched)
         apply_setup_handoff(args, ch_top, ch_side, ch_mode)
         top_is_active = args.mode in ["dual", "opencv", "headless", "web", "top-only"]
         side_is_active = args.mode in ["dual", "opencv", "headless", "web", "side-only"]
@@ -3849,6 +4459,12 @@ def main():
         print(f"[*] Profil Parameter   : DEFAULT_STABIL (Awal Pabrik - Tekan [P] untuk Kalibrasi)")
         print(f"[*] Durasi Uji Coba    : {'Tak Terbatas (Tekan [Q] / Ctrl+C)' if args.duration <= 0 else f'{args.duration} detik'}")
         print(f"[*] Database Logging   : {'AKTIF [RECORDING & TEAMS NOTIFIER]' if args.enable_db else 'OFF (DRY-RUN BENCHMARK - Tekan [D] di jendela untuk aktifkan)'}")
+        sched_preview = DetectionScheduler.from_env_and_args(args)
+        if sched_preview.is_scheduled:
+            snap_p = sched_preview.evaluate(force_refresh=True)
+            print(f"[*] Jadwal Deteksi AI  : {sched_preview.config.mode.upper()} ({sched_preview.config.active_min:g}m / {sched_preview.config.interval_min:g}m) | Saat ini: {snap_p.hud_badge()}")
+        else:
+            print("[*] Jadwal Deteksi AI  : CONTINUOUS (24/7 — Tekan [S] untuk Manual Override)")
         print("=" * 86)
 
     # 1. Jalankan runner threads/hybrid dengan dukungan handoff mode dinamis dari tombol [W]
@@ -3861,6 +4477,8 @@ def main():
             restart_req = _run_hybrid_engine(args)
         if not restart_req:
             return
+        if restart_req.get("schedule"):
+            apply_schedule_dict_to_args(args, restart_req.get("schedule"))
         apply_setup_handoff(
             args,
             restart_req.get("top_source"),
@@ -3875,6 +4493,8 @@ def main():
 
     # Inisialisasi Shared Memory untuk Telemetri Antar-Proses
     stop_event = mp.Event()
+    proc_scheduler = DetectionScheduler.from_env_and_args(args)
+    ws_sched_state_proc = mp.Value("i", SCHED_STATE_TO_CODE[proc_scheduler.evaluate(force_refresh=True).state])
     fps_top = mp.Value("d", 0.0)
     fps_side = mp.Value("d", 0.0)
     frames_top = mp.Value("i", 0)
@@ -3906,6 +4526,10 @@ def main():
                 stat_top,
                 args.gui_fps
             ),
+            kwargs={
+                "ws_sched_state_val": ws_sched_state_proc,
+                "standby_fps": float(proc_scheduler.config.standby_fps),
+            },
             name="Worker-TopInspector"
         )
         processes.append(("TOP", p_top))
@@ -3928,6 +4552,10 @@ def main():
                 stat_side,
                 args.gui_fps
             ),
+            kwargs={
+                "ws_sched_state_val": ws_sched_state_proc,
+                "standby_fps": float(proc_scheduler.config.standby_fps),
+            },
             name="Worker-SideInspector"
         )
         processes.append(("SIDE", p_side))
@@ -3995,6 +4623,7 @@ def main():
             # Cetak ringkasan berkala setiap 1.0 detik
             if now - last_print >= 1.0:
                 last_print = now
+                ws_sched_state_proc.value = SCHED_STATE_TO_CODE[proc_scheduler.evaluate(force_refresh=True).state]
                 v_top_fps = fps_top.value
                 v_side_fps = fps_side.value
                 v_comb_fps = v_top_fps + v_side_fps

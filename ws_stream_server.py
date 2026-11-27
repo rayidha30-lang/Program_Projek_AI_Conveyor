@@ -250,7 +250,11 @@ def build_stream_metadata(cam_id: str, slot: dict[str, Any]) -> dict[str, Any]:
         rib_conf = float(rib_res.get("confidence", 0.0) or 0.0)
         slat_conf = float(slat_res.get("confidence", slat_res.get("coverage", 0.0)) or 0.0)
         conf = round(max(rib_conf, slat_conf), 3) if (rib_conf > 0 or slat_conf > 0) else None
-        if rib_res.get("is_ng"):
+        if status == "STANDBY":
+            obj = "Scheduled Standby (Live View)"
+        elif status == "PRE_WARMUP":
+            obj = "GPU Pre-Warmup..."
+        elif rib_res.get("is_ng"):
             obj = f"Rib #{rib_no} Deform" if rib_no else "Rib Deformation"
         elif slat_res.get("is_ng"):
             obj = f"Slat #{slat_no} Deform" if slat_no else "Plate Deformation"
@@ -266,7 +270,13 @@ def build_stream_metadata(cam_id: str, slot: dict[str, Any]) -> dict[str, Any]:
         ng_names = [str(c.get("name", "")) for c in comps if str(c.get("result", "")).upper() == "NG"]
         confs = [float(c.get("confidence", 0.0) or 0.0) for c in comps if float(c.get("confidence", 0.0) or 0.0) > 0]
         conf = round(max(confs), 3) if confs else None
-        if "PIN" in ng_names:
+        if status == "STANDBY":
+            obj = "Scheduled Standby (Live View)"
+            severity = "NONE"
+        elif status == "PRE_WARMUP":
+            obj = "GPU Pre-Warmup..."
+            severity = "NONE"
+        elif "PIN" in ng_names:
             obj = "Pin Missing / NG"
             severity = "CRITICAL"
         elif "BOLT" in ng_names:
@@ -279,7 +289,7 @@ def build_stream_metadata(cam_id: str, slot: dict[str, Any]) -> dict[str, Any]:
             obj = f"Slat #{slat_no} Fasteners" if slat_no else "Bolt / Pin / Bracket"
             severity = "HIGH" if status == "NG" else "NONE"
 
-    return {
+    payload_meta: dict[str, Any] = {
         "cam": cam_id,
         "status": status,
         "fps": fps_val,
@@ -289,6 +299,10 @@ def build_stream_metadata(cam_id: str, slot: dict[str, Any]) -> dict[str, Any]:
         "slatNo": slat_no,
         "ts": round(time.time(), 3),
     }
+    sched_state = ins_meta.get("schedule_state") or res.get("schedule_state")
+    if sched_state:
+        payload_meta["scheduleState"] = str(sched_state)
+    return payload_meta
 
 
 class WebSocketStreamServer:
@@ -306,6 +320,8 @@ class WebSocketStreamServer:
         on_overlay_change: Callable[[bool], None] | None = None,
         initial_db_enabled: bool = False,
         on_db_enabled_change: Callable[[bool], None] | None = None,
+        initial_schedule: dict[str, Any] | None = None,
+        on_schedule_override: Callable[[str], dict[str, Any] | None] | None = None,
     ) -> None:
         self.hub = hub
         self.host = host
@@ -317,10 +333,12 @@ class WebSocketStreamServer:
         self._on_client_count_change = on_client_count_change
         self._on_overlay_change = on_overlay_change
         self._on_db_enabled_change = on_db_enabled_change
+        self._on_schedule_override = on_schedule_override
 
         self._overlay_lock = threading.Lock()
         self._show_overlay = True
         self._db_enabled = bool(initial_db_enabled)
+        self._schedule_state: dict[str, Any] | None = dict(initial_schedule) if initial_schedule is not None else None
         self._clients: set[Any] = set()
         self._encoded_frame_count = 0
 
@@ -376,13 +394,23 @@ class WebSocketStreamServer:
                 pass
         self._schedule_state_broadcast()
 
+    def set_schedule_state(self, schedule_dict: dict[str, Any] | None, broadcast: bool = True) -> None:
+        new_val = dict(schedule_dict) if schedule_dict is not None else None
+        with self._overlay_lock:
+            changed = new_val != self._schedule_state
+            self._schedule_state = new_val
+        if broadcast and changed:
+            self._schedule_state_broadcast()
+
     def _build_state_payload(self) -> str:
         with self._overlay_lock:
-            payload = {
+            payload: dict[str, Any] = {
                 "type": "state",
                 "show_overlay": self._show_overlay,
                 "db_enabled": self._db_enabled,
             }
+            if self._schedule_state is not None:
+                payload["schedule"] = dict(self._schedule_state)
         return json.dumps(payload, separators=(",", ":"))
 
     def _schedule_state_broadcast(self) -> None:
@@ -485,6 +513,10 @@ class WebSocketStreamServer:
                                 self.show_overlay = bool(cmd["show_overlay"])
                             if "db_enabled" in cmd:
                                 self.set_db_enabled(bool(cmd["db_enabled"]), notify_callback=True)
+                            if "schedule_override" in cmd and self._on_schedule_override is not None:
+                                new_sched = self._on_schedule_override(str(cmd["schedule_override"]))
+                                if isinstance(new_sched, dict):
+                                    self.set_schedule_state(new_sched, broadcast=True)
                     except Exception:
                         pass
         except Exception:
